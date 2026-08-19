@@ -788,7 +788,6 @@ pub async fn update_settings(
     *published = settings;
     state.proxy_runtime.finish_reconfigure(proxy_policy);
     drop(published);
-    drop(_persistence);
 
     // Apply updated torrent session settings dynamically.
     state

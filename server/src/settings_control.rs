@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use axum::http::HeaderMap;
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
     net::SocketAddr,
     path::Path,
@@ -97,17 +97,23 @@ fn create_token_file(path: &Path) -> io::Result<[u8; TOKEN_LENGTH]> {
         .try_into()
         .expect("two simple UUIDs are exactly 64 bytes");
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("settings control token path has no parent"))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".settings-control-token-")
+        .tempfile_in(parent)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let mut file = options.open(path)?;
     file.write_all(&token)?;
-    file.sync_all()?;
-    Ok(token)
+    file.as_file().sync_all()?;
+    file.persist_noclobber(path)
+        .map(|_| token)
+        .map_err(|error| error.error)
 }
 
 fn load_token_file(path: &Path) -> anyhow::Result<[u8; TOKEN_LENGTH]> {
@@ -256,6 +262,35 @@ mod tests {
             second.authorize_http(peer, &headers),
             SettingsMutationAuthority::HttpAuthorized
         );
+    }
+
+    #[test]
+    fn concurrent_token_creation_observes_only_a_complete_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let path = temp.path().to_owned();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                SettingsControl::load_or_create(&path).unwrap()
+            }));
+        }
+        let controls: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let bytes = fs::read(temp.path().join("settings-control.token")).unwrap();
+        assert_eq!(bytes.len(), 64);
+        let headers = headers_with(&bytes);
+        let peer = "127.0.0.1:40000".parse().unwrap();
+        for control in controls {
+            assert_eq!(
+                control.authorize_http(peer, &headers),
+                SettingsMutationAuthority::HttpAuthorized
+            );
+        }
     }
 
     #[test]

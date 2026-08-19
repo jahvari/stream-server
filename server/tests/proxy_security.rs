@@ -84,7 +84,17 @@ async fn start_tls_fixture() -> anyhow::Result<(
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
-    let app = Router::new().route("/ok", get(|| async { "secure-fixture-ok" }));
+    let app = Router::new()
+        .route("/ok", get(|| async { "secure-fixture-ok" }))
+        .route(
+            "/redirect-http",
+            get(|| async {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, "http://example.com/")],
+                )
+            }),
+        );
     let task = tokio::spawn(async move {
         axum_server::from_tcp_rustls(listener, tls)?
             .serve(app.into_make_service())
@@ -159,6 +169,7 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
         .send()
         .await?;
     assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(allowed.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
     assert_eq!(allowed.text().await?, "fixture-ok");
 
     let range_target = format!("http://{fixture_addr}/range");
@@ -169,6 +180,7 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
         .await?;
     assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(range.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+    assert_eq!(range.headers()[header::CONTENT_LENGTH], "4");
     assert_eq!(range.bytes().await?, &b"2345"[..]);
 
     let playlist_target = format!("http://{fixture_addr}/playlist");
@@ -177,6 +189,7 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
         .send()
         .await?;
     assert_eq!(playlist.status(), StatusCode::OK);
+    assert!(playlist.headers().get(header::CONTENT_LENGTH).is_none());
     assert!(playlist.headers().get(header::CONTENT_RANGE).is_none());
     assert!(playlist.headers().get(header::CONTENT_ENCODING).is_none());
     assert!(playlist.text().await?.contains("/proxy/?d="));
@@ -229,6 +242,19 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
     .await??;
     assert_eq!(allowed_tls.status(), StatusCode::OK);
     assert_eq!(allowed_tls.text().await?, "secure-fixture-ok");
+    let downgrade_target = format!(
+        "https://127.0.0.1:{}/redirect-http",
+        tls_fixture_addr.port()
+    );
+    let downgrade = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .get(proxy_url(server.http_addr(), &downgrade_target))
+            .send(),
+    )
+    .await??;
+    assert_eq!(downgrade.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(downgrade.text().await?, "Proxy upstream request failed");
 
     let stall_target = format!("http://{fixture_addr}/stall");
     let stalled = client

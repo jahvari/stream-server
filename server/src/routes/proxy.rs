@@ -262,6 +262,9 @@ async fn fetch_with_redirects(
             return Err(ProxyError::Upstream);
         }
         next.set_fragment(None);
+        if next.as_str().len() > MAX_TARGET_URL {
+            return Err(ProxyError::Upstream);
+        }
         if !same_authority(&destination.url, &next) {
             let _ = next.set_username("");
             let _ = next.set_password(None);
@@ -363,11 +366,16 @@ async fn handle_proxy(
             Ok(body) => body,
             Err(error) => return proxy_error_response(error),
         };
+        let ProxyRequestContext {
+            cancellation,
+            capacity,
+            ..
+        } = context;
         return build_proxy_response(
             status,
             &upstream_headers,
             &request.response_headers,
-            Body::from(body),
+            buffered_proxy_body(Bytes::from(body), cancellation, capacity),
             true,
         );
     }
@@ -377,8 +385,23 @@ async fn handle_proxy(
         capacity,
         ..
     } = context;
+    let body = streaming_proxy_body(Box::pin(upstream.bytes_stream()), cancellation, capacity);
+    build_proxy_response(
+        status,
+        &upstream_headers,
+        &request.response_headers,
+        body,
+        false,
+    )
+}
+
+fn streaming_proxy_body(
+    stream: UpstreamByteStream,
+    cancellation: CancellationToken,
+    capacity: OwnedSemaphorePermit,
+) -> Body {
     let stream = ProxyBodyState {
-        stream: Box::pin(upstream.bytes_stream()),
+        stream,
         cancellation,
         _capacity: capacity,
         terminal: false,
@@ -419,13 +442,7 @@ async fn handle_proxy(
         };
         next.map(|item| (item, state))
     });
-    build_proxy_response(
-        status,
-        &upstream_headers,
-        &request.response_headers,
-        Body::from_stream(stream),
-        false,
-    )
+    Body::from_stream(stream)
 }
 
 type UpstreamByteStream =
@@ -436,6 +453,54 @@ struct ProxyBodyState {
     cancellation: CancellationToken,
     _capacity: OwnedSemaphorePermit,
     terminal: bool,
+}
+
+struct BufferedProxyBodyState {
+    bytes: Bytes,
+    offset: usize,
+    cancellation: CancellationToken,
+    _capacity: OwnedSemaphorePermit,
+    terminal: bool,
+}
+
+fn buffered_proxy_body(
+    bytes: Bytes,
+    cancellation: CancellationToken,
+    capacity: OwnedSemaphorePermit,
+) -> Body {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let stream = futures_util::stream::unfold(
+        BufferedProxyBodyState {
+            bytes,
+            offset: 0,
+            cancellation,
+            _capacity: capacity,
+            terminal: false,
+        },
+        |mut state| async move {
+            if state.terminal || state.offset == state.bytes.len() {
+                return None;
+            }
+            if state.cancellation.is_cancelled() {
+                state.terminal = true;
+                return Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "proxy policy changed",
+                    )),
+                    state,
+                ));
+            }
+            let end = state
+                .offset
+                .saturating_add(CHUNK_SIZE)
+                .min(state.bytes.len());
+            let chunk = state.bytes.slice(state.offset..end);
+            state.offset = end;
+            Some((Ok::<_, std::io::Error>(chunk), state))
+        },
+    );
+    Body::from_stream(stream)
 }
 
 const MAX_PLAYLIST_INPUT: usize = 8 * 1024 * 1024;
@@ -608,18 +673,17 @@ fn rewrite_playlist_tag(line: &str, base_url: &Url, output: &mut String) -> Resu
 
 fn push_proxy_uri(output: &mut String, absolute: &Url) -> Result<(), ProxyError> {
     const PREFIX: &str = "/proxy/?d=";
-    let maximum_encoded = absolute
-        .as_str()
+    let encoded = urlencoding::encode(absolute.as_str());
+    let required = encoded
         .len()
-        .checked_mul(3)
-        .and_then(|length| length.checked_add(PREFIX.len()))
+        .checked_add(PREFIX.len())
         .ok_or(ProxyError::Upstream)?;
     let remaining = MAX_PLAYLIST_OUTPUT.saturating_sub(output.len());
-    if maximum_encoded > remaining {
+    if required > remaining {
         return Err(ProxyError::Upstream);
     }
     push_playlist(output, PREFIX)?;
-    push_playlist(output, &urlencoding::encode(absolute.as_str()))
+    push_playlist(output, &encoded)
 }
 
 fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
@@ -636,7 +700,10 @@ fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyError, fetch_with_redirects, parse_proxy_request, rewrite_playlist_bounded};
+    use super::{
+        MAX_PLAYLIST_INPUT, ProxyError, buffered_proxy_body, collect_playlist,
+        fetch_with_redirects, parse_proxy_request, rewrite_playlist_bounded, streaming_proxy_body,
+    };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
         ProxyRuntime,
@@ -644,8 +711,11 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         Router,
+        body::Body,
+        extract::Path,
         http::{HeaderMap, StatusCode, header},
-        routing::get,
+        response::{IntoResponse, Response},
+        routing::{any, get},
     };
     use std::{
         io,
@@ -654,7 +724,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -877,6 +947,311 @@ mod tests {
             )
             .await,
             Err(ProxyError::Blocked)
+        ));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_redirect_target_is_rejected_before_resolution() {
+        let location = format!("https://example.com/{}", "a".repeat(16 * 1024));
+        let (address, fixture) = fixture(Router::new().route(
+            "/redirect",
+            get(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, location)],
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let parsed = parse_proxy_request(
+            "",
+            Some(&format!(
+                "d=http%3A%2F%2Fredirect.test%3A{}%2Fredirect",
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        assert!(matches!(
+            fetch_with_redirects(
+                &runtime,
+                &context,
+                &parsed,
+                reqwest::Method::GET,
+                &HeaderMap::new(),
+            )
+            .await,
+            Err(ProxyError::Upstream)
+        ));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_allows_five_hops_and_rejects_a_sixth() {
+        async fn chain(Path((kind, hop)): Path<(String, usize)>) -> Response {
+            if kind == "five" && hop == 5 {
+                return "done".into_response();
+            }
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, format!("/{kind}/{}", hop + 1))],
+            )
+                .into_response()
+        }
+
+        let (address, fixture) = fixture(Router::new().route("/{kind}/{hop}", any(chain))).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        let parsed = parse_proxy_request(
+            "",
+            Some(&format!(
+                "d=http%3A%2F%2Fredirect.test%3A{}%2Ffive%2F0",
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        let (response, _) = fetch_with_redirects(
+            &runtime,
+            &context,
+            &parsed,
+            reqwest::Method::GET,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text().await.unwrap(), "done");
+
+        let parsed = parse_proxy_request(
+            "",
+            Some(&format!(
+                "d=http%3A%2F%2Fredirect.test%3A{}%2Fsix%2F0",
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        assert!(matches!(
+            fetch_with_redirects(
+                &runtime,
+                &context,
+                &parsed,
+                reqwest::Method::GET,
+                &HeaderMap::new(),
+            )
+            .await,
+            Err(ProxyError::Upstream)
+        ));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn redirects_preserve_method_and_strip_cross_authority_secrets() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let final_handler = {
+            let seen_tx = seen_tx.clone();
+            move |method: reqwest::Method, headers: HeaderMap| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    if let Some(sender) = seen_tx.lock().unwrap().take() {
+                        let _ = sender.send((method, headers));
+                    }
+                    "done"
+                }
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect_location = format!("http://other.test:{}/final", address.port());
+        let router = Router::new()
+            .route(
+                "/redirect",
+                any(move || {
+                    let redirect_location = redirect_location.clone();
+                    async move {
+                        (
+                            StatusCode::SEE_OTHER,
+                            [(header::LOCATION, redirect_location)],
+                        )
+                    }
+                }),
+            )
+            .route("/final", any(final_handler));
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let parsed = parse_proxy_request(
+            "",
+            Some(&format!(
+                concat!(
+                    "d=http%3A%2F%2Fuser%3Asecret%40redirect.test%3A{}%2Fredirect",
+                    "&h=Authorization%3ABearer%20secret",
+                    "&h=Cookie%3Asession%3Dsecret"
+                ),
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        let (response, _) = fetch_with_redirects(
+            &runtime,
+            &context,
+            &parsed,
+            reqwest::Method::POST,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text().await.unwrap(), "done");
+        let (method, headers) = tokio::time::timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(method, reqwest::Method::POST);
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert!(!headers.contains_key(header::COOKIE));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn buffered_playlist_body_retains_capacity_and_observes_cancellation() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let body = buffered_proxy_body(
+            bytes::Bytes::from_static(b"#EXTM3U\nsegment.ts\n"),
+            cancellation.clone(),
+            permit,
+        );
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        cancellation.cancel();
+        assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_body_times_out_once_and_releases_capacity() {
+        let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            tokio_util::sync::CancellationToken::new(),
+            permit,
+        );
+        let collect = tokio::spawn(axum::body::to_bytes(body, usize::MAX));
+        tokio::task::yield_now().await;
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(collect.await.unwrap().is_err());
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_streaming_body_releases_capacity() {
+        let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            tokio_util::sync::CancellationToken::new(),
+            permit,
+        );
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        drop(body);
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn playlist_collection_accepts_exact_limit_and_rejects_streamed_overflow() {
+        let exact = bytes::Bytes::from(vec![b'a'; MAX_PLAYLIST_INPUT]);
+        let overflow_tail = bytes::Bytes::from_static(b"x");
+        let (address, fixture) = fixture(
+            Router::new()
+                .route(
+                    "/exact",
+                    get({
+                        let exact = exact.clone();
+                        move || {
+                            let exact = exact.clone();
+                            async move {
+                                Body::from_stream(futures_util::stream::once(async move {
+                                    Ok::<_, std::io::Error>(exact)
+                                }))
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/overflow",
+                    get(move || {
+                        let exact = exact.clone();
+                        let overflow_tail = overflow_tail.clone();
+                        async move {
+                            Body::from_stream(futures_util::stream::iter([
+                                Ok::<_, std::io::Error>(exact),
+                                Ok::<_, std::io::Error>(overflow_tail),
+                            ]))
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        let context = runtime.try_request().unwrap();
+        let response = client
+            .get(format!("http://{address}/exact"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_playlist(response, &context).await.unwrap().len(),
+            MAX_PLAYLIST_INPUT
+        );
+        drop(context);
+
+        let context = runtime.try_request().unwrap();
+        let response = client
+            .get(format!("http://{address}/overflow"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            collect_playlist(response, &context).await,
+            Err(ProxyError::Upstream)
         ));
         fixture.abort();
     }

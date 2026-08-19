@@ -56,8 +56,10 @@ const ALWAYS_BLOCKED_V4: &[&str] = &[
 ];
 
 const METADATA_V4: &[&str] = &[
+    "168.63.129.16/32",
     "169.254.169.254/32",
     "169.254.170.2/32",
+    "169.254.170.23/32",
     "100.100.100.200/32",
     "192.0.0.192/32",
 ];
@@ -76,7 +78,7 @@ const ALWAYS_BLOCKED_V6: &[&str] = &[
     "ff00::/8",
 ];
 
-const METADATA_V6: &[&str] = &["fd00:ec2::254/128"];
+const METADATA_V6: &[&str] = &["fd00:ec2::23/128", "fd00:ec2::254/128", "fd20:ce::254/128"];
 
 static PRIVATE_V4_NETS: LazyLock<Vec<IpNet>> = LazyLock::new(|| parse_networks(PRIVATE_V4));
 static ALWAYS_BLOCKED_V4_NETS: LazyLock<Vec<IpNet>> =
@@ -131,6 +133,12 @@ fn extract_ipv4_compatible(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     None
 }
 
+fn extract_ipv4_translatable(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    (octets[..8].iter().all(|byte| *byte == 0) && octets[8..12] == [0xff, 0xff, 0x00, 0x00])
+        .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+}
+
 pub(crate) fn extract_rfc6052(ip: Ipv6Addr, prefix: Nat64Prefix) -> Option<Ipv4Addr> {
     const VALID_LENGTHS: &[u8] = &[32, 40, 48, 56, 64, 96];
     if !VALID_LENGTHS.contains(&prefix.length) {
@@ -180,9 +188,16 @@ fn embedded_nat64(ip: Ipv6Addr, prefixes: &[Nat64Prefix]) -> Option<Ipv4Addr> {
             let value = u128::from(ip);
             let prefix = u128::from(LOCAL_USE.network);
             let mask = u128::MAX << 80;
-            (value & mask == prefix & mask).then(|| Ipv4Addr::from(value as u32))
+            if value & mask != prefix & mask {
+                return None;
+            }
+            let rfc6052 = extract_rfc6052(ip, LOCAL_USE)?;
+            if rfc6052 == Ipv4Addr::UNSPECIFIED {
+                Some(Ipv4Addr::from(value as u32))
+            } else {
+                Some(rfc6052)
+            }
         })
-        .or_else(|| extract_rfc6052(ip, LOCAL_USE))
         .or_else(|| {
             prefixes
                 .iter()
@@ -199,6 +214,7 @@ fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> De
         return classify_v4(embedded, local);
     }
     if extract_ipv4_compatible(ip).is_some()
+        || extract_ipv4_translatable(ip).is_some()
         || extract_6to4(ip).is_some()
         || extract_teredo_client(ip).is_some()
     {
@@ -277,8 +293,10 @@ mod tests {
     fn ipv4_metadata_precedes_private_source_ranges() {
         let local = LocalNetworks::default();
         for value in [
+            "168.63.129.16",
             "169.254.169.254",
             "169.254.170.2",
+            "169.254.170.23",
             "100.100.100.200",
             "192.0.0.192",
         ] {
@@ -355,6 +373,7 @@ mod tests {
             "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
             "64:ff9b::7f00:1",
             "64:ff9b:1::7f00:1",
+            "64:ff9b:1:7f00:0:100::",
         ];
         for value in cases {
             assert_ne!(
@@ -370,6 +389,7 @@ mod tests {
         let local = LocalNetworks::default();
         for value in [
             "::93.184.216.34",
+            "::ffff:0:93.184.216.34",
             "2002:5db8:d822::",
             "2001:0000:4136:e378:8000:63bf:a247:27dd",
         ] {
@@ -392,6 +412,7 @@ mod tests {
             ("::ffff:93.184.216.34", &[][..]),
             ("64:ff9b::5db8:d822", &[][..]),
             ("64:ff9b:1::5db8:d822", &[][..]),
+            ("64:ff9b:1:5db8:d8:2200::", &[][..]),
             ("2001:db8:64::5db8:d822", &discovered[..]),
         ] {
             assert_eq!(
@@ -405,10 +426,13 @@ mod tests {
     #[test]
     fn ipv6_metadata_precedes_private_source_ranges() {
         let local = LocalNetworks::default();
-        assert_eq!(
-            classify_ip("fd00:ec2::254".parse().unwrap(), &local, &[]),
-            DestinationClass::AlwaysBlocked
-        );
+        for value in ["fd00:ec2::23", "fd00:ec2::254", "fd20:ce::254"] {
+            assert_eq!(
+                classify_ip(value.parse().unwrap(), &local, &[]),
+                DestinationClass::AlwaysBlocked,
+                "{value}"
+            );
+        }
     }
 
     #[test]

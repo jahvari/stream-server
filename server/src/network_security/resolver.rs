@@ -74,9 +74,12 @@ impl LocalNetworkProvider for SystemLocalNetworkProvider {
 }
 
 fn network_for_interface(interface: &if_addrs::Interface) -> Option<ipnet::IpNet> {
-    let eligible = interface.is_oper_up()
-        || (interface.is_loopback() && interface.oper_status == if_addrs::IfOperStatus::Unknown);
-    if !eligible {
+    if matches!(
+        interface.oper_status,
+        if_addrs::IfOperStatus::Down
+            | if_addrs::IfOperStatus::NotPresent
+            | if_addrs::IfOperStatus::LowerLayerDown
+    ) {
         return None;
     }
 
@@ -128,6 +131,7 @@ pub(crate) struct DestinationValidator {
 struct CachedNat64Prefixes {
     expires_at: Instant,
     prefixes: Vec<Nat64Prefix>,
+    failed: bool,
 }
 
 impl DestinationValidator {
@@ -195,7 +199,7 @@ impl DestinationValidator {
                 }
                 resolved.sort_unstable();
                 resolved.dedup();
-                let nat64 = self.nat64_prefixes_for(&resolved).await;
+                let nat64 = self.nat64_prefixes_for(&resolved, &local).await?;
                 self.validate_addresses(&resolved, &local, &nat64, policy)?;
                 return Ok(ResolvedDestination {
                     url: canonical_url,
@@ -210,7 +214,7 @@ impl DestinationValidator {
             .current()
             .await
             .map_err(|_| DestinationError::LocalNetworkUnavailable)?;
-        let nat64 = self.nat64_prefixes_for(&addresses).await;
+        let nat64 = self.nat64_prefixes_for(&addresses, &local).await?;
         self.validate_addresses(&addresses, &local, &nat64, policy)?;
         Ok(ResolvedDestination {
             url: canonical_url,
@@ -262,6 +266,11 @@ impl DestinationValidator {
                     (IpAddr::V6(_), IpAddr::V6(ip)) => {
                         ip.is_loopback() || local.contains(IpAddr::V6(ip))
                     }
+                    // An unspecified IPv6 socket can be dual-stack. Treat mapped
+                    // IPv4 addresses on local interfaces as self-listener targets.
+                    (IpAddr::V6(_), IpAddr::V4(ip)) => {
+                        ip.is_loopback() || local.contains(IpAddr::V4(ip))
+                    }
                     _ => false,
                 };
             }
@@ -270,9 +279,21 @@ impl DestinationValidator {
         })
     }
 
-    async fn nat64_prefixes_for(&self, addresses: &[SocketAddr]) -> Vec<Nat64Prefix> {
-        if !addresses.iter().any(SocketAddr::is_ipv6) {
-            return Vec::new();
+    async fn nat64_prefixes_for(
+        &self,
+        addresses: &[SocketAddr],
+        local: &LocalNetworks,
+    ) -> Result<Vec<Nat64Prefix>, DestinationError> {
+        let needs_discovery = addresses.iter().any(|address| match address.ip() {
+            IpAddr::V4(_) => false,
+            IpAddr::V6(ip) => {
+                super::ip::normalized_embedded_ipv4(ip, &[]).is_none()
+                    && super::ip::classify_ip(IpAddr::V6(ip), local, &[])
+                        == DestinationClass::Public
+            }
+        });
+        if !needs_discovery {
+            return Ok(Vec::new());
         }
 
         if let Some(prefixes) = self.cached_nat64_prefixes().await {
@@ -284,14 +305,18 @@ impl DestinationValidator {
             return prefixes;
         }
 
-        let prefixes = self
-            .resolver
-            .resolve("ipv4only.arpa", 0)
-            .await
-            .ok()
-            .filter(|answers| !answers.is_empty() && answers.len() <= MAX_DNS_ANSWERS)
-            .map(|answers| discover_nat64_prefixes(&answers))
-            .unwrap_or_default();
+        let discovered = match self.resolver.resolve("ipv4only.arpa", 0).await {
+            Ok(answers) if !answers.is_empty() && answers.len() <= MAX_DNS_ANSWERS => {
+                let has_ipv6 = answers.iter().any(SocketAddr::is_ipv6);
+                let prefixes = discover_nat64_prefixes(&answers);
+                if has_ipv6 && prefixes.is_empty() {
+                    Err(DestinationError::ResolutionFailed)
+                } else {
+                    Ok(prefixes)
+                }
+            }
+            Ok(_) | Err(_) => Err(DestinationError::ResolutionFailed),
+        };
 
         let expires_at = self
             .clock
@@ -300,17 +325,24 @@ impl DestinationValidator {
             .unwrap_or_else(|| self.clock.now());
         *self.nat64_cache.lock().await = Some(CachedNat64Prefixes {
             expires_at,
-            prefixes: prefixes.clone(),
+            prefixes: discovered.as_ref().cloned().unwrap_or_default(),
+            failed: discovered.is_err(),
         });
-        prefixes
+        discovered
     }
 
-    async fn cached_nat64_prefixes(&self) -> Option<Vec<Nat64Prefix>> {
+    async fn cached_nat64_prefixes(&self) -> Option<Result<Vec<Nat64Prefix>, DestinationError>> {
         let cache = self.nat64_cache.lock().await;
         cache
             .as_ref()
             .filter(|cached| self.clock.now() < cached.expires_at)
-            .map(|cached| cached.prefixes.clone())
+            .map(|cached| {
+                if cached.failed {
+                    Err(DestinationError::ResolutionFailed)
+                } else {
+                    Ok(cached.prefixes.clone())
+                }
+            })
     }
 }
 
@@ -355,9 +387,7 @@ fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Vec<Nat64Prefix> {
                     }
                 }
             }
-            if seen == [true, true]
-                && !prefixes.contains(&prefix)
-            {
+            if seen == [true, true] && !prefixes.contains(&prefix) {
                 prefixes.push(prefix);
             }
         }
@@ -525,16 +555,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_loopback_is_blocked_before_connect() {
+    async fn alternate_ipv4_loopback_spellings_are_blocked_before_connect() {
         let resolver = FakeResolver::new(Vec::new());
         let validator = validator(resolver.clone());
-        let result = validator
-            .validate(
-                &Url::parse("http://2130706433/").unwrap(),
-                OutboundPolicy::default(),
-            )
-            .await;
-        assert_eq!(result.unwrap_err(), DestinationError::Blocked);
+        for target in [
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://017700000001/",
+            "http://127.1/",
+        ] {
+            let result = validator
+                .validate(&Url::parse(target).unwrap(), OutboundPolicy::default())
+                .await;
+            assert_eq!(result.unwrap_err(), DestinationError::Blocked, "{target}");
+        }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -678,6 +712,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_wildcard_listener_blocks_ipv4_mapped_local_interfaces() {
+        let validator = validator_with_listeners(
+            FakeResolver::new(vec!["[::ffff:8.8.8.10]:11470".parse().unwrap()]),
+            LocalNetworks {
+                interfaces: vec!["8.8.8.8/29".parse().unwrap()],
+            },
+            vec![ListenerBinding {
+                address: "::".parse().unwrap(),
+                port: 11470,
+            }],
+        );
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://self-via-mapped.example:11470/").unwrap(),
+                    OutboundPolicy {
+                        allow_private_network_sources: true,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+    }
+
+    #[tokio::test]
     async fn a_different_port_on_the_listener_host_remains_eligible() {
         let validator = validator_with_listeners(
             FakeResolver::new(vec!["93.184.216.34:8080".parse().unwrap()]),
@@ -742,6 +802,38 @@ mod tests {
             );
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn nat64_discovery_failure_rejects_unclassifiable_public_ipv6() {
+        let validator = validator(FakeResolver::failing());
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[2001:4860:4860::8888]/").unwrap(),
+                    OutboundPolicy::default(),
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::ResolutionFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn nat64_discovery_failure_does_not_hide_standard_prefixes() {
+        let validator = validator(FakeResolver::failing());
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[64:ff9b::a9fe:a9fe]/").unwrap(),
+                    OutboundPolicy {
+                        allow_private_network_sources: true,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
     }
 
     #[tokio::test]
@@ -811,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn local_interface_snapshots_ignore_down_links_but_keep_unknown_loopback() {
+    fn local_interface_snapshots_ignore_down_links_but_fail_closed_on_unknown_status() {
         fn interface(
             ip: std::net::Ipv4Addr,
             prefixlen: u8,
@@ -854,7 +946,7 @@ mod tests {
             24,
             if_addrs::IfOperStatus::Unknown,
         );
-        assert!(network_for_interface(&unknown_public).is_none());
+        assert!(network_for_interface(&unknown_public).is_some());
     }
 
     #[tokio::test(start_paused = true)]

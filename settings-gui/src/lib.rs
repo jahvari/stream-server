@@ -164,7 +164,7 @@ impl HttpConnector {
         }
     }
 
-    pub fn with_settings_control_token(mut self, token: HeaderValue) -> Result<Self> {
+    pub fn with_settings_control_token(mut self, mut token: HeaderValue) -> Result<Self> {
         let url = reqwest::Url::parse(&self.server_url)
             .context("server URL is invalid for protected settings")?;
         if !matches!(url.scheme(), "http" | "https")
@@ -183,6 +183,7 @@ impl HttpConnector {
                 .build()
                 .context("failed to create protected settings client")?,
         );
+        token.set_sensitive(true);
         self.settings_control_token = Some(token);
         Ok(self)
     }
@@ -200,7 +201,9 @@ pub fn parse_settings_control_token(bytes: &[u8]) -> Result<HeaderValue> {
     {
         anyhow::bail!("settings control token is invalid");
     }
-    HeaderValue::from_bytes(token).context("settings control token is invalid")
+    let mut value = HeaderValue::from_bytes(token).context("settings control token is invalid")?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 #[async_trait::async_trait]
@@ -227,7 +230,8 @@ impl ServerConnector for HttpConnector {
     async fn apply_settings(&self, settings: SettingsPayload) -> Result<()> {
         let value = serde_json::to_value(&settings)?;
         let url = format!("{}/settings", self.server_url);
-        if let (Some(client), Some(token)) = (&self.protected_client, &self.settings_control_token)
+        let response = if let (Some(client), Some(token)) =
+            (&self.protected_client, &self.settings_control_token)
         {
             client
                 .post(url)
@@ -235,15 +239,13 @@ impl ServerConnector for HttpConnector {
                 .json(&value)
                 .send()
                 .await?
-                .error_for_status()?;
         } else {
-            self.client
-                .post(url)
-                .json(&value)
-                .send()
-                .await?
-                .error_for_status()?;
+            self.client.post(url).json(&value).send().await?
+        };
+        if response.status().is_redirection() {
+            anyhow::bail!("settings endpoint returned an unexpected redirect");
         }
+        response.error_for_status()?;
         Ok(())
     }
 
@@ -1699,9 +1701,21 @@ mod tests {
     #[test]
     fn token_parser_accepts_one_line_ending_and_rejects_surrounding_whitespace() {
         let token = "a".repeat(64);
-        assert!(parse_settings_control_token(token.as_bytes()).is_ok());
-        assert!(parse_settings_control_token(format!("{token}\n").as_bytes()).is_ok());
-        assert!(parse_settings_control_token(format!("{token}\r\n").as_bytes()).is_ok());
+        assert!(
+            parse_settings_control_token(token.as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            parse_settings_control_token(format!("{token}\n").as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            parse_settings_control_token(format!("{token}\r\n").as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
         assert!(parse_settings_control_token(format!(" {token}").as_bytes()).is_err());
         assert!(parse_settings_control_token(format!("{token} \n").as_bytes()).is_err());
         assert!(parse_settings_control_token(b"abc").is_err());
@@ -1773,7 +1787,7 @@ mod tests {
             .with_settings_control_token(test_token())
             .unwrap();
 
-        connector.apply_settings(empty_settings()).await.unwrap();
+        assert!(connector.apply_settings(empty_settings()).await.is_err());
         task.join().unwrap();
         assert!(matches!(
             redirect_target.accept(),
