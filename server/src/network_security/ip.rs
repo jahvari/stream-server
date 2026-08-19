@@ -220,14 +220,15 @@ fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> De
     {
         return DestinationClass::AlwaysBlocked;
     }
+    let native = IpAddr::V6(ip);
+    if contains(&METADATA_V6_NETS, native) || contains(&ALWAYS_BLOCKED_V6_NETS, native) {
+        return DestinationClass::AlwaysBlocked;
+    }
     if let Some(embedded) = embedded_nat64(ip, nat64) {
         return classify_v4(embedded, local);
     }
 
-    let ip = IpAddr::V6(ip);
-    if contains(&METADATA_V6_NETS, ip) || contains(&ALWAYS_BLOCKED_V6_NETS, ip) {
-        DestinationClass::AlwaysBlocked
-    } else if local.contains(ip) || contains(&PRIVATE_V6_NETS, ip) {
+    if local.contains(native) || contains(&PRIVATE_V6_NETS, native) {
         DestinationClass::PrivateSource
     } else {
         DestinationClass::Public
@@ -435,10 +436,23 @@ mod tests {
     }
 
     #[test]
+    fn discovered_nat64_prefix_cannot_override_native_always_blocked_space() {
+        let local = LocalNetworks::default();
+        let discovered = [Nat64Prefix {
+            network: "2001:db8::".parse().unwrap(),
+            length: 96,
+        }];
+        assert_eq!(
+            classify_ip("2001:db8::5db8:d822".parse().unwrap(), &local, &discovered,),
+            DestinationClass::AlwaysBlocked
+        );
+    }
+
+    #[test]
     fn mapped_and_nat64_public_ipv4_remain_public() {
         let local = LocalNetworks::default();
         let discovered = [Nat64Prefix {
-            network: "2001:db8:64::".parse().unwrap(),
+            network: "2001:4860:64::".parse().unwrap(),
             length: 96,
         }];
         for (value, prefixes) in [
@@ -446,7 +460,7 @@ mod tests {
             ("64:ff9b::5db8:d822", &[][..]),
             ("64:ff9b:1::5db8:d822", &[][..]),
             ("64:ff9b:1:5db8:d8:2200::", &[][..]),
-            ("2001:db8:64::5db8:d822", &discovered[..]),
+            ("2001:4860:64::5db8:d822", &discovered[..]),
         ] {
             assert_eq!(
                 classify_ip(value.parse().unwrap(), &local, prefixes),
