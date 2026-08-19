@@ -210,7 +210,7 @@ pub(crate) fn normalized_embedded_ipv4(ip: Ipv6Addr, nat64: &[Nat64Prefix]) -> O
 }
 
 fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> DestinationClass {
-    if let Some(embedded) = normalized_embedded_ipv4(ip, nat64) {
+    if let Some(embedded) = ip.to_ipv4_mapped() {
         return classify_v4(embedded, local);
     }
     if extract_ipv4_compatible(ip).is_some()
@@ -219,6 +219,9 @@ fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> De
         || extract_teredo_client(ip).is_some()
     {
         return DestinationClass::AlwaysBlocked;
+    }
+    if let Some(embedded) = embedded_nat64(ip, nat64) {
+        return classify_v4(embedded, local);
     }
 
     let ip = IpAddr::V6(ip);
@@ -399,6 +402,36 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn discovered_nat64_prefix_cannot_override_an_obsolete_wrapper() {
+        let local = LocalNetworks::default();
+        let translated_prefix = [Nat64Prefix {
+            network: "::ffff:0:0:0".parse().unwrap(),
+            length: 96,
+        }];
+        assert_eq!(
+            classify_ip(
+                "::ffff:0:93.184.216.34".parse().unwrap(),
+                &local,
+                &translated_prefix,
+            ),
+            DestinationClass::AlwaysBlocked
+        );
+
+        let compatible_prefix = [Nat64Prefix {
+            network: "::".parse().unwrap(),
+            length: 96,
+        }];
+        assert_eq!(
+            classify_ip(
+                "::93.184.216.34".parse().unwrap(),
+                &local,
+                &compatible_prefix,
+            ),
+            DestinationClass::AlwaysBlocked
+        );
     }
 
     #[test]
