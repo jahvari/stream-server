@@ -48,6 +48,7 @@ mod cache_cleaner;
 mod diagnostics;
 mod ffmpeg_setup;
 mod local_addon;
+mod network_security;
 mod routes;
 mod ssdp;
 mod state;
