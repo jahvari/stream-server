@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     Router,
     body::Body,
-    extract::{Path, RawQuery, State},
+    extract::{OriginalUri, Path, RawQuery, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
@@ -52,12 +52,20 @@ struct ParsedProxyRequest {
     response_headers: HeaderMap,
 }
 
+#[cfg(test)]
 fn parse_proxy_request(
     rest: &str,
     raw_query: Option<&str>,
 ) -> Result<ParsedProxyRequest, ProxyError> {
-    let input_length = rest
-        .len()
+    parse_proxy_request_with_raw_length(rest, raw_query, rest.len())
+}
+
+fn parse_proxy_request_with_raw_length(
+    rest: &str,
+    raw_query: Option<&str>,
+    raw_rest_length: usize,
+) -> Result<ParsedProxyRequest, ProxyError> {
+    let input_length = raw_rest_length
         .checked_add(raw_query.map_or(0, str::len))
         .ok_or(ProxyError::InvalidRequest)?;
     if input_length > MAX_PROXY_INPUT {
@@ -293,22 +301,28 @@ async fn proxy_root_handler(
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    handle_proxy(state, String::new(), raw_query, headers, method).await
+    handle_proxy(state, String::new(), 0, raw_query, headers, method).await
 }
 
 async fn proxy_path_handler(
     State(state): State<AppState>,
     Path(rest): Path<String>,
+    OriginalUri(original_uri): OriginalUri,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    handle_proxy(state, rest, raw_query, headers, method).await
+    let raw_rest_length = original_uri
+        .path()
+        .strip_prefix("/proxy/")
+        .map_or_else(|| original_uri.path().len(), str::len);
+    handle_proxy(state, rest, raw_rest_length, raw_query, headers, method).await
 }
 
 async fn handle_proxy(
     state: AppState,
     rest: String,
+    raw_rest_length: usize,
     raw_query: Option<String>,
     headers: HeaderMap,
     method: Method,
@@ -317,10 +331,11 @@ async fn handle_proxy(
         Ok(context) => context,
         Err(_) => return proxy_error_response(ProxyError::Capacity),
     };
-    let request = match parse_proxy_request(&rest, raw_query.as_deref()) {
-        Ok(request) => request,
-        Err(error) => return proxy_error_response(error),
-    };
+    let request =
+        match parse_proxy_request_with_raw_length(&rest, raw_query.as_deref(), raw_rest_length) {
+            Ok(request) => request,
+            Err(error) => return proxy_error_response(error),
+        };
     let (upstream, final_url) = match fetch_with_redirects(
         &state.proxy_runtime,
         &context,
@@ -701,8 +716,9 @@ fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PLAYLIST_INPUT, ProxyError, buffered_proxy_body, collect_playlist,
-        fetch_with_redirects, parse_proxy_request, rewrite_playlist_bounded, streaming_proxy_body,
+        MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, ProxyError, buffered_proxy_body, collect_playlist,
+        fetch_with_redirects, parse_proxy_request, parse_proxy_request_with_raw_length,
+        rewrite_playlist_bounded, streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -810,6 +826,17 @@ mod tests {
         let query = format!("d={}", urlencoding::encode(&oversized));
         assert!(matches!(
             parse_proxy_request("", Some(&query)),
+            Err(ProxyError::InvalidRequest)
+        ));
+
+        // Axum percent-decodes wildcard path captures. The raw URI length must
+        // remain authoritative so encoded input cannot shrink under the cap.
+        assert!(matches!(
+            parse_proxy_request_with_raw_length(
+                "d=https%3A%2F%2Fexample.com",
+                None,
+                MAX_PROXY_INPUT + 1,
+            ),
             Err(ProxyError::InvalidRequest)
         ));
     }
