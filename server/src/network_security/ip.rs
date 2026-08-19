@@ -190,11 +190,12 @@ fn embedded_nat64(ip: Ipv6Addr, prefixes: &[Nat64Prefix]) -> Option<Ipv4Addr> {
         })
 }
 
+pub(crate) fn normalized_embedded_ipv4(ip: Ipv6Addr, nat64: &[Nat64Prefix]) -> Option<Ipv4Addr> {
+    ip.to_ipv4_mapped().or_else(|| embedded_nat64(ip, nat64))
+}
+
 fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> DestinationClass {
-    if let Some(embedded) = ip.to_ipv4_mapped() {
-        return classify_v4(embedded, local);
-    }
-    if let Some(embedded) = embedded_nat64(ip, nat64) {
+    if let Some(embedded) = normalized_embedded_ipv4(ip, nat64) {
         return classify_v4(embedded, local);
     }
     if extract_ipv4_compatible(ip).is_some()

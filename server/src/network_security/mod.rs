@@ -1,1 +1,2 @@
 mod ip;
+mod resolver;
