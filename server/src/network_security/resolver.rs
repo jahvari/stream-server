@@ -356,9 +356,7 @@ fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Vec<Nat64Prefix> {
                 }
             }
             if seen == [true, true]
-                && !prefixes
-                    .iter()
-                    .any(|existing: &Nat64Prefix| *existing == prefix)
+                && !prefixes.contains(&prefix)
             {
                 prefixes.push(prefix);
             }
