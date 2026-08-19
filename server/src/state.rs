@@ -1,4 +1,11 @@
 use crate::routes::system::ServerSettings;
+use crate::{
+    network_security::{
+        DestinationValidator, ListenerBinding, ProxyPolicySettings, ProxyRuntime, SystemClock,
+        SystemDnsResolver, SystemLocalNetworkProvider,
+    },
+    settings_control::SettingsControl,
+};
 use enginefs::EngineFS;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -24,6 +31,9 @@ pub struct AppState {
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    pub(crate) settings_control: SettingsControl,
+    pub(crate) proxy_runtime: Arc<ProxyRuntime>,
+    pub(crate) settings_persistence: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -86,6 +96,23 @@ impl AppState {
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
         let updater = Arc::new(crate::updater::UpdateManager::new(config_dir.clone()));
+        let proxy_policy = settings
+            .try_read()
+            .map(|settings| ProxyPolicySettings {
+                allow_private_network_sources: settings.allow_private_network_sources,
+                allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+            })
+            .unwrap_or_default();
+        let default_http_addr = SocketAddr::from(([127, 0, 0, 1], 11470));
+        let validator = Arc::new(DestinationValidator::new(
+            Arc::new(SystemDnsResolver),
+            Arc::new(SystemLocalNetworkProvider),
+            Arc::new(SystemClock),
+            vec![ListenerBinding {
+                address: default_http_addr.ip(),
+                port: default_http_addr.port(),
+            }],
+        ));
 
         Self {
             engine,
@@ -96,26 +123,23 @@ impl AppState {
             config_dir,
             log_dir,
             base_url: "http://127.0.0.1:11470".to_string(),
-            http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
+            http_addr: default_http_addr,
             update_install_exit_enabled: true,
             updater,
             local_index: LocalIndex::new(),
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
+            settings_control: SettingsControl::ephemeral(),
+            proxy_runtime: Arc::new(ProxyRuntime::new(proxy_policy, validator)),
+            settings_persistence: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub async fn save_settings(&self) -> anyhow::Result<()> {
-        let settings = self.settings.read().await;
-        let json = serde_json::to_string_pretty(&*settings)?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.settings_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        tokio::fs::write(&self.settings_path, json).await?;
+        let _persistence = self.settings_persistence.lock().await;
+        let settings = self.settings.read().await.clone();
+        crate::routes::system::persist_settings_atomic(&self.settings_path, &settings).await?;
         tracing::info!("Settings saved to {:?}", self.settings_path);
         Ok(())
     }
@@ -150,11 +174,14 @@ impl AppState {
                 );
                 settings.bt_max_connections = enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS;
             }
+            crate::routes::system::apply_proxy_environment_overrides(&mut settings);
             return settings;
         }
 
         tracing::info!("Using default settings");
-        defaults.clone()
+        let mut settings = defaults.clone();
+        crate::routes::system::apply_proxy_environment_overrides(&mut settings);
+        settings
     }
 }
 
@@ -163,13 +190,28 @@ impl AppState {
 pub struct TrackerStorageBridge {
     settings: Arc<RwLock<ServerSettings>>,
     settings_path: PathBuf,
+    settings_persistence: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TrackerStorageBridge {
+    #[allow(dead_code)] // Retained for embedders that construct the bridge directly.
     pub fn new(settings: Arc<RwLock<ServerSettings>>, settings_path: PathBuf) -> Self {
+        Self::new_with_persistence(
+            settings,
+            settings_path,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+    }
+
+    pub fn new_with_persistence(
+        settings: Arc<RwLock<ServerSettings>>,
+        settings_path: PathBuf,
+        settings_persistence: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
         Self {
             settings,
             settings_path,
+            settings_persistence,
         }
     }
 }
@@ -225,32 +267,20 @@ impl enginefs::TrackerStorage for TrackerStorageBridge {
     fn save_trackers(&self, trackers: Vec<String>, timestamp: i64) {
         let settings = self.settings.clone();
         let settings_path = self.settings_path.clone();
+        let settings_persistence = self.settings_persistence.clone();
 
         // Spawn async task to update and save
         tokio::spawn(async move {
-            let mut guard = settings.write().await;
-            guard.cached_trackers = trackers;
-            guard.trackers_last_updated = timestamp;
-            let json = match serde_json::to_string_pretty(&*guard) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::error!("Failed to serialize settings: {}", e);
-                    return;
-                }
-            };
-            drop(guard);
-
-            // Ensure parent directory exists
-            if let Some(parent) = settings_path.parent()
-                && let Err(e) = tokio::fs::create_dir_all(parent).await
+            let _persistence = settings_persistence.lock().await;
+            let mut next = settings.read().await.clone();
+            next.cached_trackers = trackers;
+            next.trackers_last_updated = timestamp;
+            if let Err(e) =
+                crate::routes::system::persist_settings_atomic(&settings_path, &next).await
             {
-                tracing::error!("Failed to create settings directory: {}", e);
-                return;
-            }
-
-            if let Err(e) = tokio::fs::write(&settings_path, json).await {
                 tracing::error!("Failed to save settings after tracker update: {}", e);
             } else {
+                *settings.write().await = next;
                 tracing::debug!("Saved cached trackers to settings");
             }
         });

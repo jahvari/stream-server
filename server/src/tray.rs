@@ -368,6 +368,10 @@ struct DirectConnector {
 
 #[async_trait::async_trait]
 impl settings_gui::ServerConnector for DirectConnector {
+    fn can_update_protected_settings(&self) -> bool {
+        true
+    }
+
     async fn get_settings(&self) -> anyhow::Result<settings_gui::SettingsPayload> {
         let settings = self.state.settings.read().await;
         let val = serde_json::to_value(&*settings)?;
@@ -376,7 +380,13 @@ impl settings_gui::ServerConnector for DirectConnector {
 
     async fn apply_settings(&self, payload: settings_gui::SettingsPayload) -> anyhow::Result<()> {
         let val = serde_json::to_value(&payload)?;
-        crate::routes::system::update_settings(&self.state, &val).await
+        crate::routes::system::update_settings(
+            &self.state,
+            &val,
+            crate::settings_control::SettingsMutationAuthority::TrustedLocal,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn get_logs(&self) -> anyhow::Result<settings_gui::LogsSnapshot> {

@@ -50,6 +50,7 @@ mod ffmpeg_setup;
 mod local_addon;
 mod network_security;
 mod routes;
+mod settings_control;
 mod ssdp;
 mod state;
 mod tui;
@@ -381,11 +382,14 @@ async fn run_inner(
     };
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
+    let settings_control = settings_control::SettingsControl::load_or_create(&config_dir)?;
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
     let settings_path = config_dir.join("settings.json");
-    let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
+    let settings_persistence = Arc::new(tokio::sync::Mutex::new(()));
+    let tracker_storage = Arc::new(state::TrackerStorageBridge::new_with_persistence(
         settings_arc.clone(),
         settings_path.clone(),
+        settings_persistence.clone(),
     ));
 
     let backend_config = enginefs::backend::BackendConfig {
@@ -467,6 +471,36 @@ async fn run_inner(
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.update_install_exit_enabled = cfg.enable_update_exit;
+    state.settings_control = settings_control;
+    state.settings_persistence = settings_persistence;
+    let https_cert_path = config_dir.join("https-cert.pem");
+    let https_key_path = config_dir.join("https-key.pem");
+    let mut listeners = vec![network_security::ListenerBinding {
+        address: bound_http_addr.ip(),
+        port: bound_http_addr.port(),
+    }];
+    if https_cert_path.exists()
+        && https_key_path.exists()
+        && let Some(https_addr) = cfg.https_addr
+    {
+        listeners.push(network_security::ListenerBinding {
+            address: https_addr.ip(),
+            port: https_addr.port(),
+        });
+    }
+    let validator = Arc::new(network_security::DestinationValidator::new(
+        Arc::new(network_security::SystemDnsResolver),
+        Arc::new(network_security::SystemLocalNetworkProvider),
+        Arc::new(network_security::SystemClock),
+        listeners,
+    ));
+    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+        network_security::ProxyPolicySettings {
+            allow_private_network_sources: settings.allow_private_network_sources,
+            allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+        },
+        validator,
+    ));
 
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
@@ -618,9 +652,6 @@ async fn run_inner(
 
         let _ = shutdown_started_tx.send(source);
     };
-
-    let https_cert_path = config_dir.join("https-cert.pem");
-    let https_key_path = config_dir.join("https-key.pem");
 
     if let Some(https_addr) = cfg.https_addr {
         if https_cert_path.exists() && https_key_path.exists() {
@@ -839,7 +870,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tgz", routes::archive::router())
         .nest("/nzb", routes::nzb::router())
         .nest("/local-addon", local_addon::get_router())
-        .nest("/proxy", routes::proxy::router())
+        .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
         .route("/hlsv2/status", get(routes::hls::hls_status))
@@ -881,10 +912,11 @@ pub fn build_router(state: AppState) -> Router {
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                let target = diagnostics::logging::sanitize_request_target(request.uri());
                 tracing::info_span!(
                     "request",
                     method = %request.method(),
-                    path = request.uri().path(),
+                    path = %target.path,
                 )
             }),
         )

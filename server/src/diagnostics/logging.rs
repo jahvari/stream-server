@@ -41,7 +41,11 @@ fn format_headers(headers: &axum::http::HeaderMap) -> String {
     fn is_sensitive(name: &axum::http::HeaderName) -> bool {
         matches!(
             name.as_str(),
-            "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+            "authorization"
+                | "proxy-authorization"
+                | "cookie"
+                | "set-cookie"
+                | "x-stream-server-settings-token"
         )
     }
 
@@ -62,6 +66,27 @@ fn format_headers(headers: &axum::http::HeaderMap) -> String {
         }
     }
     out
+}
+
+pub(crate) struct SanitizedRequestTarget {
+    pub(crate) uri: String,
+    pub(crate) path: String,
+    pub(crate) query: String,
+}
+
+pub(crate) fn sanitize_request_target(uri: &axum::http::Uri) -> SanitizedRequestTarget {
+    if uri.path().starts_with("/proxy") {
+        return SanitizedRequestTarget {
+            uri: "/proxy/<redacted>".to_owned(),
+            path: "/proxy/<redacted>".to_owned(),
+            query: String::new(),
+        };
+    }
+    SanitizedRequestTarget {
+        uri: uri.to_string(),
+        path: uri.path().to_owned(),
+        query: uri.query().unwrap_or("").to_owned(),
+    }
 }
 
 /// Emit an ERROR log describing an unhandled route or request (a 404 fallback,
@@ -90,15 +115,16 @@ pub fn log_unhandled(
     let peer = peer
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let request_target = sanitize_request_target(uri);
 
     tracing::error!(
         reason,
         status,
         peer = %peer,
         method = %method,
-        uri = %uri,
-        path = uri.path(),
-        query = uri.query().unwrap_or(""),
+        uri = %request_target.uri,
+        path = %request_target.path,
+        query = %request_target.query,
         version = ?version,
         host = %header_value(&header::HOST),
         user_agent = %header_value(&header::USER_AGENT),
@@ -367,3 +393,46 @@ unsafe extern "system" fn windows_exception_filter(
 
 pub const MEMORY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 pub const MEMORY_GROWTH_ALERT_BYTES: u64 = 128 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::{format_headers, sanitize_request_target};
+    use axum::http::{HeaderMap, HeaderValue, Uri};
+
+    #[test]
+    fn settings_control_header_is_redacted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-stream-server-settings-token",
+            HeaderValue::from_static(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+        let rendered = format_headers(&headers);
+        assert_eq!(
+            rendered,
+            "x-stream-server-settings-token=<redacted:64 bytes>"
+        );
+        assert!(!rendered.contains("aaaaaaaa"));
+    }
+
+    #[test]
+    fn proxy_targets_are_redacted_before_extractors_run() {
+        let uri: Uri = "/proxy/d=http%3A%2F%2Fuser%3Asecret%40host/private?token=secret"
+            .parse()
+            .unwrap();
+        let target = sanitize_request_target(&uri);
+        assert_eq!(target.uri, "/proxy/<redacted>");
+        assert_eq!(target.path, "/proxy/<redacted>");
+        assert_eq!(target.query, "");
+    }
+
+    #[test]
+    fn ordinary_request_targets_keep_diagnostic_context() {
+        let uri: Uri = "/heartbeat?probe=1".parse().unwrap();
+        let target = sanitize_request_target(&uri);
+        assert_eq!(target.uri, "/heartbeat?probe=1");
+        assert_eq!(target.path, "/heartbeat");
+        assert_eq!(target.query, "probe=1");
+    }
+}
