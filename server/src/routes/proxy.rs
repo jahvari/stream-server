@@ -1,5 +1,7 @@
+#[cfg(test)]
+use crate::network_security::ProxyProducerProbe;
 use crate::{
-    network_security::{DestinationError, ProxyCapacityPermit, ProxyRequestContext, ProxyRuntime},
+    network_security::{DestinationError, ProxyProducerLease, ProxyRequestContext, ProxyRuntime},
     state::AppState,
 };
 use axum::{
@@ -17,10 +19,13 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     net::{IpAddr, SocketAddr},
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
+use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 
@@ -31,6 +36,9 @@ const MAX_HEADER_PAIR: usize = 8 * 1024;
 const RAW_CANONICAL_PATH_KEY: &str = "x-stream-path";
 const RAW_CANONICAL_PATH_OPTION: &str = "&x-stream-path=raw";
 const RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(30);
+const UPSTREAM_READ_IDLE_DEADLINE: Duration = Duration::from_secs(30);
+const DOWNSTREAM_NO_PROGRESS_DEADLINE: Duration = Duration::from_secs(120);
+const PROXY_BODY_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyError {
@@ -585,27 +593,24 @@ async fn handle_proxy_suffix_for_peer(
             Ok(body) => body,
             Err(error) => return proxy_error_response(error),
         };
-        let ProxyRequestContext {
-            cancellation,
-            capacity,
-            ..
-        } = context;
         return build_proxy_response(
             status,
             &upstream_headers,
             &effective_response_headers,
-            buffered_proxy_body(Bytes::from(body), cancellation, capacity),
+            buffered_proxy_body(Bytes::from(body), context.into_producer_lease()),
             true,
             credential_bearing,
         );
     }
 
-    let ProxyRequestContext {
-        cancellation,
-        capacity,
-        ..
-    } = context;
-    let body = streaming_proxy_body(Box::pin(upstream.bytes_stream()), cancellation, capacity);
+    let body = streaming_proxy_body(
+        Box::pin(
+            upstream
+                .bytes_stream()
+                .map(|item| item.map_err(|_| ProxySourceError)),
+        ),
+        context.into_producer_lease(),
+    );
     build_proxy_response(
         status,
         &upstream_headers,
@@ -795,112 +800,607 @@ fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn streaming_proxy_body(
-    stream: UpstreamByteStream,
-    cancellation: CancellationToken,
-    capacity: ProxyCapacityPermit,
-) -> Body {
-    let stream = ProxyBodyState {
-        stream,
-        cancellation,
-        _capacity: capacity,
-        terminal: false,
-    };
-    let stream = futures_util::stream::unfold(stream, |mut state| async move {
-        if state.terminal {
-            return None;
-        }
-        let next = tokio::select! {
-            biased;
-            _ = state.cancellation.cancelled() => {
-                state.terminal = true;
-                Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "proxy policy changed",
-                )))
-            }
-            result = tokio::time::timeout(Duration::from_secs(30), state.stream.next()) => {
-                match result {
-                    Err(_) => {
-                        state.terminal = true;
-                        Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "proxy upstream body timed out",
-                        )))
-                    }
-                    Ok(Some(Ok(bytes))) => Some(Ok(bytes)),
-                    Ok(Some(Err(_))) => {
-                        state.terminal = true;
-                        Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "proxy upstream body failed",
-                        )))
-                    }
-                    Ok(None) => return None,
-                }
-            }
-        };
-        next.map(|item| (item, state))
-    });
-    Body::from_stream(stream)
+fn streaming_proxy_body(stream: UpstreamByteStream, lease: ProxyProducerLease) -> Body {
+    spawn_proxy_body(ProxyBodySource::Streaming(stream), lease).0
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProxySourceError;
 
 type UpstreamByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<Bytes, ProxySourceError>> + Send + 'static>>;
 
-struct ProxyBodyState {
-    stream: UpstreamByteStream,
-    cancellation: CancellationToken,
-    _capacity: ProxyCapacityPermit,
-    terminal: bool,
+enum ProxyBodySource {
+    Streaming(UpstreamByteStream),
+    Buffered(Option<Bytes>),
 }
 
-struct BufferedProxyBodyState {
-    bytes: Bytes,
-    offset: usize,
-    cancellation: CancellationToken,
-    _capacity: ProxyCapacityPermit,
-    terminal: bool,
+enum ProxySourceItem {
+    Chunk(Bytes),
+    Eof,
+    Failed,
 }
 
-fn buffered_proxy_body(
-    bytes: Bytes,
+impl ProxyBodySource {
+    async fn next(&mut self) -> ProxySourceItem {
+        match self {
+            Self::Streaming(stream) => match stream.next().await {
+                Some(Ok(bytes)) => ProxySourceItem::Chunk(bytes),
+                Some(Err(_)) => ProxySourceItem::Failed,
+                None => ProxySourceItem::Eof,
+            },
+            Self::Buffered(bytes) => bytes
+                .take()
+                .map_or(ProxySourceItem::Eof, ProxySourceItem::Chunk),
+        }
+    }
+}
+
+enum ProxyHandoffSlot {
+    Empty,
+    Reserved,
+    Full {
+        bytes: Bytes,
+        deadline: tokio::time::Instant,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProxyHandoffTerminal {
+    Running,
+    Clean,
+    FailedPending,
+    FailedDelivered,
+}
+
+struct ProxyHandoffState {
+    slot: ProxyHandoffSlot,
+    terminal: ProxyHandoffTerminal,
+    consumer_closed: bool,
+}
+
+struct ProxyHandoff {
+    state: Mutex<ProxyHandoffState>,
+    producer_notify: Notify,
+    consumer_notify: Notify,
     cancellation: CancellationToken,
-    capacity: ProxyCapacityPermit,
-) -> Body {
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let stream = futures_util::stream::unfold(
-        BufferedProxyBodyState {
-            bytes,
-            offset: 0,
+    #[cfg(test)]
+    producer_probe: Option<ProxyProducerProbe>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProxyProducerStop {
+    ConsumerClosed,
+    Failed,
+}
+
+enum ProxyConsumerItem {
+    Chunk(Bytes),
+    Failed,
+    Eof,
+}
+
+impl ProxyHandoff {
+    fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            state: Mutex::new(ProxyHandoffState {
+                slot: ProxyHandoffSlot::Empty,
+                terminal: ProxyHandoffTerminal::Running,
+                consumer_closed: false,
+            }),
+            producer_notify: Notify::new(),
+            consumer_notify: Notify::new(),
             cancellation,
-            _capacity: capacity,
-            terminal: false,
-        },
-        |mut state| async move {
-            if state.terminal || state.offset == state.bytes.len() {
-                return None;
+            #[cfg(test)]
+            producer_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_producer_probe(mut self, producer_probe: Option<ProxyProducerProbe>) -> Self {
+        self.producer_probe = producer_probe;
+        self
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ProxyHandoffState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn fail_locked(state: &mut ProxyHandoffState) {
+        if !state.consumer_closed && state.terminal == ProxyHandoffTerminal::Running {
+            state.slot = ProxyHandoffSlot::Empty;
+            state.terminal = ProxyHandoffTerminal::FailedPending;
+        }
+    }
+
+    fn fail(&self) {
+        let mut state = self.lock_state();
+        Self::fail_locked(&mut state);
+        drop(state);
+        #[cfg(test)]
+        if let Some(producer_probe) = &self.producer_probe {
+            producer_probe.mark_terminated_before_ready();
+        }
+        self.producer_notify.notify_waiters();
+        self.consumer_notify.notify_waiters();
+    }
+
+    fn close_consumer(&self) {
+        let mut state = self.lock_state();
+        state.consumer_closed = true;
+        state.slot = ProxyHandoffSlot::Empty;
+        drop(state);
+        #[cfg(test)]
+        if let Some(producer_probe) = &self.producer_probe {
+            producer_probe.mark_terminated_before_ready();
+        }
+        self.producer_notify.notify_waiters();
+        self.consumer_notify.notify_waiters();
+    }
+
+    async fn reserve(&self) -> Result<(), ProxyProducerStop> {
+        loop {
+            let notified = self.producer_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.lock_state();
+                if state.consumer_closed {
+                    return Err(ProxyProducerStop::ConsumerClosed);
+                }
+                if state.terminal != ProxyHandoffTerminal::Running {
+                    return Err(ProxyProducerStop::Failed);
+                }
+                if matches!(state.slot, ProxyHandoffSlot::Empty) {
+                    state.slot = ProxyHandoffSlot::Reserved;
+                    return Ok(());
+                }
             }
-            if state.cancellation.is_cancelled() {
-                state.terminal = true;
-                return Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "proxy policy changed",
-                    )),
-                    state,
-                ));
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => {
+                    self.fail();
+                    return Err(ProxyProducerStop::Failed);
+                }
+                _ = &mut notified => {}
             }
-            let end = state
-                .offset
-                .saturating_add(CHUNK_SIZE)
-                .min(state.bytes.len());
-            let chunk = state.bytes.slice(state.offset..end);
-            state.offset = end;
-            Some((Ok::<_, std::io::Error>(chunk), state))
+        }
+    }
+
+    fn publish(
+        &self,
+        bytes: Bytes,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ProxyProducerStop> {
+        let mut state = self.lock_state();
+        if state.consumer_closed {
+            state.slot = ProxyHandoffSlot::Empty;
+            return Err(ProxyProducerStop::ConsumerClosed);
+        }
+        if self.cancellation.is_cancelled() || state.terminal != ProxyHandoffTerminal::Running {
+            Self::fail_locked(&mut state);
+            drop(state);
+            #[cfg(test)]
+            if let Some(producer_probe) = &self.producer_probe {
+                producer_probe.mark_terminated_before_ready();
+            }
+            self.consumer_notify.notify_waiters();
+            return Err(ProxyProducerStop::Failed);
+        }
+        debug_assert!(matches!(state.slot, ProxyHandoffSlot::Reserved));
+        state.slot = ProxyHandoffSlot::Full { bytes, deadline };
+        #[cfg(test)]
+        let consumer_notification_deferred = self.producer_probe.is_some();
+        drop(state);
+        #[cfg(test)]
+        if consumer_notification_deferred {
+            return Ok(());
+        }
+        self.consumer_notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn wait_until_consumed(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ProxyProducerStop> {
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+        #[cfg(test)]
+        std::future::poll_fn(|context| {
+            let _ = sleep.as_mut().poll(context);
+            Poll::Ready(())
+        })
+        .await;
+        loop {
+            let notified = self.producer_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.lock_state();
+                if state.consumer_closed {
+                    return Err(ProxyProducerStop::ConsumerClosed);
+                }
+                if state.terminal != ProxyHandoffTerminal::Running {
+                    return Err(ProxyProducerStop::Failed);
+                }
+                if matches!(state.slot, ProxyHandoffSlot::Empty) {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                if matches!(state.slot, ProxyHandoffSlot::Full { .. })
+                    && let Some(producer_probe) = &self.producer_probe
+                {
+                    producer_probe.mark_full_deadline_armed();
+                }
+            }
+            #[cfg(test)]
+            if self.producer_probe.is_some() {
+                self.consumer_notify.notify_waiters();
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => {
+                    self.fail();
+                    return Err(ProxyProducerStop::Failed);
+                }
+                _ = &mut sleep => {
+                    let mut state = self.lock_state();
+                    if state.consumer_closed {
+                        return Err(ProxyProducerStop::ConsumerClosed);
+                    }
+                    if state.terminal != ProxyHandoffTerminal::Running {
+                        return Err(ProxyProducerStop::Failed);
+                    }
+                    if matches!(state.slot, ProxyHandoffSlot::Empty) {
+                        return Ok(());
+                    }
+                    if let ProxyHandoffSlot::Full {
+                        deadline: published_deadline,
+                        ..
+                    } = &state.slot
+                    {
+                        debug_assert_eq!(*published_deadline, deadline);
+                    }
+                    Self::fail_locked(&mut state);
+                    drop(state);
+                    #[cfg(test)]
+                    if let Some(producer_probe) = &self.producer_probe {
+                        producer_probe.mark_terminated_before_ready();
+                    }
+                    self.producer_notify.notify_waiters();
+                    self.consumer_notify.notify_waiters();
+                    return Err(ProxyProducerStop::Failed);
+                }
+                _ = &mut notified => {}
+            }
+        }
+    }
+
+    async fn consumer_closed(&self) {
+        loop {
+            let notified = self.producer_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lock_state().consumer_closed {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn clean(&self) {
+        let mut state = self.lock_state();
+        if self.cancellation.is_cancelled() {
+            Self::fail_locked(&mut state);
+        } else if !state.consumer_closed && state.terminal == ProxyHandoffTerminal::Running {
+            debug_assert!(matches!(state.slot, ProxyHandoffSlot::Reserved));
+            state.slot = ProxyHandoffSlot::Empty;
+            state.terminal = ProxyHandoffTerminal::Clean;
+        }
+        drop(state);
+        #[cfg(test)]
+        if let Some(producer_probe) = &self.producer_probe {
+            producer_probe.mark_terminated_before_ready();
+        }
+        self.producer_notify.notify_waiters();
+        self.consumer_notify.notify_waiters();
+    }
+
+    async fn take(&self) -> ProxyConsumerItem {
+        loop {
+            let notified = self.consumer_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.lock_state();
+                if self.cancellation.is_cancelled() {
+                    Self::fail_locked(&mut state);
+                }
+                if state.terminal == ProxyHandoffTerminal::Running
+                    && let ProxyHandoffSlot::Full { deadline, .. } = &state.slot
+                    && tokio::time::Instant::now() >= *deadline
+                {
+                    Self::fail_locked(&mut state);
+                }
+                #[cfg(test)]
+                if state.terminal != ProxyHandoffTerminal::Running
+                    && let Some(producer_probe) = &self.producer_probe
+                {
+                    producer_probe.mark_terminated_before_ready();
+                }
+                match state.terminal {
+                    ProxyHandoffTerminal::FailedPending => {
+                        state.slot = ProxyHandoffSlot::Empty;
+                        state.terminal = ProxyHandoffTerminal::FailedDelivered;
+                        drop(state);
+                        self.producer_notify.notify_waiters();
+                        return ProxyConsumerItem::Failed;
+                    }
+                    ProxyHandoffTerminal::FailedDelivered => return ProxyConsumerItem::Eof,
+                    ProxyHandoffTerminal::Clean => {
+                        debug_assert!(matches!(state.slot, ProxyHandoffSlot::Empty));
+                        return ProxyConsumerItem::Eof;
+                    }
+                    ProxyHandoffTerminal::Running => {
+                        #[cfg(test)]
+                        let producer_probe_pending = self
+                            .producer_probe
+                            .as_ref()
+                            .is_some_and(ProxyProducerProbe::is_pending);
+                        #[cfg(not(test))]
+                        let producer_probe_pending = false;
+                        if matches!(state.slot, ProxyHandoffSlot::Full { .. })
+                            && !producer_probe_pending
+                        {
+                            let ProxyHandoffSlot::Full { bytes, .. } =
+                                std::mem::replace(&mut state.slot, ProxyHandoffSlot::Empty)
+                            else {
+                                unreachable!()
+                            };
+                            drop(state);
+                            self.producer_notify.notify_waiters();
+                            return ProxyConsumerItem::Chunk(bytes);
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => self.fail(),
+                _ = &mut notified => {}
+            }
+        }
+    }
+}
+
+struct ProxyProducerGuard {
+    handoff: Arc<ProxyHandoff>,
+    armed: bool,
+}
+
+struct ProxyProducerTask<F> {
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F> ProxyProducerTask<F> {
+    fn new(future: F) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+        }
+    }
+
+    fn drop_future(&mut self) {
+        let Some(future) = self.future.take() else {
+            return;
+        };
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+            drop_panic_payload(payload);
+        }
+    }
+}
+
+impl<F> Future for ProxyProducerTask<F>
+where
+    F: Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.future
+                .as_mut()
+                .expect("proxy producer task polled after completion")
+                .as_mut()
+                .poll(context)
+        }));
+        match outcome {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(())) => {
+                self.drop_future();
+                Poll::Ready(())
+            }
+            Err(payload) => {
+                drop_panic_payload(payload);
+                self.drop_future();
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl<F> Drop for ProxyProducerTask<F> {
+    fn drop(&mut self) {
+        self.drop_future();
+    }
+}
+
+fn drop_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+}
+
+impl ProxyProducerGuard {
+    fn new(handoff: Arc<ProxyHandoff>) -> Self {
+        Self {
+            handoff,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProxyProducerGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handoff.fail();
+        }
+    }
+}
+
+struct ProxyBodyConsumer {
+    handoff: Arc<ProxyHandoff>,
+    producer: JoinHandle<()>,
+}
+
+struct ProxyProducerResources {
+    source: ProxyBodySource,
+    _lease: ProxyProducerLease,
+}
+
+impl Drop for ProxyBodyConsumer {
+    fn drop(&mut self) {
+        self.handoff.close_consumer();
+        self.producer.abort();
+    }
+}
+
+async fn read_source_chunk(
+    source: &mut ProxyBodySource,
+    handoff: &ProxyHandoff,
+) -> Result<Option<Bytes>, ProxyProducerStop> {
+    let deadline = tokio::time::sleep(UPSTREAM_READ_IDLE_DEADLINE);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = handoff.cancellation.cancelled() => {
+                handoff.fail();
+                return Err(ProxyProducerStop::Failed);
+            }
+            _ = handoff.consumer_closed() => {
+                return Err(ProxyProducerStop::ConsumerClosed);
+            }
+            _ = &mut deadline => {
+                handoff.fail();
+                return Err(ProxyProducerStop::Failed);
+            }
+            item = source.next() => match item {
+                ProxySourceItem::Chunk(bytes) if bytes.is_empty() => {
+                    tokio::task::yield_now().await;
+                }
+                ProxySourceItem::Chunk(bytes) => return Ok(Some(bytes)),
+                ProxySourceItem::Eof => return Ok(None),
+                ProxySourceItem::Failed => {
+                    handoff.fail();
+                    return Err(ProxyProducerStop::Failed);
+                }
+            }
+        }
+    }
+}
+
+async fn run_proxy_body_producer(
+    mut resources: ProxyProducerResources,
+    handoff: Arc<ProxyHandoff>,
+    mut guard: ProxyProducerGuard,
+) {
+    loop {
+        if handoff.reserve().await.is_err() {
+            guard.disarm();
+            return;
+        }
+        let bytes = match read_source_chunk(&mut resources.source, &handoff).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                drop(resources);
+                handoff.clean();
+                guard.disarm();
+                return;
+            }
+            Err(_) => {
+                guard.disarm();
+                return;
+            }
+        };
+
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            if offset != 0 && handoff.reserve().await.is_err() {
+                guard.disarm();
+                return;
+            }
+            let end = offset
+                .saturating_add(PROXY_BODY_CHUNK_SIZE)
+                .min(bytes.len());
+            let chunk = Bytes::copy_from_slice(&bytes[offset..end]);
+            let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+            if handoff.publish(chunk, deadline).is_err() {
+                guard.disarm();
+                return;
+            }
+            if handoff.wait_until_consumed(deadline).await.is_err() {
+                guard.disarm();
+                return;
+            }
+            offset = end;
+        }
+    }
+}
+
+fn spawn_proxy_body(
+    source: ProxyBodySource,
+    lease: ProxyProducerLease,
+) -> (Body, tokio::task::AbortHandle) {
+    let handoff = ProxyHandoff::new(lease.cancellation().clone());
+    #[cfg(test)]
+    let handoff = handoff.with_producer_probe(lease.producer_probe());
+    let handoff = Arc::new(handoff);
+    let guard = ProxyProducerGuard::new(handoff.clone());
+    let producer_handoff = handoff.clone();
+    let producer = tokio::spawn(ProxyProducerTask::new(run_proxy_body_producer(
+        ProxyProducerResources {
+            source,
+            _lease: lease,
         },
-    );
-    Body::from_stream(stream)
+        producer_handoff,
+        guard,
+    )));
+    let abort = producer.abort_handle();
+    let consumer = ProxyBodyConsumer { handoff, producer };
+    let stream = futures_util::stream::unfold(consumer, |consumer| async move {
+        let item = consumer.handoff.take().await;
+        match item {
+            ProxyConsumerItem::Chunk(bytes) => Some((Ok(bytes), consumer)),
+            ProxyConsumerItem::Failed => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "proxy response body failed",
+                )),
+                consumer,
+            )),
+            ProxyConsumerItem::Eof => None,
+        }
+    });
+    (Body::from_stream(stream), abort)
+}
+
+fn buffered_proxy_body(bytes: Bytes, lease: ProxyProducerLease) -> Body {
+    spawn_proxy_body(ProxyBodySource::Buffered(Some(bytes)), lease).0
 }
 
 const MAX_PLAYLIST_INPUT: usize = 8 * 1024 * 1024;
@@ -1701,12 +2201,14 @@ fn reserve_bounded(
 #[cfg(test)]
 mod tests {
     use super::{
-        HLS_SCHEME_PRESCAN_BYTES, HLS_VARIABLE_RANGE_SCANS, MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT,
-        MAX_PLAYLIST_OUTPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
-        apply_redirect_origin_policy, await_response_headers, buffered_proxy_body,
-        collect_playlist, fetch_with_redirects, handle_proxy, handle_proxy_suffix,
-        parse_proxy_request, parse_proxy_suffix, proxy_error_response, resolve_hls_reference,
-        rewrite_playlist_bounded, rewrite_playlist_with_options, runtime_service, same_origin,
+        DOWNSTREAM_NO_PROGRESS_DEADLINE, HLS_SCHEME_PRESCAN_BYTES, HLS_VARIABLE_RANGE_SCANS,
+        MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PLAYLIST_OUTPUT, MAX_PROXY_INPUT, MAX_TARGET_URL,
+        PROXY_BODY_CHUNK_SIZE, ProxyBodySource, ProxyConsumerItem, ProxyError, ProxyHandoff,
+        ProxyHandoffSlot, ProxyProducerStop, ProxySourceError, apply_redirect_origin_policy,
+        await_response_headers, buffered_proxy_body, collect_playlist, fetch_with_redirects,
+        handle_proxy, handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix,
+        proxy_error_response, resolve_hls_reference, rewrite_playlist_bounded,
+        rewrite_playlist_with_options, runtime_service, same_origin, spawn_proxy_body,
         streaming_proxy_body,
     };
     use crate::network_security::{
@@ -1722,16 +2224,22 @@ mod tests {
         response::{IntoResponse, Response},
         routing::{any, get},
     };
+    use futures_util::StreamExt;
     use std::{
+        collections::VecDeque,
+        future::Future,
         io,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        pin::Pin,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
         time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
     use url::Url;
 
     fn assert_response_isolated(response: &Response) {
@@ -2377,6 +2885,20 @@ mod tests {
                 .body(Body::from_stream(futures_util::stream::pending::<
                     Result<bytes::Bytes, std::io::Error>,
                 >()))
+                .unwrap()
+        })))
+        .await
+    }
+
+    async fn chunk_then_stalled_upstream_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        fixture(Router::new().fallback(any(|| async {
+            let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"network-chunk"),
+            )])
+            .chain(futures_util::stream::pending());
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
                 .unwrap()
         })))
         .await
@@ -3955,32 +4477,1090 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             ProxyPolicySettings::default(),
         );
-        let permit = runtime.try_request().unwrap().capacity;
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let body = buffered_proxy_body(
-            bytes::Bytes::from_static(b"#EXTM3U\nsegment.ts\n"),
-            cancellation.clone(),
-            permit,
-        );
+        let context = runtime.try_request().unwrap();
+        let cancellation = context.cancellation.clone();
+        let lease = context.into_producer_lease();
+        let body = buffered_proxy_body(bytes::Bytes::from_static(b"#EXTM3U\nsegment.ts\n"), lease);
         assert_eq!(runtime.capacity_snapshot(), (1, 1));
         cancellation.cancel();
         assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+        wait_for_capacity(&runtime, (0, 0)).await;
         assert_eq!(runtime.capacity_snapshot(), (0, 0));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn streaming_body_times_out_once_and_releases_capacity() {
-        let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+    async fn wait_until(mut ready: impl FnMut() -> bool) {
+        for _ in 0..64 {
+            if ready() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ready(),
+            "condition did not become ready after bounded yields"
+        );
+    }
+
+    async fn wait_for_capacity(runtime: &ProxyRuntime, expected: (usize, usize)) {
+        wait_until(|| runtime.capacity_snapshot() == expected).await;
+    }
+
+    fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        future.as_mut().poll(&mut context)
+    }
+
+    async fn assert_body_error_then_eof(body: Body) {
+        let mut stream = body.into_data_stream();
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+    }
+
+    enum TestStreamStep {
+        Chunk(bytes::Bytes),
+        Error,
+        Pending,
+        Panic,
+        PanicWithPayload(Arc<AtomicUsize>),
+    }
+
+    struct TestByteStream {
+        steps: VecDeque<TestStreamStep>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl TestByteStream {
+        fn new(
+            steps: impl IntoIterator<Item = TestStreamStep>,
+        ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    steps: steps.into_iter().collect(),
+                    polls: polls.clone(),
+                    drops: drops.clone(),
+                },
+                polls,
+                drops,
+            )
+        }
+    }
+
+    impl futures_util::Stream for TestByteStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            match self.steps.front() {
+                Some(TestStreamStep::Pending) => Poll::Pending,
+                Some(TestStreamStep::Error) => {
+                    self.steps.pop_front();
+                    Poll::Ready(Some(Err(ProxySourceError)))
+                }
+                Some(TestStreamStep::Panic) => {
+                    self.steps.pop_front();
+                    panic!("controlled proxy producer panic");
+                }
+                Some(TestStreamStep::PanicWithPayload(_)) => {
+                    let Some(TestStreamStep::PanicWithPayload(drops)) = self.steps.pop_front()
+                    else {
+                        unreachable!()
+                    };
+                    std::panic::panic_any(TrackedPanicPayload { drops });
+                }
+                Some(TestStreamStep::Chunk(_)) => {
+                    let Some(TestStreamStep::Chunk(bytes)) = self.steps.pop_front() else {
+                        unreachable!()
+                    };
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    impl Drop for TestByteStream {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedBytesOwner {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for TrackedBytesOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackedBytesOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedPanicPayload {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedPanicPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PanicOnDropAfterEofStream {
+        returned_eof: bool,
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Stream for PanicOnDropAfterEofStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.returned_eof = true;
+            Poll::Ready(None)
+        }
+    }
+
+    impl Drop for PanicOnDropAfterEofStream {
+        fn drop(&mut self) {
+            if self.returned_eof {
+                std::panic::panic_any(TrackedPanicPayload {
+                    drops: self.payload_drops.clone(),
+                });
+            }
+        }
+    }
+
+    struct PanicOnDropPendingStream {
+        polled: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Stream for PanicOnDropPendingStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polled.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PanicOnDropPendingStream {
+        fn drop(&mut self) {
+            std::panic::panic_any(TrackedPanicPayload {
+                drops: self.payload_drops.clone(),
+            });
+        }
+    }
+
+    struct ReadyEmptyStream {
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Stream for ReadyEmptyStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(bytes::Bytes::new())))
+        }
+    }
+
+    impl Drop for ReadyEmptyStream {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CancelThenEofStream {
+        cancellation: tokio_util::sync::CancellationToken,
+    }
+
+    impl futures_util::Stream for CancelThenEofStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.cancellation.cancel();
+            Poll::Ready(None)
+        }
+    }
+
+    struct OneThenPendingStream {
+        chunk: Option<bytes::Bytes>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Stream for OneThenPendingStream {
+        type Item = Result<bytes::Bytes, ProxySourceError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.chunk
+                .take()
+                .map_or(Poll::Pending, |chunk| Poll::Ready(Some(Ok(chunk))))
+        }
+    }
+
+    impl Drop for OneThenPendingStream {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_probes_are_runtime_isolated_and_mark_only_a_full_handoff() {
+        let (pending_runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let (full_runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let pending_probe = pending_runtime.probe_next_request_producer();
+        let full_probe = full_runtime.probe_next_request_producer();
+        let (pending_stream, pending_polls, _) = TestByteStream::new([TestStreamStep::Pending]);
+        let pending_body = streaming_proxy_body(
+            Box::pin(pending_stream),
+            pending_runtime.try_request().unwrap().into_producer_lease(),
+        );
+        let (full_stream, _, _) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"full")),
+            TestStreamStep::Pending,
+        ]);
+        let full_body = streaming_proxy_body(
+            Box::pin(full_stream),
+            full_runtime.try_request().unwrap().into_producer_lease(),
+        );
+
+        full_probe.wait_for_full_deadline_armed().await.unwrap();
+        wait_until(|| pending_polls.load(Ordering::SeqCst) == 1).await;
+        assert!(!pending_probe.is_full_deadline_armed());
+
+        drop(pending_body);
+        drop(full_body);
+        assert!(pending_probe.wait_for_full_deadline_armed().await.is_err());
+        wait_for_capacity(&pending_runtime, (0, 0)).await;
+        wait_for_capacity(&full_runtime, (0, 0)).await;
+    }
+
+    #[tokio::test]
+    async fn pending_probe_reports_cancellation_instead_of_stranding_its_waiter() {
         let (runtime, _) = test_runtime(
             "127.0.0.1:1".parse().unwrap(),
             ProxyPolicySettings::default(),
         );
-        let permit = runtime.try_request().unwrap().capacity;
+        let producer_probe = runtime.probe_next_request_producer();
+        let context = runtime.try_request().unwrap();
+        let cancellation = context.cancellation.clone();
+        let (stream, polls, _) = TestByteStream::new([TestStreamStep::Pending]);
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        cancellation.cancel();
+
+        assert!(producer_probe.wait_for_full_deadline_armed().await.is_err());
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_consumer_stays_pending_until_the_full_deadline_is_armed() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let producer_probe = runtime.probe_next_request_producer();
+        let lease = runtime.try_request().unwrap().into_producer_lease();
+        let handoff = Arc::new(
+            ProxyHandoff::new(lease.cancellation().clone())
+                .with_producer_probe(lease.producer_probe()),
+        );
+        assert!(handoff.reserve().await.is_ok());
+        let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+        let mut consumer = Box::pin(handoff.take());
+        assert!(poll_once(consumer.as_mut()).is_pending());
+        assert!(
+            handoff
+                .publish(bytes::Bytes::from_static(b"published"), deadline)
+                .is_ok()
+        );
+        assert!(poll_once(consumer.as_mut()).is_pending());
+
+        let mut producer = Box::pin(handoff.wait_until_consumed(deadline));
+        assert!(poll_once(producer.as_mut()).is_pending());
+        assert!(producer_probe.is_full_deadline_armed());
+        match poll_once(consumer.as_mut()) {
+            Poll::Ready(ProxyConsumerItem::Chunk(bytes)) => assert_eq!(bytes, "published"),
+            Poll::Pending => panic!("consumer stayed pending after deadline readiness"),
+            Poll::Ready(ProxyConsumerItem::Failed | ProxyConsumerItem::Eof) => {
+                panic!("consumer did not receive the published chunk")
+            }
+        }
+        assert!(matches!(poll_once(producer.as_mut()), Poll::Ready(Ok(()))));
+
+        drop(lease);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn first_consumer_poll_after_full_waits_for_armed_deadline() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let producer_probe = runtime.probe_next_request_producer();
+        let lease = runtime.try_request().unwrap().into_producer_lease();
+        let handoff = Arc::new(
+            ProxyHandoff::new(lease.cancellation().clone())
+                .with_producer_probe(lease.producer_probe()),
+        );
+        assert!(handoff.reserve().await.is_ok());
+        let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+        assert!(
+            handoff
+                .publish(bytes::Bytes::from_static(b"published"), deadline)
+                .is_ok()
+        );
+
+        let mut consumer = Box::pin(handoff.take());
+        assert!(poll_once(consumer.as_mut()).is_pending());
+        assert!(matches!(
+            handoff.lock_state().slot,
+            ProxyHandoffSlot::Full { .. }
+        ));
+
+        let mut producer = Box::pin(handoff.wait_until_consumed(deadline));
+        assert!(poll_once(producer.as_mut()).is_pending());
+        assert!(producer_probe.is_full_deadline_armed());
+        match poll_once(consumer.as_mut()) {
+            Poll::Ready(ProxyConsumerItem::Chunk(bytes)) => assert_eq!(bytes, "published"),
+            Poll::Pending => panic!("consumer stayed pending after deadline readiness"),
+            Poll::Ready(ProxyConsumerItem::Failed | ProxyConsumerItem::Eof) => {
+                panic!("consumer did not receive the published chunk")
+            }
+        }
+        assert!(matches!(poll_once(producer.as_mut()), Poll::Ready(Ok(()))));
+
+        drop(lease);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timely_take_wins_when_producer_observes_notify_after_deadline() {
+        let handoff = ProxyHandoff::new(CancellationToken::new());
+        assert!(handoff.reserve().await.is_ok());
+        let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+        assert!(
+            handoff
+                .publish(bytes::Bytes::from_static(b"timely"), deadline)
+                .is_ok()
+        );
+        let mut producer = Box::pin(handoff.wait_until_consumed(deadline));
+        assert!(poll_once(producer.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_secs(119)).await;
+        match handoff.take().await {
+            ProxyConsumerItem::Chunk(bytes) => assert_eq!(bytes, "timely"),
+            ProxyConsumerItem::Failed | ProxyConsumerItem::Eof => {
+                panic!("timely consumer did not receive the published chunk")
+            }
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(matches!(poll_once(producer.as_mut()), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_take_fails_without_delivering_expired_chunk() {
+        let handoff = ProxyHandoff::new(CancellationToken::new());
+        assert!(handoff.reserve().await.is_ok());
+        let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+        assert!(
+            handoff
+                .publish(bytes::Bytes::from_static(b"expired"), deadline)
+                .is_ok()
+        );
+        let mut producer = Box::pin(handoff.wait_until_consumed(deadline));
+        assert!(poll_once(producer.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+
+        assert!(matches!(handoff.take().await, ProxyConsumerItem::Failed));
+        assert!(matches!(handoff.take().await, ProxyConsumerItem::Eof));
+        assert!(matches!(
+            poll_once(producer.as_mut()),
+            Poll::Ready(Err(ProxyProducerStop::Failed))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpolled_body_reads_one_chunk_then_stall_reclaims_capacity() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let stream = OneThenPendingStream {
+            chunk: Some(bytes::Bytes::from_owner(TrackedBytesOwner {
+                bytes: b"queued".to_vec(),
+                drops: payload_drops.clone(),
+            })),
+            polls: polls.clone(),
+            drops: drops.clone(),
+        };
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let (body, producer) = spawn_proxy_body(
+            ProxyBodySource::Streaming(Box::pin(stream)),
+            context.into_producer_lease(),
+        );
+
+        for _ in 0..16 {
+            if polls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+        for _ in 0..16 {
+            if runtime.capacity_snapshot() == (0, 0) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        wait_until(|| producer.is_finished()).await;
+        assert!(producer.is_finished());
+
+        let mut body = body.into_data_stream();
+        assert!(body.next().await.unwrap().is_err());
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_full_handoff_clears_payload_and_stops_before_a_second_poll() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"queued")),
+            TestStreamStep::Pending,
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
         let body = streaming_proxy_body(
             Box::pin(stream),
-            tokio_util::sync::CancellationToken::new(),
-            permit,
+            runtime.try_request().unwrap().into_producer_lease(),
         );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        drop(body);
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_body_while_upstream_read_is_pending_reclaims_without_a_timer() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Pending]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        drop(body);
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_handoff_is_full_discards_data_then_errors_once() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"must-not-escape")),
+            TestStreamStep::Pending,
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let cancellation = context.cancellation.clone();
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        cancellation.cancel();
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_upstream_read_is_pending_errors_and_reclaims_immediately() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Pending]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let cancellation = context.cancellation.clone();
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        cancellation.cancel();
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_triggered_by_the_eof_poll_wins_over_clean_eof() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let stream = CancelThenEofStream {
+            cancellation: context.cancellation.clone(),
+        };
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_upstream_read_times_out_with_one_error_then_eof() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Pending]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_body_error_then_eof(body).await;
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn upstream_source_error_yields_one_generic_error_then_eof() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Error]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+
+        assert_body_error_then_eof(body).await;
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_finite_stream_preserves_content_order_and_reclaims_everything() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"first-")),
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"second")),
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+
+        assert_eq!(
+            axum::body::to_bytes(body, usize::MAX).await.unwrap(),
+            "first-second"
+        );
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn producer_panic_wakes_retained_body_and_fails_closed() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Panic]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let (body, producer) = spawn_proxy_body(
+            ProxyBodySource::Streaming(Box::pin(stream)),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        wait_until(|| producer.is_finished()).await;
+
+        assert_body_error_then_eof(body).await;
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn producer_panic_payload_is_dropped_while_body_remains_retained() {
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let (stream, _, source_drops) =
+            TestByteStream::new([TestStreamStep::PanicWithPayload(payload_drops.clone())]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+
+        wait_until(|| source_drops.load(Ordering::SeqCst) == 1).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+        assert_body_error_then_eof(body).await;
+    }
+
+    #[tokio::test]
+    async fn source_drop_panic_after_eof_overrides_clean_terminal_state() {
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let stream = PanicOnDropAfterEofStream {
+            returned_eof: false,
+            payload_drops: payload_drops.clone(),
+        };
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_producer_abort_wakes_retained_body_and_fails_closed() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Pending]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let (body, abort) = spawn_proxy_body(
+            ProxyBodySource::Streaming(Box::pin(stream)),
+            context.into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        abort.abort();
+        wait_until(|| abort.is_finished()).await;
+        assert!(abort.is_finished());
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_drops_a_panicking_source_without_retaining_its_payload() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let stream = PanicOnDropPendingStream {
+            polled: polls.clone(),
+            payload_drops: payload_drops.clone(),
+        };
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let (body, abort) = spawn_proxy_body(
+            ProxyBodySource::Streaming(Box::pin(stream)),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        abort.abort();
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+        assert_body_error_then_eof(body).await;
+    }
+
+    #[tokio::test]
+    async fn abort_before_first_producer_poll_still_fails_closed_and_reclaims() {
+        let (stream, polls, drops) = TestByteStream::new([TestStreamStep::Pending]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let (body, abort) = spawn_proxy_body(
+            ProxyBodySource::Streaming(Box::pin(stream)),
+            context.into_producer_lease(),
+        );
+
+        abort.abort();
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_resets_each_downstream_deadline_without_a_total_limit() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"one")),
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"two")),
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"three")),
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        let mut body = body.into_data_stream();
+        let started = tokio::time::Instant::now();
+
+        for (index, expected) in [b"one".as_slice(), b"two", b"three"]
+            .into_iter()
+            .enumerate()
+        {
+            wait_until(|| polls.load(Ordering::SeqCst) > index).await;
+            tokio::time::advance(Duration::from_secs(119)).await;
+            assert_eq!(body.next().await.unwrap().unwrap(), expected);
+        }
+        assert!(body.next().await.is_none());
+
+        assert!(tokio::time::Instant::now().duration_since(started) > Duration::from_secs(350));
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(polls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn buffered_large_source_crosses_as_independent_bounded_chunks() {
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let source = bytes::Bytes::from_owner(TrackedBytesOwner {
+            bytes: (0..PROXY_BODY_CHUNK_SIZE + 17)
+                .map(|index| (index % 251) as u8)
+                .collect(),
+            drops: owner_drops.clone(),
+        });
+        let expected = source.to_vec();
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body =
+            buffered_proxy_body(source, runtime.try_request().unwrap().into_producer_lease());
+        let mut stream = body.into_data_stream();
+        let mut retained_chunks = Vec::new();
+        let mut actual = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= PROXY_BODY_CHUNK_SIZE);
+            actual.extend_from_slice(&chunk);
+            retained_chunks.push(chunk);
+        }
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| owner_drops.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(retained_chunks.len(), 2);
+        assert_eq!(actual, expected);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_buffered_body_reclaims_its_source_and_permit() {
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let source = bytes::Bytes::from_owner(TrackedBytesOwner {
+            bytes: vec![b'x'; PROXY_BODY_CHUNK_SIZE + 1],
+            drops: owner_drops.clone(),
+        });
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body =
+            buffered_proxy_body(source, runtime.try_request().unwrap().into_producer_lease());
+        tokio::task::yield_now().await;
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+
+        drop(body);
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| owner_drops.load(Ordering::SeqCst) == 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_chunks_do_not_reset_the_persistent_upstream_idle_deadline() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream_polls = polls.clone();
+        let stream = futures_util::stream::poll_fn(move |context| {
+            stream_polls.fetch_add(1, Ordering::SeqCst);
+            receiver
+                .poll_recv(context)
+                .map(|item| item.map(Ok::<_, ProxySourceError>))
+        });
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) >= 1).await;
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        sender.send(bytes::Bytes::new()).unwrap();
+        wait_until(|| polls.load(Ordering::SeqCst) >= 2).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn always_ready_empty_chunks_cannot_starve_the_read_idle_deadline() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stream = ReadyEmptyStream {
+            polls: polls.clone(),
+            drops: drops.clone(),
+        };
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) >= 2).await;
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_stalled_body_releases_same_peer_capacity_for_re_admission() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"held")),
+            TestStreamStep::Pending,
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime.try_request().unwrap().into_producer_lease(),
+        );
+        let blockers: Vec<_> = (0..15).map(|_| runtime.try_request().unwrap()).collect();
+        assert!(runtime.try_request().is_err());
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+        wait_for_capacity(&runtime, (15, 1)).await;
+        let replacement = runtime.try_request().unwrap();
+
+        assert_body_error_then_eof(body).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        drop(replacement);
+        drop(blockers);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_stalled_body_releases_global_capacity_for_re_admission() {
+        let (stream, polls, drops) = TestByteStream::new([
+            TestStreamStep::Chunk(bytes::Bytes::from_static(b"held")),
+            TestStreamStep::Pending,
+        ]);
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let body = streaming_proxy_body(
+            Box::pin(stream),
+            runtime
+                .try_request_for_peer(Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))))
+                .unwrap()
+                .into_producer_lease(),
+        );
+        let blockers: Vec<_> = (2..=64u16)
+            .map(|index| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V6(Ipv6Addr::from(u128::from(index)))))
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            runtime
+                .try_request_for_peer(Some(IpAddr::V6(Ipv6Addr::from(65u128))))
+                .is_err()
+        );
+        wait_until(|| polls.load(Ordering::SeqCst) == 1).await;
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+        wait_for_capacity(&runtime, (63, 63)).await;
+        let replacement = runtime
+            .try_request_for_peer(Some(IpAddr::V6(Ipv6Addr::from(65u128))))
+            .unwrap();
+
+        assert_body_error_then_eof(body).await;
+        wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
+        drop(replacement);
+        drop(blockers);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn retained_real_axum_handler_response_reclaims_its_producer() {
+        let (upstream_address, upstream) = chunk_then_stalled_upstream_fixture().await;
+        let (runtime, _) = test_runtime(
+            upstream_address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://fixture.test:{}/body", upstream_address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+        let producer_probe = runtime.probe_next_request_producer();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        producer_probe.wait_for_full_deadline_armed().await.unwrap();
+        tokio::time::pause();
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        tokio::time::advance(Duration::from_secs(90)).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_body_error_then_eof(response.into_body()).await;
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_real_axum_service_response_reclaims_its_producer() {
+        let (upstream_address, upstream) = chunk_then_stalled_upstream_fixture().await;
+        let (runtime, _) = test_runtime(
+            upstream_address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let runtime = Arc::new(runtime);
+        let (proxy_address, proxy) = proxy_router_fixture(runtime.clone(), true).await;
+        let target = format!(
+            "http://stalled-upstream.test:{}/resource",
+            upstream_address.port()
+        );
+        let url = format!(
+            "http://{proxy_address}/proxy/?d={}",
+            urlencoding::encode(&target)
+        );
+        let producer_probe = runtime.probe_next_request_producer();
+
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        producer_probe.wait_for_full_deadline_armed().await.unwrap();
+        tokio::time::pause();
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+
+        drop(response);
+        proxy.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_body_times_out_once_and_releases_capacity() {
+        let stream = futures_util::stream::pending::<Result<bytes::Bytes, ProxySourceError>>();
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
         let collect = tokio::spawn(axum::body::to_bytes(body, usize::MAX));
         tokio::task::yield_now().await;
         assert_eq!(runtime.capacity_snapshot(), (1, 1));
@@ -3991,19 +5571,21 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_streaming_body_releases_capacity() {
-        let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let stream = futures_util::stream::pending::<Result<bytes::Bytes, ProxySourceError>>();
         let (runtime, _) = test_runtime(
             "127.0.0.1:1".parse().unwrap(),
             ProxyPolicySettings::default(),
         );
-        let permit = runtime.try_request().unwrap().capacity;
-        let body = streaming_proxy_body(
-            Box::pin(stream),
-            tokio_util::sync::CancellationToken::new(),
-            permit,
-        );
+        let context = runtime.try_request().unwrap();
+        let body = streaming_proxy_body(Box::pin(stream), context.into_producer_lease());
         assert_eq!(runtime.capacity_snapshot(), (1, 1));
         drop(body);
+        for _ in 0..16 {
+            if runtime.capacity_snapshot() == (0, 0) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(runtime.capacity_snapshot(), (0, 0));
     }
 

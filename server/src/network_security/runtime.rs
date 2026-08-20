@@ -6,6 +6,8 @@ use std::{
     net::IpAddr,
     sync::{Arc, Mutex},
 };
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -21,7 +23,149 @@ pub(crate) struct ProxyPolicySettings {
 pub(crate) struct ProxyRequestContext {
     pub(crate) settings: ProxyPolicySettings,
     pub(crate) cancellation: CancellationToken,
-    pub(crate) capacity: ProxyCapacityPermit,
+    capacity: ProxyCapacityPermit,
+    #[cfg(test)]
+    producer_probe: Option<ProxyProducerProbe>,
+}
+
+pub(crate) struct ProxyProducerLease {
+    cancellation: CancellationToken,
+    _capacity: ProxyCapacityPermit,
+    #[cfg(test)]
+    producer_probe: Option<ProxyProducerProbe>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ProxyProducerProbe {
+    state: Arc<ProxyProducerProbeState>,
+}
+
+#[cfg(test)]
+struct ProxyProducerProbeState {
+    signals: Mutex<ProxyProducerProbeSignals>,
+    notify: Notify,
+}
+
+#[cfg(test)]
+struct ProxyProducerProbeSignals {
+    outcome: ProxyProducerProbeOutcome,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProxyProducerProbeOutcome {
+    Pending,
+    Ready,
+    Terminated,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProxyProducerProbeTerminated;
+
+#[cfg(test)]
+impl ProxyProducerProbe {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(ProxyProducerProbeState {
+                signals: Mutex::new(ProxyProducerProbeSignals {
+                    outcome: ProxyProducerProbeOutcome::Pending,
+                }),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn lock_signals(&self) -> std::sync::MutexGuard<'_, ProxyProducerProbeSignals> {
+        self.state
+            .signals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn outcome(
+        signals: &ProxyProducerProbeSignals,
+    ) -> Option<Result<(), ProxyProducerProbeTerminated>> {
+        match signals.outcome {
+            ProxyProducerProbeOutcome::Pending => None,
+            ProxyProducerProbeOutcome::Ready => Some(Ok(())),
+            ProxyProducerProbeOutcome::Terminated => Some(Err(ProxyProducerProbeTerminated)),
+        }
+    }
+
+    async fn wait_for(
+        &self,
+        ready: impl Fn(&ProxyProducerProbeSignals) -> Option<Result<(), ProxyProducerProbeTerminated>>,
+    ) -> Result<(), ProxyProducerProbeTerminated> {
+        loop {
+            let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let outcome = ready(&self.lock_signals());
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ProxyProducerProbeSignals)) {
+        update(&mut self.lock_signals());
+        self.state.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_full_deadline_armed(&self) -> bool {
+        self.lock_signals().outcome == ProxyProducerProbeOutcome::Ready
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.lock_signals().outcome == ProxyProducerProbeOutcome::Pending
+    }
+
+    pub(crate) async fn wait_for_full_deadline_armed(
+        &self,
+    ) -> Result<(), ProxyProducerProbeTerminated> {
+        self.wait_for(Self::outcome).await
+    }
+
+    pub(crate) fn mark_full_deadline_armed(&self) {
+        self.update(|signals| {
+            if signals.outcome == ProxyProducerProbeOutcome::Pending {
+                signals.outcome = ProxyProducerProbeOutcome::Ready;
+            }
+        });
+    }
+
+    pub(crate) fn mark_terminated_before_ready(&self) {
+        self.update(|signals| {
+            if signals.outcome == ProxyProducerProbeOutcome::Pending {
+                signals.outcome = ProxyProducerProbeOutcome::Terminated;
+            }
+        });
+    }
+}
+
+impl ProxyRequestContext {
+    pub(crate) fn into_producer_lease(self) -> ProxyProducerLease {
+        ProxyProducerLease {
+            cancellation: self.cancellation,
+            _capacity: self.capacity,
+            #[cfg(test)]
+            producer_probe: self.producer_probe,
+        }
+    }
+}
+
+impl ProxyProducerLease {
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_probe(&self) -> Option<ProxyProducerProbe> {
+        self.producer_probe.clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,7 +193,7 @@ struct ProxyCapacity {
     state: Mutex<ProxyCapacityState>,
 }
 
-pub(crate) struct ProxyCapacityPermit {
+struct ProxyCapacityPermit {
     capacity: Arc<ProxyCapacity>,
     peer: ProxyPeer,
 }
@@ -122,6 +266,8 @@ pub(crate) struct ProxyRuntime {
     validator: Arc<DestinationValidator>,
     capacity: Arc<ProxyCapacity>,
     generation: Mutex<ProxyGeneration>,
+    #[cfg(test)]
+    next_producer_probe: Mutex<Option<ProxyProducerProbe>>,
 }
 
 impl ProxyRuntime {
@@ -133,6 +279,8 @@ impl ProxyRuntime {
                 settings,
                 cancellation: CancellationToken::new(),
             }),
+            #[cfg(test)]
+            next_producer_probe: Mutex::new(None),
         }
     }
 
@@ -150,11 +298,34 @@ impl ProxyRuntime {
             .generation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        let producer_probe = self
+            .next_producer_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         Ok(ProxyRequestContext {
             settings: generation.settings,
             cancellation: generation.cancellation.clone(),
             capacity,
+            #[cfg(test)]
+            producer_probe,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_next_request_producer(&self) -> ProxyProducerProbe {
+        let probe = ProxyProducerProbe::new();
+        let previous = self
+            .next_producer_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(probe.clone());
+        assert!(
+            previous.is_none(),
+            "proxy runtime already has an unclaimed producer probe"
+        );
+        probe
     }
 
     #[cfg(test)]

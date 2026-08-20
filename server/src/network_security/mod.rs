@@ -7,10 +7,12 @@ pub(crate) use resolver::{
     SystemLocalNetworkProvider,
 };
 pub(crate) use runtime::{
-    ProxyCapacityPermit, ProxyPolicySettings, ProxyRequestContext, ProxyRuntime,
+    ProxyPolicySettings, ProxyProducerLease, ProxyRequestContext, ProxyRuntime,
 };
 
 #[cfg(test)]
 pub(crate) use ip::LocalNetworks;
 #[cfg(test)]
 pub(crate) use resolver::{Clock, DnsResolver, LocalNetworkProvider};
+#[cfg(test)]
+pub(crate) use runtime::ProxyProducerProbe;
