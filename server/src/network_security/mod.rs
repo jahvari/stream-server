@@ -6,7 +6,9 @@ pub(crate) use resolver::{
     DestinationError, DestinationValidator, ListenerBinding, SystemClock, SystemDnsResolver,
     SystemLocalNetworkProvider,
 };
-pub(crate) use runtime::{ProxyPolicySettings, ProxyRequestContext, ProxyRuntime};
+pub(crate) use runtime::{
+    ProxyCapacityPermit, ProxyPolicySettings, ProxyRequestContext, ProxyRuntime,
+};
 
 #[cfg(test)]
 pub(crate) use ip::LocalNetworks;

@@ -1,11 +1,11 @@
 use crate::{
-    network_security::{DestinationError, ProxyRequestContext, ProxyRuntime},
+    network_security::{DestinationError, ProxyCapacityPermit, ProxyRequestContext, ProxyRuntime},
     state::AppState,
 };
 use axum::{
     Router,
     body::Body,
-    extract::{OriginalUri, State},
+    extract::{ConnectInfo, Extension, OriginalUri, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::any,
@@ -15,10 +15,12 @@ use futures_util::{Stream, StreamExt};
 use reqwest::{Client, Method};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 
@@ -28,6 +30,7 @@ const MAX_CUSTOM_OPTIONS: usize = 64;
 const MAX_HEADER_PAIR: usize = 8 * 1024;
 const RAW_CANONICAL_PATH_KEY: &str = "x-stream-path";
 const RAW_CANONICAL_PATH_OPTION: &str = "&x-stream-path=raw";
+const RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyError {
@@ -312,6 +315,23 @@ fn response_header_forbidden(name: &HeaderName) -> bool {
     name != header::CONTENT_TYPE
 }
 
+async fn await_response_headers<F, T, E>(
+    cancellation: &CancellationToken,
+    send: F,
+) -> Result<T, ProxyError>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ProxyError::Cancelled),
+        result = tokio::time::timeout(RESPONSE_HEADER_DEADLINE, send) => {
+            result.map_err(|_| ProxyError::Upstream)?
+                .map_err(|_| ProxyError::Upstream)
+        }
+    }
+}
+
 async fn fetch_with_redirects(
     runtime: &ProxyRuntime,
     context: &ProxyRequestContext,
@@ -368,11 +388,7 @@ async fn fetch_with_redirects(
             .request(method.clone(), destination.url.clone())
             .headers(headers)
             .send();
-        let response = tokio::select! {
-            biased;
-            _ = context.cancellation.cancelled() => return Err(ProxyError::Cancelled),
-            result = send => result.map_err(|_| ProxyError::Upstream)?,
-        };
+        let response = await_response_headers(&context.cancellation, send).await?;
 
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             return Err(ProxyError::Upstream);
@@ -440,20 +456,39 @@ fn same_origin(left: &Url, right: &Url) -> bool {
 }
 
 pub fn service(state: AppState) -> Router {
-    Router::new().fallback(any(proxy_handler)).with_state(state)
+    runtime_service(state.proxy_runtime.clone())
+}
+
+fn runtime_service(runtime: Arc<ProxyRuntime>) -> Router {
+    Router::new()
+        .fallback(any(proxy_handler))
+        .with_state(runtime)
 }
 
 async fn proxy_handler(
-    State(state): State<AppState>,
+    State(runtime): State<Arc<ProxyRuntime>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    handle_proxy(&state.proxy_runtime, original_uri, headers, method).await
+    let peer = peer.map(|Extension(ConnectInfo(address))| address.ip());
+    handle_proxy_for_peer(&runtime, peer, original_uri, headers, method).await
 }
 
+#[cfg(test)]
 async fn handle_proxy(
     runtime: &ProxyRuntime,
+    original_uri: Uri,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    handle_proxy_for_peer(runtime, None, original_uri, headers, method).await
+}
+
+async fn handle_proxy_for_peer(
+    runtime: &ProxyRuntime,
+    peer: Option<IpAddr>,
     original_uri: Uri,
     headers: HeaderMap,
     method: Method,
@@ -467,11 +502,22 @@ async fn handle_proxy(
         }
         _ => return proxy_error_response(ProxyError::InvalidRequest),
     };
-    handle_proxy_suffix(runtime, raw_suffix, headers, method).await
+    handle_proxy_suffix_for_peer(runtime, peer, raw_suffix, headers, method).await
 }
 
+#[cfg(test)]
 async fn handle_proxy_suffix(
     runtime: &ProxyRuntime,
+    raw_suffix: &str,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    handle_proxy_suffix_for_peer(runtime, None, raw_suffix, headers, method).await
+}
+
+async fn handle_proxy_suffix_for_peer(
+    runtime: &ProxyRuntime,
+    peer: Option<IpAddr>,
     raw_suffix: &str,
     headers: HeaderMap,
     method: Method,
@@ -482,7 +528,7 @@ async fn handle_proxy_suffix(
     if method == Method::CONNECT {
         return proxy_error_response(ProxyError::InvalidRequest);
     }
-    let context = match runtime.try_request() {
+    let context = match runtime.try_request_for_peer(peer) {
         Ok(context) => context,
         Err(_) => return proxy_error_response(ProxyError::Capacity),
     };
@@ -752,7 +798,7 @@ fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
 fn streaming_proxy_body(
     stream: UpstreamByteStream,
     cancellation: CancellationToken,
-    capacity: OwnedSemaphorePermit,
+    capacity: ProxyCapacityPermit,
 ) -> Body {
     let stream = ProxyBodyState {
         stream,
@@ -805,7 +851,7 @@ type UpstreamByteStream =
 struct ProxyBodyState {
     stream: UpstreamByteStream,
     cancellation: CancellationToken,
-    _capacity: OwnedSemaphorePermit,
+    _capacity: ProxyCapacityPermit,
     terminal: bool,
 }
 
@@ -813,14 +859,14 @@ struct BufferedProxyBodyState {
     bytes: Bytes,
     offset: usize,
     cancellation: CancellationToken,
-    _capacity: OwnedSemaphorePermit,
+    _capacity: ProxyCapacityPermit,
     terminal: bool,
 }
 
 fn buffered_proxy_body(
     bytes: Bytes,
     cancellation: CancellationToken,
-    capacity: OwnedSemaphorePermit,
+    capacity: ProxyCapacityPermit,
 ) -> Body {
     const CHUNK_SIZE: usize = 64 * 1024;
     let stream = futures_util::stream::unfold(
@@ -1657,10 +1703,11 @@ mod tests {
     use super::{
         HLS_SCHEME_PRESCAN_BYTES, HLS_VARIABLE_RANGE_SCANS, MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT,
         MAX_PLAYLIST_OUTPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
-        apply_redirect_origin_policy, buffered_proxy_body, collect_playlist, fetch_with_redirects,
-        handle_proxy, handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix,
-        proxy_error_response, resolve_hls_reference, rewrite_playlist_bounded,
-        rewrite_playlist_with_options, same_origin, streaming_proxy_body,
+        apply_redirect_origin_policy, await_response_headers, buffered_proxy_body,
+        collect_playlist, fetch_with_redirects, handle_proxy, handle_proxy_suffix,
+        parse_proxy_request, parse_proxy_suffix, proxy_error_response, resolve_hls_reference,
+        rewrite_playlist_bounded, rewrite_playlist_with_options, runtime_service, same_origin,
+        streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -1677,7 +1724,7 @@ mod tests {
     };
     use std::{
         io,
-        net::SocketAddr,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1988,14 +2035,22 @@ mod tests {
             ProxyPolicySettings::default(),
         );
         let permits = (0..64)
-            .map(|_| runtime.try_request().unwrap())
+            .map(|index| {
+                runtime
+                    .try_request_for_peer(Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                        index + 1,
+                    ))))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
+        assert_eq!(runtime.capacity_snapshot(), (64, 64));
         let prefix = "?d=http%3A%2F%2Fblocked.example&unknown=";
         let raw_suffix = format!("{prefix}{}", "a".repeat(MAX_PROXY_INPUT + 1 - prefix.len()));
         let response =
             handle_proxy_suffix(&runtime, &raw_suffix, HeaderMap::new(), Method::GET).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.capacity_snapshot(), (64, 64));
 
         let response = handle_proxy_suffix(
             &runtime,
@@ -2312,6 +2367,374 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (address, task)
+    }
+
+    async fn stalled_upstream_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        fixture(Router::new().fallback(any(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, "1")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >()))
+                .unwrap()
+        })))
+        .await
+    }
+
+    async fn proxy_router_fixture(
+        runtime: Arc<ProxyRuntime>,
+        with_connect_info: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = runtime_service(runtime);
+        let task = if with_connect_info {
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            })
+        } else {
+            tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            })
+        };
+        (address, task)
+    }
+
+    async fn assert_capacity_response(response: reqwest::Response) {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
+        );
+        assert_eq!(
+            response.text().await.unwrap(),
+            "Proxy capacity is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_uses_actual_connect_info_and_ignores_forwarded_peers() {
+        let (upstream_address, upstream) = stalled_upstream_fixture().await;
+        let (runtime, _) = test_runtime(
+            upstream_address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let (proxy_address, proxy) = proxy_router_fixture(Arc::new(runtime), true).await;
+        let target = format!(
+            "http://stalled-upstream.test:{}/resource",
+            upstream_address.port()
+        );
+        let url = format!(
+            "http://{proxy_address}/proxy/?d={}",
+            urlencoding::encode(&target)
+        );
+        let first_peer = reqwest::Client::builder()
+            .local_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
+            .build()
+            .unwrap();
+        let second_peer = reqwest::Client::builder()
+            .local_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)))
+            .build()
+            .unwrap();
+        let mut held = Vec::new();
+        for index in 0..16 {
+            let response = first_peer
+                .get(&url)
+                .header("forwarded", format!("for=198.51.100.{}", index + 1))
+                .header("x-forwarded-for", format!("203.0.113.{}", index + 1))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+
+        let exhausted = first_peer
+            .get(&url)
+            .header("forwarded", "for=127.0.0.3")
+            .header("x-forwarded-for", "127.0.0.3")
+            .send()
+            .await
+            .unwrap();
+        assert_capacity_response(exhausted).await;
+
+        let other = second_peer
+            .get(&url)
+            .header("forwarded", "for=127.0.0.2")
+            .header("x-forwarded-for", "127.0.0.2")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+
+        drop(other);
+        drop(held);
+        proxy.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn router_without_connect_info_uses_one_unknown_peer_bucket() {
+        let (upstream_address, upstream) = stalled_upstream_fixture().await;
+        let (runtime, _) = test_runtime(
+            upstream_address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let (proxy_address, proxy) = proxy_router_fixture(Arc::new(runtime), false).await;
+        let target = format!(
+            "http://stalled-upstream.test:{}/resource",
+            upstream_address.port()
+        );
+        let url = format!(
+            "http://{proxy_address}/proxy/?d={}",
+            urlencoding::encode(&target)
+        );
+        let client = reqwest::Client::new();
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let response = client.get(&url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+
+        assert_capacity_response(client.get(&url).send().await.unwrap()).await;
+
+        drop(held);
+        proxy.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_deadline_is_absolute_and_releases_admission() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Drip: ")
+                .await
+                .unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if stream.write_all(b"a").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://slow-headers.test:{}/resource", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(31),
+            handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET),
+        )
+        .await
+        .expect("the absolute header deadline must beat a drip-fed response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_response_isolated(&response);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "Proxy upstream request failed"
+        );
+        let permits: Vec<_> = (0..16).map(|_| runtime.try_request().unwrap()).collect();
+        assert!(runtime.try_request().is_err());
+        drop(permits);
+        fixture.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_await_helper_has_an_absolute_thirty_second_deadline() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let result = await_response_headers(
+            &cancellation,
+            futures_util::future::pending::<Result<(), ()>>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_await_helper_accepts_completion_before_deadline() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let result = await_response_headers(&cancellation, async {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            Ok::<_, ()>("headers")
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "headers");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(29)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_response_header_awaits_each_receive_a_fresh_deadline() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        for expected in ["first", "second"] {
+            let result = await_response_headers(&cancellation, async move {
+                tokio::time::sleep(Duration::from_secs(29)).await;
+                Ok::<_, ()>(expected)
+            })
+            .await;
+            assert_eq!(result.unwrap(), expected);
+        }
+
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(58)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_headers_completing_before_deadline_proceed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://just-in-time.test:{}/resource", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_redirect_hop_gets_a_fresh_response_header_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(response).await.unwrap();
+            }
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://redirect-deadline.test:{}/start", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_cancellation_wins_while_response_headers_are_pending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            futures_util::future::pending::<()>().await;
+        });
+        let settings = ProxyPolicySettings {
+            allow_private_network_sources: true,
+            allow_invalid_proxy_tls_certificates: false,
+        };
+        let (runtime, _) = test_runtime(address, settings);
+        let request = parse_proxy_request(
+            "",
+            Some(&format!(
+                "d=http%3A%2F%2Fcancel-headers.test%3A{}%2Fresource",
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            runtime.begin_reconfigure(ProxyPolicySettings::default());
+        };
+        let incoming = HeaderMap::new();
+
+        let (result, ()) = tokio::join!(
+            fetch_with_redirects(&runtime, &context, &request, Method::GET, &incoming,),
+            cancel,
+        );
+
+        assert!(matches!(result, Err(ProxyError::Cancelled)));
+        fixture.abort();
     }
 
     #[tokio::test]
@@ -3528,25 +3951,31 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_playlist_body_retains_capacity_and_observes_cancellation() {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let permit = runtime.try_request().unwrap().capacity;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let body = buffered_proxy_body(
             bytes::Bytes::from_static(b"#EXTM3U\nsegment.ts\n"),
             cancellation.clone(),
             permit,
         );
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
         cancellation.cancel();
         assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
-        assert!(semaphore.try_acquire_owned().is_ok());
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
     }
 
     #[tokio::test(start_paused = true)]
     async fn streaming_body_times_out_once_and_releases_capacity() {
         let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let permit = runtime.try_request().unwrap().capacity;
         let body = streaming_proxy_body(
             Box::pin(stream),
             tokio_util::sync::CancellationToken::new(),
@@ -3554,25 +3983,28 @@ mod tests {
         );
         let collect = tokio::spawn(axum::body::to_bytes(body, usize::MAX));
         tokio::task::yield_now().await;
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(collect.await.unwrap().is_err());
-        assert!(semaphore.try_acquire_owned().is_ok());
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
     }
 
     #[tokio::test]
     async fn dropping_streaming_body_releases_capacity() {
         let stream = futures_util::stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let permit = runtime.try_request().unwrap().capacity;
         let body = streaming_proxy_body(
             Box::pin(stream),
             tokio_util::sync::CancellationToken::new(),
             permit,
         );
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
         drop(body);
-        assert!(semaphore.try_acquire_owned().is_ok());
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
     }
 
     #[tokio::test]
