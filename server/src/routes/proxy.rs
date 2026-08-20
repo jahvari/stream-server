@@ -210,6 +210,13 @@ fn parse_custom_header(value: &str) -> Result<(HeaderName, HeaderValue), ProxyEr
     let (name, value) = value.split_once(':').ok_or(ProxyError::InvalidRequest)?;
     let name = name.trim();
     let value = value.trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(ProxyError::InvalidRequest);
+    }
     if name
         .len()
         .checked_add(value.len())
@@ -224,8 +231,9 @@ fn parse_custom_header(value: &str) -> Result<(HeaderName, HeaderValue), ProxyEr
 }
 
 fn request_header_forbidden(name: &HeaderName) -> bool {
+    let name = name.as_str();
     matches!(
-        name.as_str(),
+        name,
         "host"
             | "connection"
             | "keep-alive"
@@ -237,18 +245,19 @@ fn request_header_forbidden(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "content-length"
-    )
+            | "forwarded"
+            | "via"
+            | "proxy-connection"
+            | "http2-settings"
+            | "x-real-ip"
+            | "x-host"
+    ) || name.starts_with("x-forwarded-")
+        || name.starts_with("x-original-")
+        || name.starts_with("x-rewrite-")
 }
 
 fn response_header_forbidden(name: &HeaderName) -> bool {
-    request_header_forbidden(name)
-        || matches!(
-            name.as_str(),
-            "set-cookie"
-                | "access-control-allow-origin"
-                | "access-control-allow-methods"
-                | "access-control-allow-headers"
-        )
+    name != header::CONTENT_TYPE
 }
 
 async fn fetch_with_redirects(
@@ -311,6 +320,10 @@ async fn fetch_with_redirects(
             _ = context.cancellation.cancelled() => return Err(ProxyError::Cancelled),
             result = send => result.map_err(|_| ProxyError::Upstream)?,
         };
+
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return Err(ProxyError::Upstream);
+        }
 
         if !REDIRECT_STATUSES.contains(&response.status()) {
             return Ok((response, destination.url));
@@ -391,6 +404,9 @@ async fn handle_proxy_suffix(
     method: Method,
 ) -> Response {
     if raw_suffix.len() > MAX_PROXY_INPUT {
+        return proxy_error_response(ProxyError::InvalidRequest);
+    }
+    if method == Method::CONNECT {
         return proxy_error_response(ProxyError::InvalidRequest);
     }
     let context = match runtime.try_request() {
@@ -669,7 +685,29 @@ fn build_proxy_response(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static("*"),
     );
+    apply_route_owned_headers(&mut response);
     response
+}
+
+fn apply_route_owned_headers(response: &mut Response) {
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox",
+        ),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
 }
 
 fn proxy_error_response(error: ProxyError) -> Response {
@@ -690,6 +728,7 @@ fn proxy_error_response(error: ProxyError) -> Response {
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
+    apply_route_owned_headers(&mut response);
     response
 }
 
@@ -775,9 +814,9 @@ fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
 mod tests {
     use super::{
         MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
-        buffered_proxy_body, collect_playlist, fetch_with_redirects, handle_proxy_suffix,
-        parse_proxy_request, parse_proxy_suffix, rewrite_playlist_bounded, same_authority,
-        streaming_proxy_body,
+        buffered_proxy_body, collect_playlist, fetch_with_redirects, handle_proxy,
+        handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix, proxy_error_response,
+        rewrite_playlist_bounded, same_authority, streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -788,7 +827,7 @@ mod tests {
         Router,
         body::Body,
         extract::Path,
-        http::{HeaderMap, Method, StatusCode, header},
+        http::{HeaderMap, Method, StatusCode, Uri, header},
         response::{IntoResponse, Response},
         routing::{any, get},
     };
@@ -801,7 +840,23 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
+
+    fn assert_response_isolated(response: &Response) {
+        let expected = [
+            (
+                "content-security-policy",
+                "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox",
+            ),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("x-frame-options", "DENY"),
+        ];
+        for (name, value) in expected {
+            assert_eq!(response.headers().get(name).unwrap(), value, "{name}");
+        }
+    }
 
     #[test]
     fn parse_core_path_format_preserves_tail_query() {
@@ -1045,13 +1100,123 @@ mod tests {
         let parsed = parse_proxy_request(
             "",
             Some(
-                "d=https%3A%2F%2Fexample.com%2Fvideo%3Fx%3D1&h=X-Test%3Afirst&h=X-Test%3Asecond&r=X-Reply%3Aok",
+                "d=https%3A%2F%2Fexample.com%2Fvideo%3Fx%3D1&h=X-Test%3Afirst&h=X-Test%3Asecond&r=Content-Type%3Atext%2Fplain&r=content-type%3Avideo%2Fmp4",
             ),
         )
         .unwrap();
         assert_eq!(parsed.target.as_str(), "https://example.com/video?x=1");
         assert_eq!(parsed.request_headers["x-test"], "second");
-        assert_eq!(parsed.response_headers["x-reply"], "ok");
+        assert_eq!(parsed.response_headers.len(), 1);
+        assert_eq!(parsed.response_headers[header::CONTENT_TYPE], "video/mp4");
+    }
+
+    #[test]
+    fn parse_rejects_non_token_alias_custom_header_names() {
+        for name in ["X_Test", "X.Test", "", "X-É"] {
+            let header = format!("{name}: value");
+            let option = urlencoding::encode(&header);
+            let query = format!("d=https%3A%2F%2Fexample.com&h={option}");
+            assert!(
+                matches!(
+                    parse_proxy_request("", Some(&query)),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "{name:?}"
+            );
+        }
+
+        let parsed = parse_proxy_request(
+            "",
+            Some("d=https%3A%2F%2Fexample.com&h=X-Api-Key2%3Asecret&r=Content-Type%3Atext%2Fplain"),
+        )
+        .unwrap();
+        assert_eq!(parsed.request_headers["x-api-key2"], "secret");
+        assert_eq!(parsed.response_headers[header::CONTENT_TYPE], "text/plain");
+    }
+
+    #[test]
+    fn parse_rejects_routing_header_aliases_case_insensitively() {
+        for name in [
+            "FoRwArDeD",
+            "vIa",
+            "Proxy-Connection",
+            "HTTP2-Settings",
+            "X-FoRwArDeD-For",
+            "x-ORIGINAL-Uri",
+            "X-Rewrite-URL",
+            "x-REAL-ip",
+            "X-hOsT",
+        ] {
+            let header = format!("{name}: attacker.example");
+            let option = urlencoding::encode(&header);
+            let query = format!("d=https%3A%2F%2Fexample.com&h={option}");
+            assert!(
+                matches!(
+                    parse_proxy_request("", Some(&query)),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_allows_legitimate_initial_hop_request_headers() {
+        let parsed = parse_proxy_request(
+            "",
+            Some(concat!(
+                "d=https%3A%2F%2Fexample.com",
+                "&h=Authorization%3ABearer%20secret",
+                "&h=Cookie%3Asession%3Dsecret",
+                "&h=Origin%3Ahttps%3A%2F%2Fapp.example",
+                "&h=Referer%3Ahttps%3A%2F%2Fapp.example%2Fplayer",
+                "&h=X-Api-Key%3Asecret"
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.request_headers[header::AUTHORIZATION],
+            "Bearer secret"
+        );
+        assert_eq!(parsed.request_headers[header::COOKIE], "session=secret");
+        assert_eq!(
+            parsed.request_headers[header::ORIGIN],
+            "https://app.example"
+        );
+        assert_eq!(
+            parsed.request_headers[header::REFERER],
+            "https://app.example/player"
+        );
+        assert_eq!(parsed.request_headers["x-api-key"], "secret");
+    }
+
+    #[test]
+    fn parse_limits_custom_response_headers_to_content_type() {
+        for name in [
+            "Content-Security-Policy",
+            "X-Content-Type-Options",
+            "Referrer-Policy",
+            "X-Frame-Options",
+            "Clear-Site-Data",
+            "Service-Worker-Allowed",
+            "Access-Control-Allow-Origin",
+            "Cache-Control",
+            "ETag",
+            "Content-Range",
+            "X-Reply",
+        ] {
+            let header = format!("{name}: attacker-value");
+            let option = urlencoding::encode(&header);
+            let query = format!("d=https%3A%2F%2Fexample.com&r={option}");
+            assert!(
+                matches!(
+                    parse_proxy_request("", Some(&query)),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1089,6 +1254,23 @@ mod tests {
                 ),
                 "{option}"
             );
+        }
+    }
+
+    #[test]
+    fn every_stable_error_response_has_route_owned_isolation_headers() {
+        for (error, status) in [
+            (ProxyError::InvalidRequest, StatusCode::BAD_REQUEST),
+            (ProxyError::Blocked, StatusCode::FORBIDDEN),
+            (ProxyError::Upstream, StatusCode::BAD_GATEWAY),
+            (ProxyError::Capacity, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = proxy_error_response(error);
+            assert_eq!(response.status(), status);
+            assert_response_isolated(&response);
+            if error == ProxyError::Capacity {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            }
         }
     }
 
@@ -1175,6 +1357,186 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (address, task)
+    }
+
+    #[tokio::test]
+    async fn active_html_and_svg_responses_receive_fixed_isolation_headers() {
+        async fn active(Path(kind): Path<String>) -> Response {
+            let (content_type, body) = if kind == "html" {
+                (
+                    "text/html",
+                    "<script>top.location='https://evil.example'</script>",
+                )
+            } else {
+                (
+                    "image/svg+xml",
+                    "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+                )
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header("content-security-policy", "script-src *")
+                .header("x-content-type-options", "unsafe")
+                .header("referrer-policy", "unsafe-url")
+                .header("x-frame-options", "ALLOWALL")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let (address, fixture) = fixture(Router::new().route("/{kind}", get(active))).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        for (kind, expected_content_type) in [("html", "text/html"), ("svg", "image/svg+xml")] {
+            let target = format!("http://active.test:{}/{kind}", address.port());
+            let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+                .parse()
+                .unwrap();
+            let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                expected_content_type,
+                "{kind}"
+            );
+            assert_response_isolated(&response);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!body.is_empty(), "{kind}");
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_is_rejected_before_resolver_or_upstream_work() {
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = upstream_calls.clone();
+        let (address, fixture) = fixture(Router::new().fallback(any(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                "unexpected upstream request"
+            }
+        })))
+        .await;
+        let (runtime, resolver) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://connect.test:{}/", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::CONNECT).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_response_isolated(&response);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_switching_protocols_is_rejected_as_isolated_bad_gateway() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let (runtime, resolver) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://upgrade.test:{}/upgrade", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_response_isolated(&response);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "Proxy upstream request failed"
+        );
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legitimate_custom_request_headers_reach_the_initial_hop() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let (address, fixture) = fixture(Router::new().route(
+            "/headers",
+            get(move |headers: HeaderMap| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    if let Some(sender) = seen_tx.lock().unwrap().take() {
+                        let _ = sender.send(headers);
+                    }
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://headers.test:{}/headers", address.port());
+        let uri: Uri = format!(
+            concat!(
+                "/proxy/?d={}",
+                "&h=Authorization%3ABearer%20secret",
+                "&h=Cookie%3Asession%3Dsecret",
+                "&h=Origin%3Ahttps%3A%2F%2Fapp.example",
+                "&h=Referer%3Ahttps%3A%2F%2Fapp.example%2Fplayer",
+                "&h=X-Api-Key%3Asecret"
+            ),
+            urlencoding::encode(&target)
+        )
+        .parse()
+        .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = seen_rx.await.unwrap();
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer secret");
+        assert_eq!(headers[header::COOKIE], "session=secret");
+        assert_eq!(headers[header::ORIGIN], "https://app.example");
+        assert_eq!(headers[header::REFERER], "https://app.example/player");
+        assert_eq!(headers["x-api-key"], "secret");
+        fixture.abort();
     }
 
     #[tokio::test]
