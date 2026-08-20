@@ -121,6 +121,45 @@ fn proxy_url(server: std::net::SocketAddr, target: &str) -> String {
 }
 
 #[tokio::test]
+async fn normal_encoded_core_path_form_reaches_destination_policy() -> anyhow::Result<()> {
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        config_dir: Some(config.path().join("config")),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/proxy?d=http%3A%2F%2F127.0.0.1%3A1%2Fmedia",
+        "/proxy/?d=http%3A%2F%2F127.0.0.1%3A1%2Fmedia",
+        "/proxy/d=http%3A%2F%2F127.0.0.1%3A1/media",
+    ] {
+        let response = client
+            .get(format!("http://{}{path}", server.http_addr()))
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "unexpected response for {path}: {:?}",
+            response.text().await?
+        );
+    }
+
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    Ok(())
+}
+
+#[tokio::test]
 async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> anyhow::Result<()> {
     let (fixture_addr, fixture_task) = start_fixture().await;
     let (tls_fixture_addr, tls_fixture_task) = start_tls_fixture().await?;

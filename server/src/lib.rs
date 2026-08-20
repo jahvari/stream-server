@@ -870,7 +870,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tgz", routes::archive::router())
         .nest("/nzb", routes::nzb::router())
         .nest("/local-addon", local_addon::get_router())
-        .merge(routes::proxy::router())
+        .nest_service("/proxy", routes::proxy::service(state.clone()))
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
         .route("/hlsv2/status", get(routes::hls::hls_status))

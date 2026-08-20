@@ -5,8 +5,8 @@ use crate::{
 use axum::{
     Router,
     body::Body,
-    extract::{OriginalUri, Path, RawQuery, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    extract::{OriginalUri, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -57,38 +57,60 @@ fn parse_proxy_request(
     rest: &str,
     raw_query: Option<&str>,
 ) -> Result<ParsedProxyRequest, ProxyError> {
-    parse_proxy_request_with_raw_length(rest, raw_query, rest.len())
+    let mut suffix = if rest.is_empty() {
+        String::new()
+    } else {
+        format!("/{rest}")
+    };
+    if let Some(query) = raw_query {
+        suffix.push('?');
+        suffix.push_str(query);
+    }
+    parse_proxy_suffix(&suffix)
 }
 
-fn parse_proxy_request_with_raw_length(
-    rest: &str,
-    raw_query: Option<&str>,
-    raw_rest_length: usize,
-) -> Result<ParsedProxyRequest, ProxyError> {
-    let input_length = raw_rest_length
-        .checked_add(raw_query.map_or(0, str::len))
-        .ok_or(ProxyError::InvalidRequest)?;
-    if input_length > MAX_PROXY_INPUT {
+fn parse_proxy_suffix(raw_suffix: &str) -> Result<ParsedProxyRequest, ProxyError> {
+    if raw_suffix.len() > MAX_PROXY_INPUT {
         return Err(ProxyError::InvalidRequest);
     }
 
-    let query_has_target = raw_query.is_some_and(|query| {
-        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "d")
-    });
-    let (encoded_options, path_tail, upstream_query) = if query_has_target {
-        (raw_query.unwrap_or_default(), "", None)
+    let (encoded_options, path_tail, upstream_query) = if raw_suffix.is_empty() {
+        ("", None, None)
+    } else if let Some(query) = raw_suffix.strip_prefix('?') {
+        (query, None, None)
+    } else if raw_suffix == "/" {
+        ("", None, None)
+    } else if let Some(query) = raw_suffix.strip_prefix("/?") {
+        (query, None, None)
     } else {
-        let (options, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        (options, tail, raw_query)
+        let path_and_query = raw_suffix
+            .strip_prefix('/')
+            .ok_or(ProxyError::InvalidRequest)?;
+        let (raw_path, upstream_query) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path_and_query, None),
+        };
+        let (options, tail) = match raw_path.split_once('/') {
+            Some((options, tail)) => (options, tail),
+            None => (raw_path, ""),
+        };
+        (options, Some(tail), upstream_query)
     };
 
     let mut target = None;
     let mut request_headers = HeaderMap::new();
     let mut response_headers = HeaderMap::new();
     let mut option_count = 0usize;
-    for (key, value) in url::form_urlencoded::parse(encoded_options.as_bytes()) {
-        match key.as_ref() {
-            "d" => target = Some(value.into_owned()),
+    for option in encoded_options.split('&') {
+        let (key, value) = option.split_once('=').unwrap_or((option, ""));
+        let key = strict_percent_decode(key, true)?;
+        let value = strict_percent_decode(value, true)?;
+        match key.as_str() {
+            "d" => {
+                if target.replace(value).is_some() {
+                    return Err(ProxyError::InvalidRequest);
+                }
+            }
             "h" | "r" => {
                 option_count = option_count
                     .checked_add(1)
@@ -114,41 +136,74 @@ fn parse_proxy_request_with_raw_length(
     }
 
     let target = target.ok_or(ProxyError::InvalidRequest)?;
-    if target.len() > MAX_TARGET_URL {
-        return Err(ProxyError::InvalidRequest);
-    }
     let mut target = Url::parse(&target).map_err(|_| ProxyError::InvalidRequest)?;
-    if !matches!(target.scheme(), "http" | "https") || target.host().is_none() {
-        return Err(ProxyError::InvalidRequest);
+    if let Some(path_tail) = path_tail {
+        let path_tail = strict_percent_decode(path_tail, false)?;
+        target.set_path(if path_tail.is_empty() {
+            "/"
+        } else {
+            &path_tail
+        });
+        target.set_query(upstream_query);
     }
-    target.set_fragment(None);
-    if !path_tail.is_empty() {
-        let declared = target.clone();
-        let joined = target
-            .join(path_tail)
-            .map_err(|_| ProxyError::InvalidRequest)?;
-        if declared.scheme() != joined.scheme()
-            || !same_authority(&declared, &joined)
-            || declared.username() != joined.username()
-            || declared.password() != joined.password()
-        {
-            return Err(ProxyError::InvalidRequest);
-        }
-        target = joined;
-    }
-    if let Some(query) = upstream_query {
-        target.set_query(Some(query));
-    }
-    target.set_fragment(None);
-    if target.as_str().len() > MAX_TARGET_URL {
-        return Err(ProxyError::InvalidRequest);
-    }
+    let target = validate_proxy_target(target)?;
 
     Ok(ParsedProxyRequest {
         target,
         request_headers,
         response_headers,
     })
+}
+
+fn strict_percent_decode(value: &str, plus_as_space: bool) -> Result<String, ProxyError> {
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = bytes
+                    .get(index + 1)
+                    .and_then(|byte| hex_value(*byte))
+                    .ok_or(ProxyError::InvalidRequest)?;
+                let low = bytes
+                    .get(index + 2)
+                    .and_then(|byte| hex_value(*byte))
+                    .ok_or(ProxyError::InvalidRequest)?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'+' if plus_as_space => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ProxyError::InvalidRequest)
+}
+
+fn validate_proxy_target(mut target: Url) -> Result<Url, ProxyError> {
+    if !matches!(target.scheme(), "http" | "https") || target.host().is_none() {
+        return Err(ProxyError::InvalidRequest);
+    }
+    target.set_fragment(None);
+    if target.as_str().len() > MAX_TARGET_URL {
+        return Err(ProxyError::InvalidRequest);
+    }
+    Ok(target)
 }
 
 fn parse_custom_header(value: &str) -> Result<(HeaderName, HeaderValue), ProxyError> {
@@ -298,66 +353,59 @@ fn same_authority(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/proxy", any(proxy_root_handler))
-        .route("/proxy/", any(proxy_root_handler))
-        .route("/proxy/{*rest}", any(proxy_path_handler))
+pub fn service(state: AppState) -> Router {
+    Router::new().fallback(any(proxy_handler)).with_state(state)
 }
 
-async fn proxy_root_handler(
+async fn proxy_handler(
     State(state): State<AppState>,
-    RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
-    method: Method,
-) -> Response {
-    handle_proxy(state, String::new(), 0, raw_query, headers, method).await
-}
-
-async fn proxy_path_handler(
-    State(state): State<AppState>,
-    Path(rest): Path<String>,
     OriginalUri(original_uri): OriginalUri,
-    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    let raw_rest_length = original_uri
-        .path()
-        .strip_prefix("/proxy/")
-        .map_or_else(|| original_uri.path().len(), str::len);
-    handle_proxy(state, rest, raw_rest_length, raw_query, headers, method).await
+    handle_proxy(&state.proxy_runtime, original_uri, headers, method).await
 }
 
 async fn handle_proxy(
-    state: AppState,
-    rest: String,
-    raw_rest_length: usize,
-    raw_query: Option<String>,
+    runtime: &ProxyRuntime,
+    original_uri: Uri,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    let context = match state.proxy_runtime.try_request() {
+    let raw_target = original_uri
+        .path_and_query()
+        .map_or_else(|| original_uri.path(), |value| value.as_str());
+    let raw_suffix = match raw_target.strip_prefix("/proxy") {
+        Some(suffix) if suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with('?') => {
+            suffix
+        }
+        _ => return proxy_error_response(ProxyError::InvalidRequest),
+    };
+    handle_proxy_suffix(runtime, raw_suffix, headers, method).await
+}
+
+async fn handle_proxy_suffix(
+    runtime: &ProxyRuntime,
+    raw_suffix: &str,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    if raw_suffix.len() > MAX_PROXY_INPUT {
+        return proxy_error_response(ProxyError::InvalidRequest);
+    }
+    let context = match runtime.try_request() {
         Ok(context) => context,
         Err(_) => return proxy_error_response(ProxyError::Capacity),
     };
-    let request =
-        match parse_proxy_request_with_raw_length(&rest, raw_query.as_deref(), raw_rest_length) {
-            Ok(request) => request,
-            Err(error) => return proxy_error_response(error),
-        };
-    let (upstream, final_url) = match fetch_with_redirects(
-        &state.proxy_runtime,
-        &context,
-        &request,
-        method,
-        &headers,
-    )
-    .await
-    {
-        Ok(response) => response,
+    let request = match parse_proxy_suffix(raw_suffix) {
+        Ok(request) => request,
         Err(error) => return proxy_error_response(error),
     };
+    let (upstream, final_url) =
+        match fetch_with_redirects(runtime, &context, &request, method, &headers).await {
+            Ok(response) => response,
+            Err(error) => return proxy_error_response(error),
+        };
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
     let content_type = upstream_headers
@@ -726,9 +774,10 @@ fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, ProxyError, buffered_proxy_body, collect_playlist,
-        fetch_with_redirects, parse_proxy_request, parse_proxy_request_with_raw_length,
-        rewrite_playlist_bounded, same_authority, streaming_proxy_body,
+        MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
+        buffered_proxy_body, collect_playlist, fetch_with_redirects, handle_proxy_suffix,
+        parse_proxy_request, parse_proxy_suffix, rewrite_playlist_bounded, same_authority,
+        streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -739,7 +788,7 @@ mod tests {
         Router,
         body::Body,
         extract::Path,
-        http::{HeaderMap, StatusCode, header},
+        http::{HeaderMap, Method, StatusCode, header},
         response::{IntoResponse, Response},
         routing::{any, get},
     };
@@ -771,17 +820,216 @@ mod tests {
 
     #[test]
     fn parse_path_tail_cannot_replace_the_declared_authority() {
-        for tail in ["https://evil.example/steal", "//evil.example/steal"] {
+        for (tail, expected_path) in [
+            ("https://evil.example/steal", "/https://evil.example/steal"),
+            ("//evil.example/steal", "//evil.example/steal"),
+        ] {
             let rest =
                 format!("d=https%3A%2F%2Ftrusted.example&h=Authorization%3ABearer%20secret/{tail}");
+            let parsed = parse_proxy_request(&rest, None).unwrap();
+            assert_eq!(parsed.target.host_str(), Some("trusted.example"), "{tail}");
+            assert_eq!(parsed.target.path(), expected_path, "{tail}");
+        }
+    }
+
+    #[test]
+    fn parse_selects_the_form_structurally() {
+        let parsed = parse_proxy_request(
+            "d=https%3A%2F%2Ftrusted.example%2Fold%2Fbase/media/file",
+            Some("d=https%3A%2F%2Fevil.example&h=Host%3Aevil&r=Set-Cookie%3Abad"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.target.as_str(),
+            "https://trusted.example/media/file?d=https%3A%2F%2Fevil.example&h=Host%3Aevil&r=Set-Cookie%3Abad"
+        );
+
+        assert!(matches!(
+            parse_proxy_request("foo", Some("d=https%3A%2F%2Fexample.com")),
+            Err(ProxyError::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn parse_requires_exactly_one_decoded_lowercase_target_key() {
+        for (rest, query) in [
+            ("", Some("x=value")),
+            (
+                "",
+                Some("d=https%3A%2F%2Fone.example&d=https%3A%2F%2Ftwo.example"),
+            ),
+            (
+                "",
+                Some("d=https%3A%2F%2Fone.example&%64=https%3A%2F%2Ftwo.example"),
+            ),
+            ("", Some("D=https%3A%2F%2Fexample.com")),
+        ] {
+            assert!(matches!(
+                parse_proxy_request(rest, query),
+                Err(ProxyError::InvalidRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_form_decodes_options_exactly_once() {
+        let parsed = parse_proxy_request(
+            "",
+            Some("d=https%3A%2F%2Fexample.com%2F%252F&h=X-Test%3Aa%26b%3Dc%2Bd+e"),
+        )
+        .unwrap();
+        assert_eq!(parsed.target.as_str(), "https://example.com/%2F");
+        assert_eq!(parsed.request_headers["x-test"], "a&b=c+d e");
+    }
+
+    #[test]
+    fn parse_path_decodes_once_with_path_semantics_and_replaces_base_components() {
+        let parsed = parse_proxy_request(
+            "d=https%3A%2F%2Fuser%3Apass%40example.com%2Fold%3Fbase%3D1%23fragment/a+b%2Fc%3Fd%23e",
+            Some("outer=a%2Bb"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.target.as_str(),
+            "https://user:pass@example.com/a+b/c%3Fd%23e?outer=a%2Bb"
+        );
+
+        let no_tail = parse_proxy_request(
+            "d=https%3A%2F%2Fuser%3Apass%40example.com%2Fold%3Fbase%3D1%23fragment",
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_tail.target.as_str(), "https://user:pass@example.com/");
+
+        let explicit_empty_query =
+            parse_proxy_request("d=https%3A%2F%2Fexample.com%2Fold%3Fbase%3D1", Some("")).unwrap();
+        assert_eq!(
+            explicit_empty_query.target.as_str(),
+            "https://example.com/?"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_malformed_percent_encoding_and_utf8() {
+        for invalid in ["%", "%0", "%GG", "%FF"] {
+            let query = format!("d=https%3A%2F%2Fexample.com&unknown={invalid}");
+            assert!(
+                matches!(
+                    parse_proxy_request("", Some(&query)),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "{invalid}"
+            );
+
+            let rest = format!("d=https%3A%2F%2Fexample.com/{invalid}");
             assert!(
                 matches!(
                     parse_proxy_request(&rest, None),
                     Err(ProxyError::InvalidRequest)
                 ),
-                "{tail}"
+                "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn parse_query_preserves_userinfo_and_clears_fragment() {
+        let parsed = parse_proxy_request(
+            "",
+            Some("d=https%3A%2F%2Fuser%3Apass%40example.com%2Fvideo%3Fx%3D1%23fragment"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.target.as_str(),
+            "https://user:pass@example.com/video?x=1"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_exact_raw_and_canonical_limits() {
+        let prefix = "?d=https%3A%2F%2Fexample.com&unknown=";
+        let exact_raw = format!("{prefix}{}", "a".repeat(MAX_PROXY_INPUT - prefix.len()));
+        assert_eq!(exact_raw.len(), MAX_PROXY_INPUT);
+        assert!(parse_proxy_suffix(&exact_raw).is_ok());
+        assert!(matches!(
+            parse_proxy_suffix(&format!("{exact_raw}a")),
+            Err(ProxyError::InvalidRequest)
+        ));
+
+        let target_prefix = "https://example.com/";
+        let exact_target = format!(
+            "{target_prefix}{}",
+            "a".repeat(MAX_TARGET_URL - target_prefix.len())
+        );
+        let exact_query = format!("d={exact_target}");
+        assert_eq!(
+            parse_proxy_request("", Some(&exact_query))
+                .unwrap()
+                .target
+                .as_str()
+                .len(),
+            MAX_TARGET_URL
+        );
+        let oversized_query = format!("d={exact_target}a");
+        assert!(matches!(
+            parse_proxy_request("", Some(&oversized_query)),
+            Err(ProxyError::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn parse_preserves_header_count_and_pair_limits() {
+        let options = (0..64)
+            .map(|index| format!("h=X-{index}%3Avalue"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let query = format!("d=https%3A%2F%2Fexample.com&{options}");
+        assert_eq!(
+            parse_proxy_request("", Some(&query))
+                .unwrap()
+                .request_headers
+                .len(),
+            64
+        );
+
+        let exact_pair = format!(
+            "d=https%3A%2F%2Fexample.com&h=X:{}",
+            "a".repeat(MAX_HEADER_PAIR - 2)
+        );
+        assert!(parse_proxy_request("", Some(&exact_pair)).is_ok());
+        let oversized_pair = format!("{exact_pair}a");
+        assert!(matches!(
+            parse_proxy_request("", Some(&oversized_pair)),
+            Err(ProxyError::InvalidRequest)
+        ));
+    }
+
+    #[tokio::test]
+    async fn overlong_raw_suffix_precedes_capacity_and_dns() {
+        let (runtime, resolver) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let permits = (0..64)
+            .map(|_| runtime.try_request().unwrap())
+            .collect::<Vec<_>>();
+        let prefix = "?d=http%3A%2F%2Fblocked.example&unknown=";
+        let raw_suffix = format!("{prefix}{}", "a".repeat(MAX_PROXY_INPUT + 1 - prefix.len()));
+        let response =
+            handle_proxy_suffix(&runtime, &raw_suffix, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+
+        let response = handle_proxy_suffix(
+            &runtime,
+            "?d=http%3A%2F%2Fblocked.example",
+            HeaderMap::new(),
+            Method::GET,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        drop(permits);
     }
 
     #[test]
@@ -863,14 +1111,11 @@ mod tests {
             Err(ProxyError::InvalidRequest)
         ));
 
-        // Axum percent-decodes wildcard path captures. The raw URI length must
-        // remain authoritative so encoded input cannot shrink under the cap.
+        let prefix = "/d=https%3A%2F%2Fexample.com/";
+        let raw_suffix = format!("{prefix}{}", "a".repeat(MAX_PROXY_INPUT + 1 - prefix.len()));
+        assert_eq!(raw_suffix.len(), MAX_PROXY_INPUT + 1);
         assert!(matches!(
-            parse_proxy_request_with_raw_length(
-                "d=https%3A%2F%2Fexample.com",
-                None,
-                MAX_PROXY_INPUT + 1,
-            ),
+            parse_proxy_suffix(&raw_suffix),
             Err(ProxyError::InvalidRequest)
         ));
     }
