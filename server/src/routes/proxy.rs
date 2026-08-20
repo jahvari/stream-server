@@ -123,13 +123,23 @@ fn parse_proxy_request_with_raw_length(
     }
     target.set_fragment(None);
     if !path_tail.is_empty() {
-        target = target
+        let declared = target.clone();
+        let joined = target
             .join(path_tail)
             .map_err(|_| ProxyError::InvalidRequest)?;
+        if declared.scheme() != joined.scheme()
+            || !same_authority(&declared, &joined)
+            || declared.username() != joined.username()
+            || declared.password() != joined.password()
+        {
+            return Err(ProxyError::InvalidRequest);
+        }
+        target = joined;
     }
     if let Some(query) = upstream_query {
         target.set_query(Some(query));
     }
+    target.set_fragment(None);
     if target.as_str().len() > MAX_TARGET_URL {
         return Err(ProxyError::InvalidRequest);
     }
@@ -276,16 +286,16 @@ async fn fetch_with_redirects(
         if !same_authority(&destination.url, &next) {
             let _ = next.set_username("");
             let _ = next.set_password(None);
-            custom_headers.remove(header::AUTHORIZATION);
-            custom_headers.remove(header::COOKIE);
-            custom_headers.remove(header::PROXY_AUTHORIZATION);
+            custom_headers.clear();
         }
         target = next;
     }
 }
 
 fn same_authority(left: &Url, right: &Url) -> bool {
-    left.host() == right.host() && left.port_or_known_default() == right.port_or_known_default()
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 pub fn router() -> Router<AppState> {
@@ -358,7 +368,7 @@ async fn handle_proxy(
         || final_url.path().ends_with(".m3u")
         || content_type.to_ascii_lowercase().contains("mpegurl");
 
-    if playlist {
+    if playlist && status != StatusCode::PARTIAL_CONTENT {
         if upstream_headers
             .get(header::CONTENT_ENCODING)
             .is_some_and(|value| {
@@ -718,7 +728,7 @@ mod tests {
     use super::{
         MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, ProxyError, buffered_proxy_body, collect_playlist,
         fetch_with_redirects, parse_proxy_request, parse_proxy_request_with_raw_length,
-        rewrite_playlist_bounded, streaming_proxy_body,
+        rewrite_playlist_bounded, same_authority, streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -742,6 +752,7 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+    use url::Url;
 
     #[test]
     fn parse_core_path_format_preserves_tail_query() {
@@ -756,6 +767,29 @@ mod tests {
         );
         assert_eq!(parsed.request_headers[header::RANGE], "bytes=1-9");
         assert_eq!(parsed.response_headers[header::CONTENT_TYPE], "video/mp4");
+    }
+
+    #[test]
+    fn parse_path_tail_cannot_replace_the_declared_authority() {
+        for tail in ["https://evil.example/steal", "//evil.example/steal"] {
+            let rest =
+                format!("d=https%3A%2F%2Ftrusted.example&h=Authorization%3ABearer%20secret/{tail}");
+            assert!(
+                matches!(
+                    parse_proxy_request(&rest, None),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "{tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_origin_requires_the_same_scheme() {
+        let http = Url::parse("http://example.test:443/source").unwrap();
+        let https = Url::parse("https://example.test:443/destination").unwrap();
+
+        assert!(!same_authority(&http, &https));
     }
 
     #[test]
@@ -1138,7 +1172,8 @@ mod tests {
                 concat!(
                     "d=http%3A%2F%2Fuser%3Asecret%40redirect.test%3A{}%2Fredirect",
                     "&h=Authorization%3ABearer%20secret",
-                    "&h=Cookie%3Asession%3Dsecret"
+                    "&h=Cookie%3Asession%3Dsecret",
+                    "&h=X-Api-Key%3Asecret"
                 ),
                 address.port()
             )),
@@ -1162,6 +1197,7 @@ mod tests {
         assert_eq!(method, reqwest::Method::POST);
         assert!(!headers.contains_key(header::AUTHORIZATION));
         assert!(!headers.contains_key(header::COOKIE));
+        assert!(!headers.contains_key("x-api-key"));
         fixture.abort();
     }
 

@@ -54,7 +54,7 @@ impl SettingsControl {
         peer: SocketAddr,
         headers: &HeaderMap,
     ) -> SettingsMutationAuthority {
-        if !peer.ip().is_loopback() {
+        if !is_loopback(peer.ip()) {
             return SettingsMutationAuthority::Untrusted;
         }
         let Some(candidate) = headers.get(SETTINGS_TOKEN_HEADER) else {
@@ -87,6 +87,15 @@ impl SettingsControl {
         Self {
             token: Arc::new(token),
         }
+    }
+}
+
+fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| ip.is_loopback(), |mapped| mapped.is_loopback()),
     }
 }
 
@@ -196,6 +205,13 @@ mod tests {
         );
         assert_eq!(
             control.authorize_http("[::1]:40000".parse::<SocketAddr>().unwrap(), &headers),
+            SettingsMutationAuthority::HttpAuthorized
+        );
+        assert_eq!(
+            control.authorize_http(
+                "[::ffff:127.0.0.1]:40000".parse::<SocketAddr>().unwrap(),
+                &headers,
+            ),
             SettingsMutationAuthority::HttpAuthorized
         );
     }

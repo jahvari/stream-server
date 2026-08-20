@@ -10,7 +10,7 @@ fn main() -> Result<()> {
         .build()
         .context("failed to create HTTP client")?;
     let mut connector = settings_gui::HttpConnector::new(http_client, server_url.clone());
-    if server_url_has_ip_literal_loopback(&server_url) {
+    if settings_gui::server_url_has_ip_literal_loopback(&server_url) {
         let path = token_path.or_else(default_token_path);
         if let Some(path) = path {
             match std::fs::read(&path) {
@@ -56,13 +56,6 @@ fn parse_arguments() -> (String, Option<PathBuf>) {
 
 fn trim_server_url(value: String) -> String {
     value.trim_end_matches('/').to_string()
-}
-
-fn server_url_has_ip_literal_loopback(server_url: &str) -> bool {
-    reqwest::Url::parse(server_url)
-        .ok()
-        .and_then(|url| url.host_str()?.parse::<std::net::IpAddr>().ok())
-        .is_some_and(|ip| ip.is_loopback())
 }
 
 fn default_token_path() -> Option<PathBuf> {

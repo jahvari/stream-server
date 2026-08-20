@@ -11,7 +11,7 @@ pub(crate) enum DestinationClass {
     AlwaysBlocked,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LocalNetworks {
     pub(crate) interfaces: Vec<IpNet>,
 }
@@ -19,6 +19,10 @@ pub(crate) struct LocalNetworks {
 impl LocalNetworks {
     pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         self.interfaces.iter().any(|network| network.contains(&ip))
+    }
+
+    pub(crate) fn contains_address(&self, ip: IpAddr) -> bool {
+        self.interfaces.iter().any(|network| network.addr() == ip)
     }
 }
 
@@ -57,6 +61,9 @@ const ALWAYS_BLOCKED_V4: &[&str] = &[
 
 const METADATA_V4: &[&str] = &[
     "168.63.129.16/32",
+    "169.254.0.23/32",
+    "169.254.10.10/32",
+    "169.254.42.42/32",
     "169.254.169.254/32",
     "169.254.170.2/32",
     "169.254.170.23/32",
@@ -73,12 +80,18 @@ const ALWAYS_BLOCKED_V6: &[&str] = &[
     "2001::/23",
     "2001:db8::/32",
     "2620:4f:8000::/48",
+    "3ffe::/16",
     "3fff::/20",
     "5f00::/16",
     "ff00::/8",
 ];
 
-const METADATA_V6: &[&str] = &["fd00:ec2::23/128", "fd00:ec2::254/128", "fd20:ce::254/128"];
+const METADATA_V6: &[&str] = &[
+    "fd00:42::42/128",
+    "fd00:ec2::23/128",
+    "fd00:ec2::254/128",
+    "fd20:ce::254/128",
+];
 
 static PRIVATE_V4_NETS: LazyLock<Vec<IpNet>> = LazyLock::new(|| parse_networks(PRIVATE_V4));
 static ALWAYS_BLOCKED_V4_NETS: LazyLock<Vec<IpNet>> =
@@ -88,6 +101,8 @@ static PRIVATE_V6_NETS: LazyLock<Vec<IpNet>> = LazyLock::new(|| parse_networks(P
 static ALWAYS_BLOCKED_V6_NETS: LazyLock<Vec<IpNet>> =
     LazyLock::new(|| parse_networks(ALWAYS_BLOCKED_V6));
 static METADATA_V6_NETS: LazyLock<Vec<IpNet>> = LazyLock::new(|| parse_networks(METADATA_V6));
+static GLOBAL_UNICAST_V6_NET: LazyLock<IpNet> =
+    LazyLock::new(|| "2000::/3".parse().expect("global IPv6 network is valid"));
 
 fn parse_networks(values: &[&str]) -> Vec<IpNet> {
     values
@@ -201,8 +216,14 @@ fn embedded_nat64(ip: Ipv6Addr, prefixes: &[Nat64Prefix]) -> Option<Ipv4Addr> {
         .or_else(|| {
             prefixes
                 .iter()
+                .filter(|prefix| nat64_prefix_address_space_is_valid(**prefix))
                 .find_map(|prefix| extract_rfc6052(ip, *prefix))
         })
+}
+
+fn nat64_prefix_address_space_is_valid(prefix: Nat64Prefix) -> bool {
+    let ip = IpAddr::V6(prefix.network);
+    GLOBAL_UNICAST_V6_NET.contains(&ip) || prefix.network.segments()[0] & 0xfe00 == 0xfc00
 }
 
 pub(crate) fn normalized_embedded_ipv4(ip: Ipv6Addr, nat64: &[Nat64Prefix]) -> Option<Ipv4Addr> {
@@ -230,8 +251,10 @@ fn classify_v6(ip: Ipv6Addr, local: &LocalNetworks, nat64: &[Nat64Prefix]) -> De
 
     if local.contains(native) || contains(&PRIVATE_V6_NETS, native) {
         DestinationClass::PrivateSource
-    } else {
+    } else if GLOBAL_UNICAST_V6_NET.contains(&native) {
         DestinationClass::Public
+    } else {
+        DestinationClass::AlwaysBlocked
     }
 }
 
@@ -298,6 +321,9 @@ mod tests {
         let local = LocalNetworks::default();
         for value in [
             "168.63.129.16",
+            "169.254.0.23",
+            "169.254.10.10",
+            "169.254.42.42",
             "169.254.169.254",
             "169.254.170.2",
             "169.254.170.23",
@@ -342,12 +368,27 @@ mod tests {
         let private = ["::1", "fc00::1", "fdff:ffff::1", "fe80::1", "febf:ffff::1"];
         let always_blocked = [
             "::",
+            "200::1",
+            "400::1",
+            "800::1",
+            "1000::1",
             "100::1",
             "100:0:0:1::1",
             "2001:db8::1",
             "2620:4f:8000::1",
+            "3ffe::1",
             "3fff::1",
+            "4000::1",
             "5f00::1",
+            "6000::1",
+            "8000::1",
+            "a000::1",
+            "c000::1",
+            "e000::1",
+            "f000::1",
+            "f800::1",
+            "fe00::1",
+            "fec0::1",
             "ff00::1",
         ];
 
@@ -446,6 +487,15 @@ mod tests {
             classify_ip("2001:db8::5db8:d822".parse().unwrap(), &local, &discovered,),
             DestinationClass::AlwaysBlocked
         );
+
+        let reserved = [Nat64Prefix {
+            network: "4000::".parse().unwrap(),
+            length: 96,
+        }];
+        assert_eq!(
+            classify_ip("4000::5db8:d822".parse().unwrap(), &local, &reserved),
+            DestinationClass::AlwaysBlocked
+        );
     }
 
     #[test]
@@ -473,7 +523,12 @@ mod tests {
     #[test]
     fn ipv6_metadata_precedes_private_source_ranges() {
         let local = LocalNetworks::default();
-        for value in ["fd00:ec2::23", "fd00:ec2::254", "fd20:ce::254"] {
+        for value in [
+            "fd00:42::42",
+            "fd00:ec2::23",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+        ] {
             assert_eq!(
                 classify_ip(value.parse().unwrap(), &local, &[]),
                 DestinationClass::AlwaysBlocked,

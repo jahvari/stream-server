@@ -48,6 +48,18 @@ async fn start_fixture() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) 
             }),
         )
         .route(
+            "/playlist-partial",
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .header(header::CONTENT_RANGE, "bytes 0-10/100")
+                    .header(header::CONTENT_LENGTH, "11")
+                    .body(Body::from("segment.ts\n"))
+                    .unwrap()
+            }),
+        )
+        .route(
             "/redirect-metadata",
             get(|| async {
                 (
@@ -193,6 +205,19 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
     assert!(playlist.headers().get(header::CONTENT_RANGE).is_none());
     assert!(playlist.headers().get(header::CONTENT_ENCODING).is_none());
     assert!(playlist.text().await?.contains("/proxy/?d="));
+
+    let partial_playlist_target = format!("http://{fixture_addr}/playlist-partial");
+    let partial_playlist = client
+        .get(proxy_url(server.http_addr(), &partial_playlist_target))
+        .send()
+        .await?;
+    assert_eq!(partial_playlist.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        partial_playlist.headers()[header::CONTENT_RANGE],
+        "bytes 0-10/100"
+    );
+    assert_eq!(partial_playlist.headers()[header::CONTENT_LENGTH], "11");
+    assert_eq!(partial_playlist.text().await?, "segment.ts\n");
 
     for self_path in ["/heartbeat", "/settings", "/proxy"] {
         let self_target = format!("{base}{self_path}");

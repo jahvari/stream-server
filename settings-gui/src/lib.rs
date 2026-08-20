@@ -165,14 +165,7 @@ impl HttpConnector {
     }
 
     pub fn with_settings_control_token(mut self, mut token: HeaderValue) -> Result<Self> {
-        let url = reqwest::Url::parse(&self.server_url)
-            .context("server URL is invalid for protected settings")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_none_or(|ip| !ip.is_loopback())
-        {
+        if !server_url_has_ip_literal_loopback(&self.server_url) {
             anyhow::bail!("protected settings require an IP-literal loopback server URL");
         }
 
@@ -186,6 +179,28 @@ impl HttpConnector {
         token.set_sensitive(true);
         self.settings_control_token = Some(token);
         Ok(self)
+    }
+}
+
+pub fn server_url_has_ip_literal_loopback(server_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(server_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(ip) = url
+        .host_str()
+        .map(|host| host.trim_matches(['[', ']']))
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+    else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| ip.is_loopback(), |mapped| mapped.is_loopback()),
     }
 }
 
@@ -1737,10 +1752,16 @@ mod tests {
             );
         }
 
-        let connector = HttpConnector::new(Client::new(), "http://127.0.0.1:11470".to_string())
-            .with_settings_control_token(token)
-            .unwrap();
-        assert!(connector.can_update_protected_settings());
+        for server_url in [
+            "http://127.0.0.1:11470",
+            "http://[::1]:11470",
+            "http://[::ffff:127.0.0.1]:11470",
+        ] {
+            let connector = HttpConnector::new(Client::new(), server_url.to_string())
+                .with_settings_control_token(token.clone())
+                .unwrap();
+            assert!(connector.can_update_protected_settings(), "{server_url}");
+        }
     }
 
     #[tokio::test]
