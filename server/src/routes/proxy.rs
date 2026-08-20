@@ -13,15 +13,21 @@ use axum::{
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::{Client, Method};
-use std::{pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    time::Duration,
+};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
-use url::Url;
+use url::{Position, Url};
 
 const MAX_PROXY_INPUT: usize = 64 * 1024;
 const MAX_TARGET_URL: usize = 16 * 1024;
 const MAX_CUSTOM_OPTIONS: usize = 64;
 const MAX_HEADER_PAIR: usize = 8 * 1024;
+const RAW_CANONICAL_PATH_KEY: &str = "x-stream-path";
+const RAW_CANONICAL_PATH_OPTION: &str = "&x-stream-path=raw";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyError {
@@ -108,6 +114,7 @@ fn parse_proxy_suffix(raw_suffix: &str) -> Result<ParsedProxyRequest, ProxyError
     let mut request_headers = HeaderMap::new();
     let mut response_headers = HeaderMap::new();
     let mut option_count = 0usize;
+    let mut raw_canonical_path = false;
     for option in encoded_options.split('&') {
         let (key, value) = option.split_once('=').unwrap_or((option, ""));
         let key = strict_percent_decode(key, true)?;
@@ -138,19 +145,35 @@ fn parse_proxy_suffix(raw_suffix: &str) -> Result<ParsedProxyRequest, ProxyError
                     response_headers.insert(name, value);
                 }
             }
+            RAW_CANONICAL_PATH_KEY => {
+                if value != "raw" || raw_canonical_path {
+                    return Err(ProxyError::InvalidRequest);
+                }
+                raw_canonical_path = true;
+            }
             _ => {}
         }
+    }
+
+    if raw_canonical_path && path_tail.is_none_or(str::is_empty) {
+        return Err(ProxyError::InvalidRequest);
     }
 
     let target = target.ok_or(ProxyError::InvalidRequest)?;
     let mut target = Url::parse(&target).map_err(|_| ProxyError::InvalidRequest)?;
     if let Some(path_tail) = path_tail {
-        let path_tail = strict_percent_decode(path_tail, false)?;
-        target.set_path(if path_tail.is_empty() {
-            "/"
+        let decoded_path;
+        let path_tail = if raw_canonical_path {
+            validate_percent_encoding(path_tail)?;
+            if let Some(upstream_query) = upstream_query {
+                validate_percent_encoding(upstream_query)?;
+            }
+            path_tail
         } else {
-            &path_tail
-        });
+            decoded_path = strict_percent_decode(path_tail, false)?;
+            &decoded_path
+        };
+        target.set_path(if path_tail.is_empty() { "/" } else { path_tail });
         target.set_query(upstream_query);
     }
     let target = validate_proxy_target(target)?;
@@ -160,6 +183,28 @@ fn parse_proxy_suffix(raw_suffix: &str) -> Result<ParsedProxyRequest, ProxyError
         request_headers,
         response_headers,
     })
+}
+
+fn validate_percent_encoding(value: &str) -> Result<(), ProxyError> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                || bytes
+                    .get(index + 2)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit())
+            {
+                return Err(ProxyError::InvalidRequest);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 fn strict_percent_decode(value: &str, plus_as_space: bool) -> Result<String, ProxyError> {
@@ -456,7 +501,7 @@ async fn handle_proxy_suffix(
     let FetchedProxyResponse {
         response: upstream,
         final_url,
-        effective_custom_request_headers: _effective_custom_request_headers,
+        effective_custom_request_headers,
         effective_response_headers,
     } = fetched;
     let status = upstream.status();
@@ -483,8 +528,14 @@ async fn handle_proxy_suffix(
         };
         let body = match String::from_utf8(body)
             .map_err(|_| ProxyError::Upstream)
-            .and_then(|body| rewrite_playlist_bounded(&body, &final_url))
-        {
+            .and_then(|body| {
+                rewrite_playlist_with_options(
+                    &body,
+                    &final_url,
+                    &effective_custom_request_headers,
+                    &effective_response_headers,
+                )
+            }) {
             Ok(body) => body,
             Err(error) => return proxy_error_response(error),
         };
@@ -972,8 +1023,21 @@ fn proxy_error_response(error: ProxyError) -> Response {
 
 const MAX_PLAYLIST_OUTPUT: usize = 16 * 1024 * 1024;
 
+#[cfg(test)]
 fn rewrite_playlist_bounded(body: &str, base_url: &Url) -> Result<String, ProxyError> {
-    let mut output = String::with_capacity(body.len().min(MAX_PLAYLIST_OUTPUT));
+    rewrite_playlist_with_options(body, base_url, &HeaderMap::new(), &HeaderMap::new())
+}
+
+fn rewrite_playlist_with_options(
+    body: &str,
+    base_url: &Url,
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+) -> Result<String, ProxyError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(body.len().min(MAX_PLAYLIST_OUTPUT))
+        .map_err(|_| ProxyError::Upstream)?;
     for line_with_ending in body.split_inclusive('\n') {
         let (line, ending) = if let Some(line) = line_with_ending.strip_suffix("\r\n") {
             (line, "\r\n")
@@ -983,14 +1047,24 @@ fn rewrite_playlist_bounded(body: &str, base_url: &Url) -> Result<String, ProxyE
             (line_with_ending, "")
         };
 
-        if line.starts_with('#') {
-            rewrite_playlist_tag(line, base_url, &mut output)?;
-        } else if line.is_empty() {
-            push_playlist(&mut output, "")?;
-        } else if let Ok(absolute) = base_url.join(line) {
-            push_proxy_uri(&mut output, &absolute)?;
-        } else {
+        if line.starts_with("#EXT") {
+            rewrite_playlist_tag(
+                line,
+                base_url,
+                request_headers,
+                response_headers,
+                &mut output,
+            )?;
+        } else if line.starts_with('#') || line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
             push_playlist(&mut output, line)?;
+        } else {
+            rewrite_playlist_reference(
+                line,
+                base_url,
+                request_headers,
+                response_headers,
+                &mut output,
+            )?;
         }
         push_playlist(&mut output, ending)?;
     }
@@ -1000,61 +1074,593 @@ fn rewrite_playlist_bounded(body: &str, base_url: &Url) -> Result<String, ProxyE
     Ok(output)
 }
 
-fn rewrite_playlist_tag(line: &str, base_url: &Url, output: &mut String) -> Result<(), ProxyError> {
-    let mut remaining = line;
-    while let Some(start) = remaining.find("URI=\"") {
-        let value_start = start + 5;
-        push_playlist(output, &remaining[..value_start])?;
-        let after_start = &remaining[value_start..];
-        let Some(end) = after_start.find('"') else {
-            push_playlist(output, after_start)?;
-            return Ok(());
-        };
-        let value = &after_start[..end];
-        if let Ok(absolute) = base_url.join(value) {
-            push_proxy_uri(output, &absolute)?;
-        } else {
-            push_playlist(output, value)?;
+fn rewrite_playlist_tag(
+    line: &str,
+    base_url: &Url,
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+    output: &mut String,
+) -> Result<(), ProxyError> {
+    let Some(colon) = line.find(':') else {
+        return push_playlist(output, line);
+    };
+    let bytes = line.as_bytes();
+    let mut attribute_start = colon + 1;
+    let mut copied = 0usize;
+    while attribute_start < line.len() {
+        let mut key_start = attribute_start;
+        while bytes
+            .get(key_start)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            key_start += 1;
         }
-        remaining = &after_start[end..];
+        let mut scan_start = attribute_start;
+        if line[key_start..].starts_with("URI=\"") {
+            let value_start = key_start + 5;
+            let Some(value_end) = line[value_start..]
+                .find('"')
+                .map(|offset| value_start + offset)
+            else {
+                break;
+            };
+            push_playlist(output, &line[copied..value_start])?;
+            let value = &line[value_start..value_end];
+            rewrite_playlist_reference(value, base_url, request_headers, response_headers, output)?;
+            copied = value_end;
+            scan_start = value_end + 1;
+        }
+
+        let mut quoted = false;
+        let mut next_attribute = None;
+        for (offset, byte) in bytes[scan_start..].iter().copied().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b',' if !quoted => {
+                    next_attribute = Some(scan_start + offset + 1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(next_attribute) = next_attribute else {
+            break;
+        };
+        attribute_start = next_attribute;
     }
-    push_playlist(output, remaining)
+    push_playlist(output, &line[copied..])
 }
 
-fn push_proxy_uri(output: &mut String, absolute: &Url) -> Result<(), ProxyError> {
-    const PREFIX: &str = "/proxy/?d=";
-    let encoded = urlencoding::encode(absolute.as_str());
-    let required = encoded
-        .len()
-        .checked_add(PREFIX.len())
-        .ok_or(ProxyError::Upstream)?;
-    let remaining = MAX_PLAYLIST_OUTPUT.saturating_sub(output.len());
-    if required > remaining {
+struct HlsVariableReplacement {
+    token: String,
+    placeholder: String,
+    removed_with_fragment: bool,
+}
+
+struct HlsVariablePath {
+    base_target: String,
+    path: String,
+    query: Option<String>,
+}
+
+struct ResolvedHlsReference {
+    target: String,
+    same_origin: bool,
+    variable_path: Option<HlsVariablePath>,
+}
+
+fn rewrite_playlist_reference(
+    reference: &str,
+    base_url: &Url,
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+    output: &mut String,
+) -> Result<(), ProxyError> {
+    let Some(resolved) = resolve_hls_reference(reference, base_url)? else {
+        return push_playlist(output, reference);
+    };
+    push_proxy_uri(output, &resolved, request_headers, response_headers)
+}
+
+fn resolve_hls_reference(
+    reference: &str,
+    base_url: &Url,
+) -> Result<Option<ResolvedHlsReference>, ProxyError> {
+    let scheme_colon = reference
+        .bytes()
+        .take(MAX_TARGET_URL + 1)
+        .inspect(|_| {
+            #[cfg(test)]
+            HLS_SCHEME_PRESCAN_BYTES.with(|scans| scans.set(scans.get() + 1));
+        })
+        .position(|byte| matches!(byte, b':' | b'/' | b'?' | b'#'))
+        .filter(|index| reference.as_bytes()[*index] == b':');
+    if let Some(colon) = scheme_colon {
+        let scheme = &reference[..colon];
+        if valid_url_scheme(scheme)
+            && !scheme.eq_ignore_ascii_case("http")
+            && !scheme.eq_ignore_ascii_case("https")
+        {
+            return Ok(None);
+        }
+    }
+    if reference.len() > MAX_TARGET_URL {
         return Err(ProxyError::Upstream);
     }
-    push_playlist(output, PREFIX)?;
-    push_playlist(output, &encoded)
+    let variables = hls_variable_ranges(reference);
+    if scheme_colon.is_some_and(|colon| variables.iter().any(|(start, _)| *start < colon)) {
+        return Ok(None);
+    }
+
+    let authority = authority_range(reference, scheme_colon);
+    if authority.is_some_and(|(authority_start, authority_end)| {
+        variables
+            .iter()
+            .any(|(start, end)| *start < authority_end && *end > authority_start)
+    }) {
+        return Ok(None);
+    }
+
+    let mut placeholder_generator = HlsPlaceholderGenerator::new(reference, base_url.as_str());
+    let (substituted, mut replacements) =
+        substitute_hls_variables(reference, &variables, &mut placeholder_generator)?;
+    let Some(mut absolute) = resolve_substituted_hls_reference(base_url, &substituted)? else {
+        return Ok(None);
+    };
+    if !hls_placeholders_are_safe(&absolute, &replacements) {
+        placeholder_generator.occupy(absolute.as_str());
+        let (retry, retry_replacements) =
+            substitute_hls_variables(reference, &variables, &mut placeholder_generator)?;
+        let Some(retry_absolute) = resolve_substituted_hls_reference(base_url, &retry)? else {
+            return Ok(None);
+        };
+        if !hls_placeholders_are_safe(&retry_absolute, &retry_replacements) {
+            return Ok(None);
+        }
+        absolute = retry_absolute;
+        replacements = retry_replacements;
+    }
+    let same_origin = same_origin(base_url, &absolute);
+    let target = restore_hls_variables(absolute.as_str(), &replacements)?;
+    let variable_path = if replacements
+        .iter()
+        .any(|replacement| !replacement.removed_with_fragment)
+    {
+        let path = restore_hls_variables(absolute.path(), &replacements)?;
+        let query = absolute
+            .query()
+            .map(|query| restore_hls_variables(query, &replacements))
+            .transpose()?;
+        if validate_percent_encoding(&path).is_err()
+            || query
+                .as_deref()
+                .is_some_and(|query| validate_percent_encoding(query).is_err())
+        {
+            return Ok(None);
+        }
+        absolute.set_path("/");
+        absolute.set_query(None);
+        Some(HlsVariablePath {
+            base_target: absolute.into(),
+            path,
+            query,
+        })
+    } else {
+        None
+    };
+    Ok(Some(ResolvedHlsReference {
+        target,
+        same_origin,
+        variable_path,
+    }))
+}
+
+fn substitute_hls_variables(
+    reference: &str,
+    variables: &[(usize, usize)],
+    placeholder_generator: &mut HlsPlaceholderGenerator,
+) -> Result<(String, Vec<HlsVariableReplacement>), ProxyError> {
+    let fragment = reference.find('#');
+    let mut replacements = Vec::with_capacity(variables.len());
+    let mut substituted = String::new();
+    substituted
+        .try_reserve_exact(reference.len())
+        .map_err(|_| ProxyError::Upstream)?;
+    let mut copied = 0usize;
+    for (start, end) in variables.iter().copied() {
+        push_target(&mut substituted, &reference[copied..start])?;
+        let placeholder = placeholder_generator.next().ok_or(ProxyError::Upstream)?;
+        push_target(&mut substituted, &placeholder)?;
+        replacements.push(HlsVariableReplacement {
+            token: reference[start..end].to_owned(),
+            placeholder,
+            removed_with_fragment: fragment.is_some_and(|fragment| start > fragment),
+        });
+        copied = end;
+    }
+    push_target(&mut substituted, &reference[copied..])?;
+    Ok((substituted, replacements))
+}
+
+fn resolve_substituted_hls_reference(
+    base_url: &Url,
+    substituted: &str,
+) -> Result<Option<Url>, ProxyError> {
+    let absolute = match base_url.join(substituted) {
+        Ok(absolute) => absolute,
+        Err(_) => return Ok(None),
+    };
+    if !matches!(absolute.scheme(), "http" | "https") || absolute.host().is_none() {
+        return Ok(None);
+    }
+    validate_proxy_target(absolute)
+        .map(Some)
+        .map_err(|_| ProxyError::Upstream)
+}
+
+fn hls_placeholders_are_safe(canonical: &Url, replacements: &[HlsVariableReplacement]) -> bool {
+    let mut placeholder_indices = HashMap::with_capacity(replacements.len());
+    for (index, replacement) in replacements.iter().enumerate() {
+        let Ok(placeholder) = <[u8; 4]>::try_from(replacement.placeholder.as_bytes()) else {
+            return false;
+        };
+        if placeholder_indices.insert(placeholder, index).is_some() {
+            return false;
+        }
+    }
+    let serialized = canonical.as_str();
+    let path_query = &canonical[Position::BeforePath..Position::AfterQuery];
+    let path_query_start = serialized.len() - canonical[Position::BeforePath..].len();
+    let path_query_end = path_query_start + path_query.len();
+    let mut occurrences = vec![(0usize, 0usize); replacements.len()];
+    for (start, window) in serialized.as_bytes().windows(4).enumerate() {
+        if let Some(index) = <[u8; 4]>::try_from(window)
+            .ok()
+            .and_then(|placeholder| placeholder_indices.get(&placeholder))
+        {
+            occurrences[*index].0 = occurrences[*index].0.saturating_add(1);
+            if start >= path_query_start && start + window.len() <= path_query_end {
+                occurrences[*index].1 = occurrences[*index].1.saturating_add(1);
+            }
+        }
+    }
+    replacements
+        .iter()
+        .zip(occurrences)
+        .all(|(replacement, (total, in_path_query))| {
+            if replacement.removed_with_fragment {
+                total == 0
+            } else {
+                total == 1 && in_path_query == 1
+            }
+        })
+}
+
+fn valid_url_scheme(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn authority_range(reference: &str, scheme_colon: Option<usize>) -> Option<(usize, usize)> {
+    let start = if reference.starts_with("//") {
+        2
+    } else {
+        let colon = scheme_colon?;
+        reference
+            .get(colon + 1..)?
+            .starts_with("//")
+            .then_some(colon + 3)?
+    };
+    let end = reference[start..]
+        .bytes()
+        .position(|byte| matches!(byte, b'/' | b'?' | b'#'))
+        .map_or(reference.len(), |offset| start + offset);
+    Some((start, end))
+}
+
+#[cfg(test)]
+thread_local! {
+    static HLS_VARIABLE_RANGE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HLS_SCHEME_PRESCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn hls_variable_ranges(value: &str) -> Vec<(usize, usize)> {
+    #[cfg(test)]
+    HLS_VARIABLE_RANGE_SCANS.with(|scans| scans.set(scans.get() + 1));
+
+    let bytes = value.as_bytes();
+    let mut variables = Vec::new();
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] != b'{' || bytes[index + 1] != b'$' {
+            index += 1;
+            continue;
+        }
+        let name_start = index + 2;
+        let mut end = name_start;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'-'))
+        {
+            end += 1;
+        }
+        if end > name_start && bytes.get(end) == Some(&b'}') {
+            variables.push((index, end + 1));
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    variables
+}
+
+struct HlsPlaceholderGenerator {
+    occupied: HashSet<[u8; 4]>,
+    next: usize,
+}
+
+impl HlsPlaceholderGenerator {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    fn new(reference: &str, base: &str) -> Self {
+        let mut generator = Self {
+            occupied: HashSet::new(),
+            next: 0,
+        };
+        generator.occupy(reference);
+        generator.occupy(base);
+        generator
+    }
+
+    fn occupy(&mut self, value: &str) {
+        for window in value.as_bytes().windows(4) {
+            if window[0].eq_ignore_ascii_case(&b'x') {
+                self.occupied.insert([
+                    window[0].to_ascii_lowercase(),
+                    window[1].to_ascii_lowercase(),
+                    window[2].to_ascii_lowercase(),
+                    window[3].to_ascii_lowercase(),
+                ]);
+            }
+        }
+    }
+
+    fn next(&mut self) -> Option<String> {
+        while self.next < 36usize.pow(3) {
+            let number = self.next;
+            self.next += 1;
+            let candidate = [
+                b'x',
+                Self::DIGITS[(number / (36 * 36)) % 36],
+                Self::DIGITS[(number / 36) % 36],
+                Self::DIGITS[number % 36],
+            ];
+            if self.occupied.insert(candidate) {
+                return std::str::from_utf8(&candidate).ok().map(str::to_owned);
+            }
+        }
+        None
+    }
+}
+
+fn restore_hls_variables(
+    canonical: &str,
+    replacements: &[HlsVariableReplacement],
+) -> Result<String, ProxyError> {
+    let ordinary = replacements
+        .iter()
+        .map(|replacement| (replacement.placeholder.as_str(), replacement.token.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut restored = String::new();
+    restored
+        .try_reserve_exact(canonical.len())
+        .map_err(|_| ProxyError::Upstream)?;
+    let mut index = 0;
+    while index < canonical.len() {
+        let replacement = canonical
+            .get(index..index.saturating_add(4))
+            .and_then(|candidate| ordinary.get(candidate).copied());
+        if let Some(token) = replacement {
+            push_target(&mut restored, token)?;
+            index += 4;
+        } else {
+            let character = canonical[index..]
+                .chars()
+                .next()
+                .ok_or(ProxyError::Upstream)?;
+            let end = index + character.len_utf8();
+            push_target(&mut restored, &canonical[index..end])?;
+            index = end;
+        }
+    }
+    Ok(restored)
+}
+
+fn push_target(output: &mut String, value: &str) -> Result<(), ProxyError> {
+    reserve_bounded(output, value.len(), MAX_TARGET_URL)?;
+    output.push_str(value);
+    Ok(())
+}
+
+fn push_proxy_uri(
+    output: &mut String,
+    resolved: &ResolvedHlsReference,
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+) -> Result<(), ProxyError> {
+    const ROUTE_PREFIX: &str = "/proxy";
+    let (suffix_prefix, target, path) = if let Some(variable_path) = &resolved.variable_path {
+        (
+            "/d=",
+            variable_path.base_target.as_str(),
+            Some(variable_path),
+        )
+    } else {
+        ("/?d=", resolved.target.as_str(), None)
+    };
+    let target_length = percent_encoded_length(target)?;
+    let mut suffix_length = suffix_prefix
+        .len()
+        .checked_add(target_length)
+        .ok_or(ProxyError::Upstream)?;
+    let mut options = Vec::new();
+    if resolved.same_origin {
+        for (kind, headers) in [('h', request_headers), ('r', response_headers)] {
+            for (name, value) in headers {
+                if (kind == 'h' && request_header_forbidden(name))
+                    || (kind == 'r' && response_header_forbidden(name))
+                {
+                    continue;
+                }
+                let value =
+                    std::str::from_utf8(value.as_bytes()).map_err(|_| ProxyError::Upstream)?;
+                let pair_length = name
+                    .as_str()
+                    .len()
+                    .checked_add(value.len())
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or(ProxyError::Upstream)?;
+                if pair_length > MAX_HEADER_PAIR {
+                    return Err(ProxyError::Upstream);
+                }
+                let name_length = percent_encoded_length(name.as_str())?;
+                let value_length = percent_encoded_length(value)?;
+                suffix_length = suffix_length
+                    .checked_add(3)
+                    .and_then(|length| length.checked_add(name_length))
+                    .and_then(|length| length.checked_add(3))
+                    .and_then(|length| length.checked_add(value_length))
+                    .ok_or(ProxyError::Upstream)?;
+                options.push((kind, name.as_str(), value));
+            }
+        }
+        if options.len() > MAX_CUSTOM_OPTIONS {
+            return Err(ProxyError::Upstream);
+        }
+        options.sort_unstable_by(|left, right| {
+            (left.0, left.1, left.2.as_bytes()).cmp(&(right.0, right.1, right.2.as_bytes()))
+        });
+    }
+    if let Some(variable_path) = path {
+        validate_percent_encoding(&variable_path.path).map_err(|_| ProxyError::Upstream)?;
+        if let Some(query) = &variable_path.query {
+            validate_percent_encoding(query).map_err(|_| ProxyError::Upstream)?;
+        }
+        suffix_length = suffix_length
+            .checked_add(RAW_CANONICAL_PATH_OPTION.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(variable_path.path.len()))
+            .and_then(|length| {
+                variable_path.query.as_ref().map_or(Some(length), |query| {
+                    length
+                        .checked_add(1)
+                        .and_then(|length| length.checked_add(query.len()))
+                })
+            })
+            .ok_or(ProxyError::Upstream)?;
+    }
+    if suffix_length > MAX_PROXY_INPUT {
+        return Err(ProxyError::Upstream);
+    }
+    let required = ROUTE_PREFIX
+        .len()
+        .checked_add(suffix_length)
+        .ok_or(ProxyError::Upstream)?;
+    reserve_playlist(output, required)?;
+    output.push_str(ROUTE_PREFIX);
+    output.push_str(suffix_prefix);
+    append_percent_encoded(output, target);
+    for (kind, name, value) in options {
+        output.push('&');
+        output.push(kind);
+        output.push('=');
+        append_percent_encoded(output, name);
+        output.push_str("%3A");
+        append_percent_encoded(output, value);
+    }
+    if let Some(variable_path) = path {
+        output.push_str(RAW_CANONICAL_PATH_OPTION);
+        output.push('/');
+        output.push_str(&variable_path.path);
+        if let Some(query) = &variable_path.query {
+            output.push('?');
+            output.push_str(query);
+        }
+    }
+    Ok(())
+}
+
+fn percent_encoded_length(value: &str) -> Result<usize, ProxyError> {
+    let mut length = 0usize;
+    for byte in value.bytes() {
+        length = length
+            .checked_add(if percent_encoding_safe(byte) { 1 } else { 3 })
+            .ok_or(ProxyError::Upstream)?;
+    }
+    Ok(length)
+}
+
+fn append_percent_encoded(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if percent_encoding_safe(byte) {
+            output.push(char::from(byte));
+        } else {
+            let encoded = [b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]];
+            output.push_str(std::str::from_utf8(&encoded).unwrap());
+        }
+    }
+}
+
+fn percent_encoding_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
+    reserve_bounded(output, value.len(), MAX_PLAYLIST_OUTPUT)?;
+    output.push_str(value);
+    Ok(())
+}
+
+fn reserve_playlist(output: &mut String, additional: usize) -> Result<(), ProxyError> {
+    reserve_bounded(output, additional, MAX_PLAYLIST_OUTPUT)
+}
+
+fn reserve_bounded(
+    output: &mut String,
+    additional: usize,
+    maximum: usize,
+) -> Result<(), ProxyError> {
     let next_length = output
         .len()
-        .checked_add(value.len())
+        .checked_add(additional)
         .ok_or(ProxyError::Upstream)?;
-    if next_length > MAX_PLAYLIST_OUTPUT {
+    if next_length > maximum {
         return Err(ProxyError::Upstream);
     }
-    output.push_str(value);
+    if next_length > output.capacity() {
+        let desired_capacity = output
+            .capacity()
+            .max(1)
+            .saturating_mul(2)
+            .max(next_length)
+            .min(maximum);
+        output
+            .try_reserve_exact(desired_capacity - output.len())
+            .map_err(|_| ProxyError::Upstream)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
+        HLS_SCHEME_PRESCAN_BYTES, HLS_VARIABLE_RANGE_SCANS, MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT,
+        MAX_PLAYLIST_OUTPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
         apply_redirect_origin_policy, buffered_proxy_body, collect_playlist, fetch_with_redirects,
         handle_proxy, handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix,
-        proxy_error_response, rewrite_playlist_bounded, same_origin, streaming_proxy_body,
+        proxy_error_response, resolve_hls_reference, rewrite_playlist_bounded,
+        rewrite_playlist_with_options, same_origin, streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -1200,6 +1806,84 @@ mod tests {
             explicit_empty_query.target.as_str(),
             "https://example.com/?"
         );
+    }
+
+    #[test]
+    fn parse_raw_canonical_path_mode_preserves_escapes_and_rejects_invalid_uses() {
+        let parsed = parse_proxy_request(
+            "d=https%3A%2F%2Fexample.com&x-stream-path=raw//media/a%2Fb%25%41%5C%FF",
+            Some("token=%FF"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.target.as_str(),
+            "https://example.com/media/a%2Fb%25%41%5C%FF?token=%FF"
+        );
+
+        for (rest, query) in [
+            (
+                "d=https%3A%2F%2Fexample.com&x-stream-path=raw&x-stream-path=raw//media",
+                None,
+            ),
+            (
+                "d=https%3A%2F%2Fexample.com&x-stream-path=raw&x-stream-%70ath=raw//media",
+                None,
+            ),
+            (
+                "d=https%3A%2F%2Fexample.com&x-stream-path=legacy//media",
+                None,
+            ),
+            ("d=https%3A%2F%2Fexample.com&x-stream-path=raw", None),
+            ("d=https%3A%2F%2Fexample.com&x-stream-path=raw/", None),
+            (
+                "d=https%3A%2F%2Fexample.com&x-stream-path=raw/",
+                Some("token=value"),
+            ),
+            ("d=https%3A%2F%2Fexample.com&x-stream-path=raw//bad%", None),
+        ] {
+            assert!(
+                matches!(
+                    parse_proxy_request(rest, query),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "rest={rest:?}, query={query:?}"
+            );
+        }
+        assert!(matches!(
+            parse_proxy_request("", Some("d=https%3A%2F%2Fexample.com&x-stream-path=raw")),
+            Err(ProxyError::InvalidRequest)
+        ));
+
+        let unknown = parse_proxy_request(
+            "d=https%3A%2F%2Fexample.com&x-unknown=raw/media%2Fpart",
+            None,
+        )
+        .unwrap();
+        assert_eq!(unknown.target.as_str(), "https://example.com/media/part");
+    }
+
+    #[test]
+    fn legacy_path_query_preserves_malformed_percent_text_but_raw_mode_rejects_it() {
+        for (query, expected) in [
+            ("token=%", "https://example.com/media?token=%"),
+            ("token=%0", "https://example.com/media?token=%0"),
+            ("token=%GG", "https://example.com/media?token=%GG"),
+        ] {
+            let legacy = parse_proxy_request("d=https%3A%2F%2Fexample.com/media", Some(query))
+                .unwrap_or_else(|error| panic!("legacy query {query:?} failed: {error:?}"));
+            assert_eq!(legacy.target.as_str(), expected, "query={query:?}");
+
+            assert!(
+                matches!(
+                    parse_proxy_request(
+                        "d=https%3A%2F%2Fexample.com&x-stream-path=raw//media",
+                        Some(query),
+                    ),
+                    Err(ProxyError::InvalidRequest)
+                ),
+                "raw query {query:?}"
+            );
+        }
     }
 
     #[test]
@@ -2961,6 +3645,851 @@ mod tests {
     }
 
     #[test]
+    fn playlist_rewriter_preserves_non_http_and_malformed_references() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let body = concat!(
+            "#EXTM3U\r\n",
+            "\r\n",
+            "# an unrelated comment\n",
+            "data:text/plain,segment\n",
+            "skd://license.example/key\r\n",
+            "urn:example:asset\n",
+            "http://[invalid\n",
+            "//[invalid\r\n",
+            "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"data:text/plain,key\"\r\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "segment.ts\n",
+        );
+
+        let rewritten = rewrite_playlist_bounded(body, &base).unwrap();
+
+        assert!(rewritten.starts_with(concat!(
+            "#EXTM3U\r\n",
+            "\r\n",
+            "# an unrelated comment\n",
+            "data:text/plain,segment\n",
+            "skd://license.example/key\r\n",
+            "urn:example:asset\n",
+            "http://[invalid\n",
+            "//[invalid\r\n",
+            "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"data:text/plain,key\"\r\n",
+        )));
+        assert_eq!(rewritten.matches("/proxy/?d=").count(), 2);
+        assert!(rewritten.ends_with('\n'));
+    }
+
+    #[test]
+    fn playlist_rewriter_preserves_space_and_tab_only_lines_byte_for_byte() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let body = " \r\n\t\n \t\r\n\t ";
+
+        let rewritten = rewrite_playlist_bounded(body, &base).unwrap();
+
+        assert_eq!(rewritten, body);
+    }
+
+    #[test]
+    fn playlist_rewriter_keeps_valid_variables_visible_in_lines_and_attributes() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let body = concat!(
+            "segments/{$segment}/part.ts?token={$token}\r\n",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"keys/{$key}.bin?sig={$signature}\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"//{$host}/audio.m3u8\"\r\n",
+        );
+
+        let rewritten = rewrite_playlist_bounded(body, &base).unwrap();
+
+        assert_eq!(rewritten.matches("/proxy/d=").count(), 2);
+        for variable in ["{$segment}", "{$token}", "{$key}", "{$signature}"] {
+            assert!(rewritten.contains(variable), "missing {variable:?}");
+        }
+        assert!(
+            rewritten.contains(
+                "&x-stream-path=raw//path/segments/{$segment}/part.ts?token={$token}\r\n"
+            )
+        );
+        assert!(
+            rewritten.contains("&x-stream-path=raw//path/keys/{$key}.bin?sig={$signature}\"\n")
+        );
+        assert!(rewritten.ends_with("//{$host}/audio.m3u8\"\r\n"));
+    }
+
+    #[test]
+    fn playlist_children_inherit_options_only_for_the_same_complete_origin() {
+        let base = Url::parse("https://MEDIA.example:443/path/master.m3u8").unwrap();
+        let request_headers = HeaderMap::from_iter([
+            ("x-z-last".parse().unwrap(), "z".parse().unwrap()),
+            ("x-a-first".parse().unwrap(), "a".parse().unwrap()),
+        ]);
+        let response_headers = HeaderMap::from_iter([(
+            header::CONTENT_TYPE,
+            "application/vnd.apple.mpegurl".parse().unwrap(),
+        )]);
+        let body = concat!(
+            "relative.ts\n",
+            "/root.ts\n",
+            "//media.example:443/protocol.ts\n",
+            "https://media.example/absolute.ts\n",
+            "http://media.example:443/different-scheme.ts\n",
+            "//other.example/cross-protocol.ts\n",
+            "https://other.example/cross-absolute.ts\n",
+        );
+
+        let rewritten =
+            rewrite_playlist_with_options(body, &base, &request_headers, &response_headers)
+                .unwrap();
+        let links = rewritten.lines().collect::<Vec<_>>();
+        assert_eq!(links.len(), 7);
+        for (index, link) in links.iter().enumerate() {
+            let parsed = parse_proxy_suffix(link.strip_prefix("/proxy").unwrap()).unwrap();
+            if index < 4 {
+                assert_eq!(parsed.request_headers["x-a-first"], "a", "{link}");
+                assert_eq!(parsed.request_headers["x-z-last"], "z", "{link}");
+                assert_eq!(
+                    parsed.response_headers[header::CONTENT_TYPE],
+                    "application/vnd.apple.mpegurl",
+                    "{link}"
+                );
+                assert!(
+                    link.contains("&h=x-a-first%3Aa&h=x-z-last%3Az&r=content-type%3Aapplication%2Fvnd.apple.mpegurl"),
+                    "non-deterministic options: {link}"
+                );
+            } else {
+                assert!(parsed.request_headers.is_empty(), "{link}");
+                assert!(parsed.response_headers.is_empty(), "{link}");
+            }
+        }
+    }
+
+    #[test]
+    fn playlist_variables_keep_path_options_but_make_origin_variables_indeterminate() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let request_headers =
+            HeaderMap::from_iter([("x-token".parse().unwrap(), "secret".parse().unwrap())]);
+        let response_headers = HeaderMap::from_iter([(
+            header::CONTENT_TYPE,
+            "application/vnd.apple.mpegurl".parse().unwrap(),
+        )]);
+        let body = concat!(
+            "segments/{$segment}.ts?token={$token}\n",
+            "#EXT-X-KEY:URI=\"keys/{$key}.bin?sig={$signature}\"\n",
+            "//{$host}/audio.m3u8\n",
+            "{$scheme}://media.example/video.m3u8\n",
+            "https://{$user}@media.example/private.m3u8\n",
+            "https://media.example:{$port}/video.m3u8\n",
+        );
+
+        let rewritten =
+            rewrite_playlist_with_options(body, &base, &request_headers, &response_headers)
+                .unwrap();
+        for unchanged in [
+            "//{$host}/audio.m3u8",
+            "{$scheme}://media.example/video.m3u8",
+            "https://{$user}@media.example/private.m3u8",
+            "https://media.example:{$port}/video.m3u8",
+        ] {
+            assert!(
+                rewritten.contains(unchanged),
+                "rewritten playlist: {rewritten:?}"
+            );
+        }
+        assert_eq!(rewritten.matches("/proxy/d=").count(), 2);
+        assert!(!rewritten.contains("/proxy/?d="));
+        assert!(rewritten.contains(
+            "&h=x-token%3Asecret&r=content-type%3Aapplication%2Fvnd.apple.mpegurl&x-stream-path=raw//path/segments/{$segment}.ts?token={$token}"
+        ));
+
+        let substituted = rewritten
+            .replace("{$segment}", "one")
+            .replace("{$token}", "two")
+            .replace("{$key}", "three")
+            .replace("{$signature}", "four");
+        let links = substituted
+            .split(['\n', '"'])
+            .filter(|part| part.starts_with("/proxy"))
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2, "rewritten playlist: {rewritten:?}");
+        for link in links {
+            let uri = link.parse::<Uri>().unwrap();
+            let raw = uri.path_and_query().unwrap().as_str();
+            let parsed = parse_proxy_suffix(raw.strip_prefix("/proxy").unwrap()).unwrap();
+            assert_eq!(parsed.request_headers["x-token"], "secret", "{link}");
+            assert_eq!(
+                parsed.response_headers[header::CONTENT_TYPE],
+                "application/vnd.apple.mpegurl",
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_url_authority_variables_remain_unchanged_after_canonicalization() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        for reference in [
+            "https:///{$host}/video.m3u8",
+            "HTTPS:////{$host}/video.m3u8",
+            r"https:\\{$host}\video.m3u8",
+            r"https:/\{$host}/video.m3u8",
+            "https:///{$user}@media.example/private.m3u8",
+            "https:///user:{$password}@media.example/private.m3u8",
+            "https:///media.example:{$port}/video.m3u8",
+        ] {
+            let rewritten = rewrite_playlist_bounded(reference, &base)
+                .unwrap_or_else(|error| panic!("reference {reference:?} failed: {error:?}"));
+            assert_eq!(rewritten, reference, "reference={reference:?}");
+        }
+    }
+
+    #[test]
+    fn variable_placeholders_do_not_collide_with_canonicalized_literals() {
+        let base = Url::parse("https://media.example/master.m3u8").unwrap();
+        for reference in [
+            "https://X000.example/{$part}.ts",
+            "https://%78%30%30%30.example/{$part}.ts",
+        ] {
+            let resolved = resolve_hls_reference(reference, &base).unwrap().unwrap();
+
+            assert_eq!(
+                Url::parse(&resolved.target).unwrap().host_str(),
+                Some("x000.example"),
+                "{reference}"
+            );
+            assert_eq!(resolved.target.matches("{$part}").count(), 1, "{reference}");
+        }
+    }
+
+    #[test]
+    fn overlapping_variable_placeholder_collision_retries_before_restoration() {
+        let base = Url::parse("https://media.example/master.m3u8").unwrap();
+        let mut reference = String::from("segments/");
+        for index in 0..33 {
+            reference.push_str("{$v");
+            reference.push_str(&index.to_string());
+            reference.push_str("}/");
+        }
+        reference.push_str("x00{$target}.ts");
+
+        let resolved = resolve_hls_reference(&reference, &base).unwrap().unwrap();
+
+        assert!(
+            resolved.target.ends_with("/x00{$target}.ts"),
+            "restored target: {:?}",
+            resolved.target
+        );
+        for index in 0..33 {
+            assert_eq!(
+                resolved.target.matches(&format!("{{$v{index}}}")).count(),
+                1,
+                "restored target: {:?}",
+                resolved.target
+            );
+        }
+    }
+
+    #[test]
+    fn variable_substitutions_cannot_escape_path_form_or_change_proxy_options() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let request_headers =
+            HeaderMap::from_iter([("x-token".parse().unwrap(), "secret".parse().unwrap())]);
+        let rewritten = rewrite_playlist_with_options(
+            "segments/{$path}.ts?token={$query}",
+            &base,
+            &request_headers,
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        assert!(rewritten.starts_with("/proxy/d="), "{rewritten}");
+
+        let parse_substitution = |path: &str, query: &str| {
+            let link = rewritten
+                .replace("{$path}", path)
+                .replace("{$query}", query);
+            let uri = link
+                .parse::<Uri>()
+                .map_err(|_| ProxyError::InvalidRequest)?;
+            let raw = uri
+                .path_and_query()
+                .ok_or(ProxyError::InvalidRequest)?
+                .as_str();
+            let suffix = raw
+                .strip_prefix("/proxy")
+                .ok_or(ProxyError::InvalidRequest)?;
+            parse_proxy_suffix(suffix)
+        };
+
+        let benign = parse_substitution("part", "value").unwrap();
+        assert_eq!(
+            benign.target.as_str(),
+            "https://media.example/path/segments/part.ts?token=value"
+        );
+        assert_eq!(benign.request_headers, request_headers);
+        assert!(benign.response_headers.is_empty());
+
+        for encoded in ["%2F", "%25", "%41", "%5C", "%FF"] {
+            for (path, query) in [
+                (format!("one{encoded}two"), "value".to_owned()),
+                ("one".to_owned(), format!("value{encoded}tail")),
+            ] {
+                let parsed = parse_substitution(&path, &query).unwrap_or_else(|error| {
+                    panic!("valid substitution {path:?}, {query:?} failed: {error:?}")
+                });
+                let direct = base
+                    .join(&format!("segments/{path}.ts?token={query}"))
+                    .unwrap();
+                assert_eq!(
+                    parsed.target, direct,
+                    "path={path:?}, query={query:?}, link={rewritten:?}"
+                );
+                assert_eq!(parsed.request_headers, request_headers);
+                assert!(parsed.response_headers.is_empty());
+            }
+        }
+        assert!(rewritten.contains("&x-stream-path=raw//path/segments/{$path}.ts"));
+
+        for (path, query) in [
+            ("one&h=x-added%3Aattacker", "value"),
+            ("one&r=content-type%3Atext%2Fplain", "value"),
+            ("one&d=https%3A%2F%2Fattacker.example%2F", "value"),
+            ("one&ignored=1", "value"),
+            ("one?nested=1", "value"),
+            ("one#fragment", "value"),
+            ("one%2Ftwo", "value"),
+            ("one", "value&h=x-added%3Aattacker"),
+            ("one", "value&r=content-type%3Atext%2Fplain"),
+            ("one", "value&d=https%3A%2F%2Fattacker.example%2F"),
+            ("one", "value&ignored=1"),
+            ("one", "value?nested=1"),
+            ("one", "value#fragment"),
+            ("one", "value%2Ftail"),
+        ] {
+            let parsed = parse_substitution(path, query).unwrap_or_else(|error| {
+                panic!("valid substitution {path:?}, {query:?} failed: {error:?}")
+            });
+            assert_eq!(
+                parsed.request_headers, request_headers,
+                "path={path:?}, query={query:?}"
+            );
+            assert!(
+                parsed.response_headers.is_empty(),
+                "path={path:?}, query={query:?}"
+            );
+        }
+
+        for malformed in ["one%", "one%0", "one%GG"] {
+            assert!(
+                parse_substitution(malformed, "value").is_err(),
+                "path={malformed:?}"
+            );
+            assert!(
+                parse_substitution("one", malformed).is_err(),
+                "query={malformed:?}"
+            );
+        }
+
+        let double_slash = rewrite_playlist_with_options(
+            "https://media.example//segments/{$path}.ts",
+            &base,
+            &request_headers,
+            &HeaderMap::new(),
+        )
+        .unwrap()
+        .replace("{$path}", "part");
+        let uri = double_slash.parse::<Uri>().unwrap();
+        let raw = uri.path_and_query().unwrap().as_str();
+        let parsed = parse_proxy_suffix(raw.strip_prefix("/proxy").unwrap()).unwrap();
+        assert_eq!(
+            parsed.target.as_str(),
+            "https://media.example//segments/part.ts"
+        );
+        assert_eq!(parsed.request_headers, request_headers);
+    }
+
+    #[test]
+    fn malformed_percent_variable_references_remain_unchanged_before_emission() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        for reference in [
+            "segments/{$part}%.ts",
+            "segments/{$part}%0.ts",
+            "segments/{$part}%GG.ts",
+            "segments/{$part}.ts?token={$query}%",
+            "segments/{$part}.ts?token={$query}%0",
+            "segments/{$part}.ts?token={$query}%GG",
+        ] {
+            let rewritten = rewrite_playlist_bounded(reference, &base)
+                .unwrap_or_else(|error| panic!("plain reference {reference:?}: {error:?}"));
+            assert_eq!(rewritten, reference, "plain reference={reference:?}");
+
+            let tag = format!("#EXT-X-MAP:URI=\"{reference}\"");
+            let rewritten = rewrite_playlist_bounded(&tag, &base)
+                .unwrap_or_else(|error| panic!("quoted reference {reference:?}: {error:?}"));
+            assert_eq!(rewritten, tag, "quoted reference={reference:?}");
+        }
+    }
+
+    #[test]
+    fn overlong_variable_candidate_is_rejected_before_variable_collection() {
+        let base = Url::parse("https://media.example/master.m3u8").unwrap();
+        let reference = "{$v}".repeat((MAX_PLAYLIST_INPUT - 1) / 4);
+        assert!(reference.len() > MAX_TARGET_URL);
+        assert!(reference.len() < MAX_PLAYLIST_INPUT);
+        HLS_VARIABLE_RANGE_SCANS.with(|scans| scans.set(0));
+
+        assert!(matches!(
+            resolve_hls_reference(&reference, &base),
+            Err(ProxyError::Upstream)
+        ));
+        HLS_VARIABLE_RANGE_SCANS.with(|scans| assert_eq!(scans.get(), 0));
+    }
+
+    #[test]
+    fn overlong_delimiter_free_candidate_bounds_initial_scheme_prescan() {
+        let base = Url::parse("https://media.example/master.m3u8").unwrap();
+        let reference = "a".repeat(MAX_PLAYLIST_INPUT - 1);
+        HLS_SCHEME_PRESCAN_BYTES.with(|scans| scans.set(0));
+
+        assert!(matches!(
+            resolve_hls_reference(&reference, &base),
+            Err(ProxyError::Upstream)
+        ));
+        HLS_SCHEME_PRESCAN_BYTES.with(|scans| {
+            assert_eq!(scans.get(), MAX_TARGET_URL + 1);
+        });
+
+        for reference in [
+            "data:text/plain,segment",
+            "skd://license.example/key",
+            "urn:example:asset",
+        ] {
+            assert!(resolve_hls_reference(reference, &base).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn dense_path_variables_restore_without_placeholder_ambiguity() {
+        let base = Url::parse("https://media.example/master.m3u8").unwrap();
+        let reference = format!("/{}tail.ts", "{$v}/".repeat(2_000));
+        assert!(reference.len() < MAX_TARGET_URL);
+
+        let resolved = resolve_hls_reference(&reference, &base).unwrap().unwrap();
+
+        assert_eq!(resolved.target.matches("{$v}").count(), 2_000);
+        assert!(resolved.target.ends_with("/tail.ts"));
+    }
+
+    #[test]
+    fn emitted_hls_links_round_trip_reserved_target_and_header_semantics() {
+        let base = Url::parse("https://user:pass@media.example/dir/master.m3u8").unwrap();
+        let request_headers = HeaderMap::from_iter([(
+            "x-token".parse().unwrap(),
+            "raw+plus&equals=value".parse().unwrap(),
+        )]);
+        let response_headers = HeaderMap::from_iter([(
+            header::CONTENT_TYPE,
+            "video/mp2t; note=raw+plus&equals=value".parse().unwrap(),
+        )]);
+        let body = concat!(
+            "child%2Fname+raw.ts?one=a+b&two=c%2Bd&equal=x=y#removed\n",
+            "#EXT-X-MAP:URI=\"/root%2Finit.mp4?x=a+b&y=%2B&z==#removed\"\n",
+        );
+
+        let rewritten =
+            rewrite_playlist_with_options(body, &base, &request_headers, &response_headers)
+                .unwrap();
+        assert!(!rewritten.contains("removed"));
+        let links = rewritten
+            .split(['\n', '"'])
+            .filter(|part| part.starts_with("/proxy"))
+            .collect::<Vec<_>>();
+        let expected_targets = [
+            "https://user:pass@media.example/dir/child%2Fname+raw.ts?one=a+b&two=c%2Bd&equal=x=y",
+            "https://user:pass@media.example/root%2Finit.mp4?x=a+b&y=%2B&z==",
+        ];
+        for (link, expected_target) in links.iter().zip(expected_targets) {
+            let parsed = parse_proxy_suffix(link.strip_prefix("/proxy").unwrap()).unwrap();
+            assert_eq!(parsed.target.as_str(), expected_target);
+            assert_eq!(parsed.request_headers["x-token"], "raw+plus&equals=value");
+            assert_eq!(
+                parsed.response_headers[header::CONTENT_TYPE],
+                "video/mp2t; note=raw+plus&equals=value"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_utf8_obs_text_headers_round_trip_through_playlist_rewriting() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let original = parse_proxy_request(
+            "",
+            Some(concat!(
+                "d=https%3A%2F%2Fmedia.example%2Fpath%2Fmaster.m3u8",
+                "&h=X-Utf8%3Acaf%C3%A9-%C2%80",
+                "&r=Content-Type%3Aapplication%2Fx.test%3Bnote%3Dcaf%C3%A9-%C2%80",
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            original.request_headers["x-utf8"].as_bytes(),
+            b"caf\xc3\xa9-\xc2\x80"
+        );
+        assert_eq!(
+            original.response_headers[header::CONTENT_TYPE].as_bytes(),
+            b"application/x.test;note=caf\xc3\xa9-\xc2\x80"
+        );
+
+        let rewritten = rewrite_playlist_with_options(
+            "segment.ts",
+            &base,
+            &original.request_headers,
+            &original.response_headers,
+        )
+        .unwrap();
+        let reparsed = parse_proxy_suffix(rewritten.strip_prefix("/proxy").unwrap()).unwrap();
+
+        assert_eq!(
+            reparsed.request_headers["x-utf8"].as_bytes(),
+            original.request_headers["x-utf8"].as_bytes()
+        );
+        assert_eq!(
+            reparsed.response_headers[header::CONTENT_TYPE].as_bytes(),
+            original.response_headers[header::CONTENT_TYPE].as_bytes()
+        );
+    }
+
+    #[test]
+    fn playlist_child_canonical_target_accepts_exact_limit_and_rejects_overflow() {
+        let base = Url::parse("https://base.example/master.m3u8").unwrap();
+        let prefix = "https://example.com/";
+        let exact = format!("{prefix}{}", "a".repeat(MAX_TARGET_URL - prefix.len()));
+        assert_eq!(exact.len(), MAX_TARGET_URL);
+        let rewritten = rewrite_playlist_bounded(&exact, &base).unwrap();
+        let parsed = parse_proxy_suffix(rewritten.strip_prefix("/proxy").unwrap()).unwrap();
+        assert_eq!(parsed.target.as_str().len(), MAX_TARGET_URL);
+
+        let over = format!("{exact}a");
+        assert!(matches!(
+            rewrite_playlist_bounded(&over, &base),
+            Err(ProxyError::Upstream)
+        ));
+    }
+
+    #[test]
+    fn emitted_proxy_suffix_accepts_exact_limit_and_rejects_overflow() {
+        const FIXED_SUFFIX_LENGTH: usize = 123;
+        const FULL_VALUE_LENGTH: usize = MAX_HEADER_PAIR - "x-0:".len();
+        let last_value_length = MAX_PROXY_INPUT - FIXED_SUFFIX_LENGTH - (7 * FULL_VALUE_LENGTH);
+        assert_eq!(last_value_length, 8_097);
+        let headers = |extra: usize| {
+            let mut headers = HeaderMap::new();
+            for index in 0..8 {
+                let length = if index == 7 {
+                    last_value_length + extra
+                } else {
+                    FULL_VALUE_LENGTH
+                };
+                headers.insert(
+                    format!("x-{index}")
+                        .parse::<axum::http::HeaderName>()
+                        .unwrap(),
+                    "a".repeat(length).parse::<HeaderValue>().unwrap(),
+                );
+            }
+            headers
+        };
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+
+        let exact =
+            rewrite_playlist_with_options("segment.ts", &base, &headers(0), &HeaderMap::new())
+                .unwrap();
+        let suffix = exact.strip_prefix("/proxy").unwrap();
+        assert_eq!(suffix.len(), MAX_PROXY_INPUT);
+        assert!(parse_proxy_suffix(suffix).is_ok());
+
+        assert!(matches!(
+            rewrite_playlist_with_options("segment.ts", &base, &headers(1), &HeaderMap::new(),),
+            Err(ProxyError::Upstream)
+        ));
+    }
+
+    #[test]
+    fn emitted_raw_path_mode_counts_exact_option_and_suffix_bytes() {
+        const FIXED_SUFFIX_LENGTH: usize = 134;
+        const FULL_VALUE_LENGTH: usize = MAX_HEADER_PAIR - "x-0:".len();
+        const LAST_VALUE_LENGTH: usize =
+            MAX_PROXY_INPUT - FIXED_SUFFIX_LENGTH - (7 * FULL_VALUE_LENGTH);
+        assert_eq!(LAST_VALUE_LENGTH, 8_086);
+        let headers = |extra: usize| {
+            let mut headers = HeaderMap::new();
+            for index in 0..8 {
+                let length = if index == 7 {
+                    LAST_VALUE_LENGTH + extra
+                } else {
+                    FULL_VALUE_LENGTH
+                };
+                headers.insert(
+                    format!("x-{index}")
+                        .parse::<axum::http::HeaderName>()
+                        .unwrap(),
+                    "a".repeat(length).parse::<HeaderValue>().unwrap(),
+                );
+            }
+            headers
+        };
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+
+        let exact =
+            rewrite_playlist_with_options("{$v}", &base, &headers(0), &HeaderMap::new()).unwrap();
+        let suffix = exact.strip_prefix("/proxy").unwrap();
+        assert!(suffix.contains("&x-stream-path=raw//path/{$v}"));
+        assert_eq!(suffix.len(), MAX_PROXY_INPUT);
+        assert!(parse_proxy_suffix(suffix).is_ok());
+
+        assert!(matches!(
+            rewrite_playlist_with_options("{$v}", &base, &headers(1), &HeaderMap::new(),),
+            Err(ProxyError::Upstream)
+        ));
+    }
+
+    #[test]
+    fn rewritten_playlist_accepts_exact_output_limit_and_rejects_one_more_byte() {
+        const REWRITTEN_LINE_LENGTH: usize = 35;
+        let base = Url::parse("https://a.test/master.m3u8").unwrap();
+        let repeats = MAX_PLAYLIST_OUTPUT / REWRITTEN_LINE_LENGTH;
+        let remainder = MAX_PLAYLIST_OUTPUT % REWRITTEN_LINE_LENGTH;
+        assert_eq!(remainder, 1);
+        let mut exact = "x\n".repeat(repeats);
+        exact.push('#');
+        assert!(exact.len() <= MAX_PLAYLIST_INPUT);
+
+        let rewritten = rewrite_playlist_bounded(&exact, &base).unwrap();
+        assert_eq!(rewritten.len(), MAX_PLAYLIST_OUTPUT);
+
+        exact.push('a');
+        assert!(matches!(
+            rewrite_playlist_bounded(&exact, &base),
+            Err(ProxyError::Upstream)
+        ));
+    }
+
+    #[tokio::test]
+    async fn overlong_valid_http_playlist_child_returns_bad_gateway() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let prefix = format!("http://child.test:{}/", address.port());
+        let child = format!("{prefix}{}", "a".repeat(MAX_TARGET_URL + 1 - prefix.len()));
+        let router = Router::new().route(
+            "/master.m3u8",
+            get(move || {
+                let child = child.clone();
+                async move {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                        .body(Body::from(child))
+                        .unwrap()
+                }
+            }),
+        );
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://origin.test:{}/master.m3u8", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "Proxy upstream request failed"
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn emitted_hls_links_scope_options_by_final_child_origin_in_real_handlers() {
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cross_uri = format!("http://other.test:{}/cross.ts", address.port());
+        let router = Router::new().fallback(any(move |uri: Uri, headers: HeaderMap| {
+            let seen_tx = seen_tx.clone();
+            let cross_uri = cross_uri.clone();
+            async move {
+                match uri.path() {
+                    "/master.m3u8" => Response::builder()
+                        .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                        .body(Body::from(format!("#EXTM3U\nsame.ts\n{cross_uri}\n")))
+                        .unwrap(),
+                    "/same.ts" | "/cross.ts" => {
+                        seen_tx.send((uri.path().to_owned(), headers)).unwrap();
+                        Response::new(Body::from("media"))
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }));
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://media.test:{}/master.m3u8", address.port());
+        let uri: Uri = format!(
+            concat!(
+                "/proxy/?d={}",
+                "&h=X-Api-Key%3Asame-secret",
+                "&r=Content-Type%3Aapplication%2Fvnd.apple.mpegurl"
+            ),
+            urlencoding::encode(&target)
+        )
+        .parse()
+        .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let links = body
+            .lines()
+            .filter(|line| line.starts_with("/proxy"))
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2, "rewritten playlist: {body:?}");
+
+        let same = parse_proxy_suffix(links[0].strip_prefix("/proxy").unwrap()).unwrap();
+        assert_eq!(same.target.host_str(), Some("media.test"));
+        assert_eq!(same.request_headers["x-api-key"], "same-secret");
+        assert_eq!(
+            same.response_headers[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        let cross = parse_proxy_suffix(links[1].strip_prefix("/proxy").unwrap()).unwrap();
+        assert_eq!(cross.target.host_str(), Some("other.test"));
+        assert!(cross.request_headers.is_empty());
+        assert!(cross.response_headers.is_empty());
+
+        for link in links {
+            let child = handle_proxy(
+                &runtime,
+                link.parse().unwrap(),
+                HeaderMap::new(),
+                Method::GET,
+            )
+            .await;
+            assert_eq!(child.status(), StatusCode::OK);
+        }
+        let (same_path, same_headers) = seen_rx.recv().await.unwrap();
+        assert_eq!(same_path, "/same.ts");
+        assert_eq!(same_headers["x-api-key"], "same-secret");
+        let (cross_path, cross_headers) = seen_rx.recv().await.unwrap();
+        assert_eq!(cross_path, "/cross.ts");
+        assert!(!cross_headers.contains_key("x-api-key"));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn redirected_playlist_children_use_cleared_h_and_retained_r() {
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect_location = format!("http://origin-b.test:{}/final.m3u8", address.port());
+        let router = Router::new().fallback(any(move |uri: Uri, headers: HeaderMap| {
+            let seen_tx = seen_tx.clone();
+            let redirect_location = redirect_location.clone();
+            async move {
+                match uri.path() {
+                    "/redirect.m3u8" => (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, redirect_location)],
+                    )
+                        .into_response(),
+                    "/final.m3u8" => {
+                        seen_tx.send((uri.path().to_owned(), headers)).unwrap();
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                            .body(Body::from("#EXTM3U\nredirect-child.ts\n"))
+                            .unwrap()
+                    }
+                    "/redirect-child.ts" => {
+                        seen_tx.send((uri.path().to_owned(), headers)).unwrap();
+                        Response::new(Body::from("media"))
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }));
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://origin-a.test:{}/redirect.m3u8", address.port());
+        let uri: Uri = format!(
+            concat!(
+                "/proxy/?d={}",
+                "&h=X-Api-Key%3Aredirect-secret",
+                "&r=Content-Type%3Aapplication%2Fvnd.apple.mpegurl"
+            ),
+            urlencoding::encode(&target)
+        )
+        .parse()
+        .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let link = body
+            .lines()
+            .find(|line| line.starts_with("/proxy"))
+            .unwrap();
+        let parsed = parse_proxy_suffix(link.strip_prefix("/proxy").unwrap()).unwrap();
+        assert_eq!(parsed.target.host_str(), Some("origin-b.test"));
+        assert!(parsed.request_headers.is_empty());
+        assert_eq!(
+            parsed.response_headers[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+
+        let child = handle_proxy(
+            &runtime,
+            link.parse().unwrap(),
+            HeaderMap::new(),
+            Method::GET,
+        )
+        .await;
+        assert_eq!(child.status(), StatusCode::OK);
+        for expected_path in ["/final.m3u8", "/redirect-child.ts"] {
+            let (path, headers) = seen_rx.recv().await.unwrap();
+            assert_eq!(path, expected_path);
+            assert!(!headers.contains_key("x-api-key"));
+        }
+        fixture.abort();
+    }
+
+    #[test]
     fn playlist_rewriter_handles_plain_and_every_quoted_uri() {
         let base = url::Url::parse("https://media.example/path/master.m3u8").unwrap();
         let body = concat!(
@@ -2973,6 +4502,35 @@ mod tests {
         assert_eq!(rewritten.matches("/proxy/?d=").count(), 3);
         assert!(rewritten.contains("https%3A%2F%2Fmedia.example%2Fpath%2Faudio.m3u8"));
         assert!(rewritten.contains("https%3A%2F%2Fmedia.example%2Fpath%2Fsegment.ts%3Ftoken%3D1"));
+        assert!(rewritten.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn playlist_rewriter_only_rewrites_exact_ext_uri_attributes() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let preserved_prefix = concat!(
+            "# an unrelated URI=\"comment.ts\"\r\n",
+            "#COMMENT:URI=\"comment-tag.ts\"\n",
+            "#EXT-X-TEST:NOTURI=\"not.ts\",X-URI=\"x.ts\"\r\n",
+        );
+        let body = format!(
+            concat!(
+                "{}",
+                "#EXT-X-TEST:NOTURI=\"not.ts\", X-URI=\"x.ts\",\tURI=\"actual.ts\", FOO=1, URI=\"backup.ts\"\n",
+                "#EXT-X-MAP: \tURI=\"leading.ts\"\r\n",
+            ),
+            preserved_prefix,
+        );
+
+        let rewritten = rewrite_playlist_bounded(&body, &base).unwrap();
+
+        assert!(
+            rewritten.starts_with(preserved_prefix),
+            "rewritten playlist: {rewritten:?}"
+        );
+        assert!(rewritten.contains("NOTURI=\"not.ts\", X-URI=\"x.ts\",\tURI=\"/proxy/?d="));
+        assert_eq!(rewritten.matches("/proxy/?d=").count(), 3);
+        assert_eq!(rewritten.matches("\r\n").count(), 3);
         assert!(rewritten.ends_with("\r\n"));
     }
 
