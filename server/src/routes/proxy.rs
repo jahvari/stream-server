@@ -52,6 +52,13 @@ struct ParsedProxyRequest {
     response_headers: HeaderMap,
 }
 
+struct FetchedProxyResponse {
+    response: reqwest::Response,
+    final_url: Url,
+    effective_custom_request_headers: HeaderMap,
+    effective_response_headers: HeaderMap,
+}
+
 #[cfg(test)]
 fn parse_proxy_request(
     rest: &str,
@@ -266,7 +273,7 @@ async fn fetch_with_redirects(
     request: &ParsedProxyRequest,
     method: Method,
     incoming: &HeaderMap,
-) -> Result<(reqwest::Response, Url), ProxyError> {
+) -> Result<FetchedProxyResponse, ProxyError> {
     const REDIRECT_STATUSES: &[StatusCode] = &[
         StatusCode::MOVED_PERMANENTLY,
         StatusCode::FOUND,
@@ -284,6 +291,12 @@ async fn fetch_with_redirects(
 
     let mut target = request.target.clone();
     let mut custom_headers = request.request_headers.clone();
+    let mut automatic_headers = HeaderMap::new();
+    for name in AUTOMATIC_REQUEST_HEADERS {
+        if let Some(value) = incoming.get(name) {
+            automatic_headers.insert(name.clone(), value.clone());
+        }
+    }
     let mut redirects = 0usize;
     loop {
         let destination = runtime.validate(context, &target).await?;
@@ -298,12 +311,7 @@ async fn fetch_with_redirects(
             builder = builder.resolve_to_addrs(domain, &destination.addrs);
         }
         let client = builder.build().map_err(|_| ProxyError::Upstream)?;
-        let mut headers = HeaderMap::new();
-        for name in AUTOMATIC_REQUEST_HEADERS {
-            if let Some(value) = incoming.get(name) {
-                headers.insert(name.clone(), value.clone());
-            }
-        }
+        let mut headers = automatic_headers.clone();
         for (name, value) in &custom_headers {
             headers.insert(name.clone(), value.clone());
         }
@@ -326,7 +334,12 @@ async fn fetch_with_redirects(
         }
 
         if !REDIRECT_STATUSES.contains(&response.status()) {
-            return Ok((response, destination.url));
+            return Ok(FetchedProxyResponse {
+                response,
+                final_url: destination.url,
+                effective_custom_request_headers: custom_headers,
+                effective_response_headers: request.response_headers.clone(),
+            });
         }
         if redirects >= 5 {
             return Err(ProxyError::Upstream);
@@ -351,16 +364,31 @@ async fn fetch_with_redirects(
         if next.as_str().len() > MAX_TARGET_URL {
             return Err(ProxyError::Upstream);
         }
-        if !same_authority(&destination.url, &next) {
-            let _ = next.set_username("");
-            let _ = next.set_password(None);
-            custom_headers.clear();
-        }
+        apply_redirect_origin_policy(
+            &destination.url,
+            &mut next,
+            &mut automatic_headers,
+            &mut custom_headers,
+        );
         target = next;
     }
 }
 
-fn same_authority(left: &Url, right: &Url) -> bool {
+fn apply_redirect_origin_policy(
+    current: &Url,
+    next: &mut Url,
+    automatic_headers: &mut HeaderMap,
+    custom_headers: &mut HeaderMap,
+) {
+    if !same_origin(current, next) {
+        let _ = next.set_username("");
+        let _ = next.set_password(None);
+        custom_headers.clear();
+        automatic_headers.remove(header::IF_RANGE);
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
     left.scheme() == right.scheme()
         && left.host() == right.host()
         && left.port_or_known_default() == right.port_or_known_default()
@@ -417,31 +445,36 @@ async fn handle_proxy_suffix(
         Ok(request) => request,
         Err(error) => return proxy_error_response(error),
     };
-    let (upstream, final_url) =
-        match fetch_with_redirects(runtime, &context, &request, method, &headers).await {
-            Ok(response) => response,
-            Err(error) => return proxy_error_response(error),
-        };
+    let credential_bearing = !request.target.username().is_empty()
+        || request.target.password().is_some()
+        || !request.request_headers.is_empty();
+    let request_method = method.clone();
+    let fetched = match fetch_with_redirects(runtime, &context, &request, method, &headers).await {
+        Ok(response) => response,
+        Err(error) => return proxy_error_response(error),
+    };
+    let FetchedProxyResponse {
+        response: upstream,
+        final_url,
+        effective_custom_request_headers: _effective_custom_request_headers,
+        effective_response_headers,
+    } = fetched;
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
-    let content_type = upstream_headers
+    let content_type_playlist = effective_response_headers
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+        .or_else(|| upstream_headers.get(header::CONTENT_TYPE))
+        .is_some_and(content_type_is_playlist);
     let playlist = final_url.path().ends_with(".m3u8")
         || final_url.path().ends_with(".m3u")
-        || content_type.to_ascii_lowercase().contains("mpegurl");
+        || content_type_playlist;
+    let transform = playlist
+        && request_method != Method::HEAD
+        && status == StatusCode::OK
+        && !cache_control_forbids_transform(&upstream_headers);
 
-    if playlist && status != StatusCode::PARTIAL_CONTENT {
-        if upstream_headers
-            .get(header::CONTENT_ENCODING)
-            .is_some_and(|value| {
-                value
-                    .to_str()
-                    .map(|value| !value.eq_ignore_ascii_case("identity"))
-                    .unwrap_or(true)
-            })
-        {
+    if transform {
+        if !content_encoding_is_identity_only(&upstream_headers) {
             return proxy_error_response(ProxyError::Upstream);
         }
         let body = match collect_playlist(upstream, &context).await {
@@ -463,9 +496,10 @@ async fn handle_proxy_suffix(
         return build_proxy_response(
             status,
             &upstream_headers,
-            &request.response_headers,
+            &effective_response_headers,
             buffered_proxy_body(Bytes::from(body), cancellation, capacity),
             true,
+            credential_bearing,
         );
     }
 
@@ -478,10 +512,190 @@ async fn handle_proxy_suffix(
     build_proxy_response(
         status,
         &upstream_headers,
-        &request.response_headers,
+        &effective_response_headers,
         body,
         false,
+        credential_bearing,
     )
+}
+
+fn content_type_is_playlist(value: &HeaderValue) -> bool {
+    let media_type = trim_ascii_ows(
+        value
+            .as_bytes()
+            .split(|byte| *byte == b';')
+            .next()
+            .unwrap_or_default(),
+    );
+    let mut parts = media_type.split(|byte| *byte == b'/');
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    let Some(subtype) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some()
+        || kind.is_empty()
+        || subtype.is_empty()
+        || !kind.iter().chain(subtype).all(|byte| is_http_token(*byte))
+    {
+        return false;
+    }
+    subtype
+        .windows(b"mpegurl".len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(b"mpegurl"))
+}
+
+fn cache_control_forbids_transform(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .any(|value| cache_control_has_no_transform(value.as_bytes()).unwrap_or(true))
+}
+
+fn cache_control_has_no_transform(value: &[u8]) -> Option<bool> {
+    let mut start = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut no_transform = false;
+    for (index, byte) in value.iter().copied().enumerate() {
+        if quoted {
+            if escaped {
+                if !is_quoted_header_byte(byte) {
+                    return None;
+                }
+                escaped = false;
+            } else {
+                match byte {
+                    b'\\' => escaped = true,
+                    b'"' => quoted = false,
+                    byte if !is_quoted_header_byte(byte) => return None,
+                    _ => {}
+                }
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b',' => {
+                    no_transform |= cache_control_directive(&value[start..index])?;
+                    start = index + 1;
+                }
+                byte if byte >= 0x80 || (byte < 0x20 && !matches!(byte, b' ' | b'\t')) => {
+                    return None;
+                }
+                0x7f => return None,
+                _ => {}
+            }
+        }
+    }
+    if quoted || escaped {
+        return None;
+    }
+    no_transform |= cache_control_directive(&value[start..])?;
+    Some(no_transform)
+}
+
+fn cache_control_directive(value: &[u8]) -> Option<bool> {
+    let value = trim_ascii_ows(value);
+    let name_length = value
+        .iter()
+        .position(|byte| !is_http_token(*byte))
+        .unwrap_or(value.len());
+    if name_length == 0 {
+        return None;
+    }
+    let name = &value[..name_length];
+    let remainder = trim_ascii_ows(&value[name_length..]);
+    if !remainder.is_empty() {
+        let parameter = trim_ascii_ows(remainder.strip_prefix(b"=")?);
+        if parameter.is_empty() {
+            return None;
+        }
+        if parameter[0] == b'"' {
+            if !valid_quoted_header_value(parameter) {
+                return None;
+            }
+        } else if !parameter.iter().all(|byte| is_http_token(*byte)) {
+            return None;
+        }
+    }
+    Some(name.eq_ignore_ascii_case(b"no-transform"))
+}
+
+fn valid_quoted_header_value(value: &[u8]) -> bool {
+    if value.len() < 2 || value[0] != b'"' {
+        return false;
+    }
+    let mut escaped = false;
+    for (index, byte) in value[1..].iter().copied().enumerate() {
+        if escaped {
+            if !is_quoted_header_byte(byte) {
+                return false;
+            }
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => return trim_ascii_ows(&value[index + 2..]).is_empty(),
+            byte if !is_quoted_header_byte(byte) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_quoted_header_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' '..=b'~' | 0x80..=0xff)
+}
+
+fn is_http_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn content_encoding_is_identity_only(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.as_bytes().split(|byte| *byte == b',').all(|coding| {
+                let coding = trim_ascii_ows(coding);
+                !coding.is_empty() && coding.eq_ignore_ascii_case(b"identity")
+            })
+        })
+}
+
+fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn streaming_proxy_body(
@@ -643,6 +857,7 @@ fn build_proxy_response(
     custom: &HeaderMap,
     body: Body,
     rewritten: bool,
+    credential_bearing: bool,
 ) -> Response {
     const SAFE_RESPONSE_HEADERS: &[HeaderName] = &[
         header::ACCEPT_RANGES,
@@ -654,24 +869,43 @@ fn build_proxy_response(
         header::SERVER,
         header::DATE,
         header::CONTENT_ENCODING,
+        header::CACHE_CONTROL,
+        header::EXPIRES,
+        header::PRAGMA,
+        header::VARY,
     ];
     let mut response = Response::new(body);
     *response.status_mut() = status;
     for name in SAFE_RESPONSE_HEADERS {
-        if rewritten
-            && matches!(
-                *name,
-                header::CONTENT_LENGTH | header::CONTENT_RANGE | header::CONTENT_ENCODING
-            )
-        {
-            continue;
-        }
-        if let Some(value) = upstream.get(name) {
-            response.headers_mut().insert(name.clone(), value.clone());
+        for value in upstream.get_all(name).iter() {
+            response.headers_mut().append(name.clone(), value.clone());
         }
     }
     for (name, value) in custom {
         response.headers_mut().insert(name.clone(), value.clone());
+    }
+    if rewritten {
+        for name in [
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::CONTENT_ENCODING,
+            header::ETAG,
+            header::LAST_MODIFIED,
+        ] {
+            response.headers_mut().remove(name);
+        }
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    } else if credential_bearing {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
     }
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -728,6 +962,10 @@ fn proxy_error_response(error: ProxyError) -> Response {
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
     apply_route_owned_headers(&mut response);
     response
 }
@@ -814,9 +1052,9 @@ fn push_playlist(output: &mut String, value: &str) -> Result<(), ProxyError> {
 mod tests {
     use super::{
         MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PROXY_INPUT, MAX_TARGET_URL, ProxyError,
-        buffered_proxy_body, collect_playlist, fetch_with_redirects, handle_proxy,
-        handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix, proxy_error_response,
-        rewrite_playlist_bounded, same_authority, streaming_proxy_body,
+        apply_redirect_origin_policy, buffered_proxy_body, collect_playlist, fetch_with_redirects,
+        handle_proxy, handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix,
+        proxy_error_response, rewrite_playlist_bounded, same_origin, streaming_proxy_body,
     };
     use crate::network_security::{
         Clock, DestinationValidator, DnsResolver, LocalNetworkProvider, ProxyPolicySettings,
@@ -827,7 +1065,7 @@ mod tests {
         Router,
         body::Body,
         extract::Path,
-        http::{HeaderMap, Method, StatusCode, Uri, header},
+        http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
         response::{IntoResponse, Response},
         routing::{any, get},
     };
@@ -1088,11 +1326,39 @@ mod tests {
     }
 
     #[test]
-    fn redirect_origin_requires_the_same_scheme() {
+    fn redirect_origin_uses_scheme_canonical_host_and_effective_port() {
         let http = Url::parse("http://example.test:443/source").unwrap();
         let https = Url::parse("https://example.test:443/destination").unwrap();
+        let implicit_http = Url::parse("http://EXAMPLE.test/source").unwrap();
+        let explicit_http = Url::parse("http://example.test:80/destination").unwrap();
+        let other_port = Url::parse("http://example.test:81/destination").unwrap();
 
-        assert!(!same_authority(&http, &https));
+        assert!(!same_origin(&http, &https));
+        assert!(same_origin(&implicit_http, &explicit_http));
+        assert!(!same_origin(&implicit_http, &other_port));
+    }
+
+    #[test]
+    fn http_to_https_same_host_and_port_clears_cross_origin_state() {
+        let current = Url::parse("http://example.test:443/source").unwrap();
+        let mut next =
+            Url::parse("https://redirect-user:redirect-pass@example.test:443/destination").unwrap();
+        let mut automatic = HeaderMap::from_iter([
+            (header::RANGE, "bytes=10-".parse().unwrap()),
+            (header::IF_RANGE, "origin-a-validator".parse().unwrap()),
+        ]);
+        let mut custom = HeaderMap::from_iter([
+            (header::AUTHORIZATION, "Bearer secret".parse().unwrap()),
+            ("x-api-key".parse().unwrap(), "secret".parse().unwrap()),
+        ]);
+
+        apply_redirect_origin_policy(&current, &mut next, &mut automatic, &mut custom);
+
+        assert!(next.username().is_empty());
+        assert!(next.password().is_none());
+        assert!(!automatic.contains_key(header::IF_RANGE));
+        assert_eq!(automatic[header::RANGE], "bytes=10-");
+        assert!(custom.is_empty());
     }
 
     #[test]
@@ -1263,11 +1529,16 @@ mod tests {
             (ProxyError::InvalidRequest, StatusCode::BAD_REQUEST),
             (ProxyError::Blocked, StatusCode::FORBIDDEN),
             (ProxyError::Upstream, StatusCode::BAD_GATEWAY),
+            (ProxyError::Cancelled, StatusCode::BAD_GATEWAY),
             (ProxyError::Capacity, StatusCode::SERVICE_UNAVAILABLE),
         ] {
             let response = proxy_error_response(error);
             assert_eq!(response.status(), status);
             assert_response_isolated(&response);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
             if error == ProxyError::Capacity {
                 assert_eq!(response.headers()[header::RETRY_AFTER], "1");
             }
@@ -1562,7 +1833,7 @@ mod tests {
         )
         .unwrap();
         let context = runtime.try_request().unwrap();
-        let (response, _) = fetch_with_redirects(
+        let fetched = fetch_with_redirects(
             &runtime,
             &context,
             &parsed,
@@ -1571,8 +1842,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.bytes().await.unwrap(), "fixture-body");
+        assert_eq!(fetched.response.status(), StatusCode::OK);
+        assert_eq!(fetched.response.bytes().await.unwrap(), "fixture-body");
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         fixture.abort();
     }
@@ -1696,7 +1967,7 @@ mod tests {
         )
         .unwrap();
         let context = runtime.try_request().unwrap();
-        let (response, _) = fetch_with_redirects(
+        let fetched = fetch_with_redirects(
             &runtime,
             &context,
             &parsed,
@@ -1705,7 +1976,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(response.text().await.unwrap(), "done");
+        assert_eq!(fetched.response.text().await.unwrap(), "done");
 
         let parsed = parse_proxy_request(
             "",
@@ -1787,7 +2058,7 @@ mod tests {
         )
         .unwrap();
         let context = runtime.try_request().unwrap();
-        let (response, _) = fetch_with_redirects(
+        let fetched = fetch_with_redirects(
             &runtime,
             &context,
             &parsed,
@@ -1796,7 +2067,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(response.text().await.unwrap(), "done");
+        assert_eq!(fetched.response.text().await.unwrap(), "done");
         let (method, headers) = tokio::time::timeout(Duration::from_secs(2), seen_rx)
             .await
             .unwrap()
@@ -1805,6 +2076,769 @@ mod tests {
         assert!(!headers.contains_key(header::AUTHORIZATION));
         assert!(!headers.contains_key(header::COOKIE));
         assert!(!headers.contains_key("x-api-key"));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_origin_changes_drop_if_range_and_custom_headers_but_keep_range() {
+        let (cross_tx, cross_rx) = tokio::sync::oneshot::channel();
+        let cross_tx = Arc::new(std::sync::Mutex::new(Some(cross_tx)));
+        let (same_tx, same_rx) = tokio::sync::oneshot::channel();
+        let same_tx = Arc::new(std::sync::Mutex::new(Some(same_tx)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cross_location = format!(
+            "http://redirect-user:redirect-secret@other.test:{}/final-cross",
+            address.port()
+        );
+        let router = Router::new()
+            .route(
+                "/redirect-cross",
+                any(move || {
+                    let cross_location = cross_location.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, cross_location)],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/final-cross",
+                any(move |headers: HeaderMap| {
+                    let cross_tx = cross_tx.clone();
+                    async move {
+                        if let Some(sender) = cross_tx.lock().unwrap().take() {
+                            let _ = sender.send(headers);
+                        }
+                        "cross"
+                    }
+                }),
+            )
+            .route(
+                "/redirect-same",
+                any(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, "/final-same")],
+                    )
+                }),
+            )
+            .route(
+                "/final-same",
+                any(move |headers: HeaderMap| {
+                    let same_tx = same_tx.clone();
+                    async move {
+                        if let Some(sender) = same_tx.lock().unwrap().take() {
+                            let _ = sender.send(headers);
+                        }
+                        "same"
+                    }
+                }),
+            );
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let incoming = HeaderMap::from_iter([
+            (header::RANGE, "bytes=10-".parse().unwrap()),
+            (header::IF_RANGE, "origin-a-validator".parse().unwrap()),
+        ]);
+
+        for path in ["redirect-cross", "redirect-same"] {
+            let parsed = parse_proxy_request(
+                "",
+                Some(&format!(
+                    concat!(
+                        "d=http%3A%2F%2Fuser%3Asecret%40redirect.test%3A{}%2F{}",
+                        "&h=Authorization%3ABearer%20secret",
+                        "&h=X-Api-Key%3Asecret",
+                        "&r=Content-Type%3Avideo%2Fmp4"
+                    ),
+                    address.port(),
+                    path
+                )),
+            )
+            .unwrap();
+            let context = runtime.try_request().unwrap();
+            let fetched =
+                fetch_with_redirects(&runtime, &context, &parsed, reqwest::Method::GET, &incoming)
+                    .await
+                    .unwrap();
+            assert_eq!(fetched.response.status(), StatusCode::OK);
+            assert_eq!(
+                fetched.effective_response_headers[header::CONTENT_TYPE],
+                "video/mp4"
+            );
+            if path == "redirect-cross" {
+                assert!(fetched.effective_custom_request_headers.is_empty());
+                assert!(fetched.final_url.username().is_empty());
+                assert!(fetched.final_url.password().is_none());
+            } else {
+                assert_eq!(
+                    fetched.effective_custom_request_headers[header::AUTHORIZATION],
+                    "Bearer secret"
+                );
+                assert_eq!(
+                    fetched.effective_custom_request_headers["x-api-key"],
+                    "secret"
+                );
+            }
+        }
+
+        let cross = cross_rx.await.unwrap();
+        assert_eq!(cross[header::RANGE], "bytes=10-");
+        assert!(!cross.contains_key(header::IF_RANGE));
+        assert!(!cross.contains_key(header::AUTHORIZATION));
+        assert!(!cross.contains_key("x-api-key"));
+
+        let same = same_rx.await.unwrap();
+        assert_eq!(same[header::RANGE], "bytes=10-");
+        assert_eq!(same[header::IF_RANGE], "origin-a-validator");
+        assert_eq!(same[header::AUTHORIZATION], "Bearer secret");
+        assert_eq!(same["x-api-key"], "secret");
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn relative_redirects_resolve_from_the_current_path_and_preserve_method() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let router = Router::new()
+            .route(
+                "/a/b",
+                any(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "next?from=relative")],
+                    )
+                }),
+            )
+            .route(
+                "/a/next",
+                any(move |method: Method, uri: Uri| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(sender) = seen_tx.lock().unwrap().take() {
+                            let _ = sender.send((method, uri));
+                        }
+                        "correct"
+                    }
+                }),
+            )
+            .route("/next", any(|| async { "wrong-root" }));
+        let (address, fixture) = fixture(router).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let parsed = parse_proxy_request(
+            "",
+            Some(&format!(
+                "d=http%3A%2F%2Fredirect.test%3A{}%2Fa%2Fb",
+                address.port()
+            )),
+        )
+        .unwrap();
+        let context = runtime.try_request().unwrap();
+        let fetched = fetch_with_redirects(
+            &runtime,
+            &context,
+            &parsed,
+            reqwest::Method::POST,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetched.final_url.path(), "/a/next");
+        assert_eq!(fetched.final_url.query(), Some("from=relative"));
+        assert_eq!(fetched.response.text().await.unwrap(), "correct");
+        let (method, uri) = seen_rx.await.unwrap();
+        assert_eq!(method, Method::POST);
+        assert_eq!(
+            uri.path_and_query().unwrap().as_str(),
+            "/a/next?from=relative"
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn public_unmodified_response_passes_safe_cache_metadata() {
+        let router = Router::new().route(
+            "/asset.bin",
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CACHE_CONTROL, "public, max-age=3600")
+                    .header(header::CACHE_CONTROL, "stale-if-error=60")
+                    .header(header::EXPIRES, "Thu, 20 Aug 2026 12:00:00 GMT")
+                    .header(header::PRAGMA, "custom-extension")
+                    .header(header::VARY, "Accept-Language")
+                    .header(header::VARY, "Origin")
+                    .body(Body::from("asset"))
+                    .unwrap()
+            }),
+        );
+        let (address, fixture) = fixture(router).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://cache.test:{}/asset.bin", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["public, max-age=3600", "stale-if-error=60"]
+        );
+        assert_eq!(
+            response.headers()[header::EXPIRES],
+            "Thu, 20 Aug 2026 12:00:00 GMT"
+        );
+        assert_eq!(response.headers()[header::PRAGMA], "custom-extension");
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Accept-Language", "Origin"]
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "asset"
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn no_transform_and_incomplete_playlist_representations_stream_unchanged() {
+        async fn representation(method: Method, Path(kind): Path<String>) -> Response {
+            let (status, cache_control) = match kind.trim_end_matches(".m3u8") {
+                "no-transform" => (
+                    StatusCode::OK,
+                    "public, max-age=60, No-TrAnSfOrM, stale-if-error=30",
+                ),
+                "partial" => (StatusCode::PARTIAL_CONTENT, "public, max-age=60"),
+                "missing" => (StatusCode::NOT_FOUND, "public, max-age=60"),
+                "multiple" => (StatusCode::MULTIPLE_CHOICES, "public, max-age=60"),
+                "head" => (StatusCode::OK, "public, max-age=60"),
+                _ => unreachable!(),
+            };
+            let body = if method == Method::HEAD {
+                Body::empty()
+            } else {
+                Body::from("#EXTM3U\nsegment.ts\n")
+            };
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                .header(header::CONTENT_LENGTH, "19")
+                .header(header::CONTENT_RANGE, "bytes 0-18/19")
+                .header(header::CONTENT_ENCODING, "identity")
+                .header(header::ETAG, "\"source-validator\"")
+                .header(header::LAST_MODIFIED, "Wed, 19 Aug 2026 12:00:00 GMT")
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, cache_control)
+                .body(body)
+                .unwrap()
+        }
+
+        let (address, fixture) = fixture(Router::new().route("/{kind}", any(representation))).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        for (kind, method, status) in [
+            ("no-transform", Method::GET, StatusCode::OK),
+            ("partial", Method::GET, StatusCode::PARTIAL_CONTENT),
+            ("missing", Method::GET, StatusCode::NOT_FOUND),
+            ("multiple", Method::GET, StatusCode::MULTIPLE_CHOICES),
+            ("head", Method::HEAD, StatusCode::OK),
+        ] {
+            let target = format!("http://media.test:{}/{kind}.m3u8", address.port());
+            let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+                .parse()
+                .unwrap();
+            let response = handle_proxy(&runtime, uri, HeaderMap::new(), method).await;
+            assert_eq!(response.status(), status, "{kind}");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "19", "{kind}");
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                "bytes 0-18/19",
+                "{kind}"
+            );
+            assert_eq!(
+                response.headers()[header::CONTENT_ENCODING],
+                "identity",
+                "{kind}"
+            );
+            assert_eq!(
+                response.headers()[header::ETAG],
+                "\"source-validator\"",
+                "{kind}"
+            );
+            assert_eq!(
+                response.headers()[header::LAST_MODIFIED],
+                "Wed, 19 Aug 2026 12:00:00 GMT",
+                "{kind}"
+            );
+            assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes", "{kind}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                if kind == "no-transform" {
+                    "public, max-age=60, No-TrAnSfOrM, stale-if-error=30"
+                } else {
+                    "public, max-age=60"
+                },
+                "{kind}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if kind == "head" {
+                assert!(body.is_empty());
+            } else {
+                assert_eq!(body, "#EXTM3U\nsegment.ts\n", "{kind}");
+            }
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn effective_content_type_controls_rewriting_and_transformed_metadata_is_final() {
+        let router = Router::new()
+            .route(
+                "/opaque.bin",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, "11")
+                        .header(header::CONTENT_RANGE, "bytes 0-10/11")
+                        .header(header::CONTENT_ENCODING, "identity")
+                        .header(header::ETAG, "\"opaque-etag\"")
+                        .header(header::LAST_MODIFIED, "Wed, 19 Aug 2026 12:00:00 GMT")
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .body(Body::from("segment.ts\n"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/manifest.bin",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                        .header(header::ETAG, "\"manifest-etag\"")
+                        .body(Body::from("segment.ts\n"))
+                        .unwrap()
+                }),
+            );
+        let (address, fixture) = fixture(router).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        let opaque = format!("http://media.test:{}/opaque.bin", address.port());
+        let uri: Uri = format!(
+            "/proxy/?d={}&r=Content-Type%3Aapplication%2Fvnd.apple.mpegurl",
+            urlencoding::encode(&opaque)
+        )
+        .parse()
+        .unwrap();
+        let transformed = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(
+            transformed.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        for removed in [
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::CONTENT_ENCODING,
+            header::ETAG,
+            header::LAST_MODIFIED,
+        ] {
+            assert!(!transformed.headers().contains_key(removed));
+        }
+        assert_eq!(transformed.headers()[header::ACCEPT_RANGES], "none");
+        assert_eq!(
+            transformed.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        let transformed_body = axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&transformed_body).contains("/proxy/?d="));
+
+        let manifest = format!("http://media.test:{}/manifest.bin", address.port());
+        let uri: Uri = format!(
+            "/proxy/?d={}&r=Content-Type%3Atext%2Fplain",
+            urlencoding::encode(&manifest)
+        )
+        .parse()
+        .unwrap();
+        let raw = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(raw.headers()[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(raw.headers()[header::ETAG], "\"manifest-etag\"");
+        assert_eq!(
+            axum::body::to_bytes(raw.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "segment.ts\n"
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn request_credentials_force_no_store_even_after_redirect_clearing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect_location = format!("http://other.test:{}/asset.bin", address.port());
+        let router = Router::new()
+            .route(
+                "/redirect",
+                get(move || {
+                    let redirect_location = redirect_location.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, redirect_location)],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/asset.bin",
+                get(|| async {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .body(Body::from("asset"))
+                        .unwrap()
+                }),
+            );
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+
+        for query in [
+            format!(
+                "d={}",
+                urlencoding::encode(&format!(
+                    "http://user:secret@cache.test:{}/asset.bin",
+                    address.port()
+                ))
+            ),
+            format!(
+                "d={}&h=X-Api-Key%3Asecret",
+                urlencoding::encode(&format!("http://cache.test:{}/asset.bin", address.port()))
+            ),
+            format!(
+                "d={}&h=X-Api-Key%3Asecret",
+                urlencoding::encode(&format!("http://redirect.test:{}/redirect", address.port()))
+            ),
+        ] {
+            let uri: Uri = format!("/proxy/?{query}").parse().unwrap();
+            let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn credential_bearing_upstream_and_rewrite_errors_are_no_store() {
+        let (unreachable_runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let uri: Uri = "/proxy/?d=http%3A%2F%2Funreachable.test%3A1%2Fasset&h=X-Api-Key%3Asecret"
+            .parse()
+            .unwrap();
+        let upstream_error =
+            handle_proxy(&unreachable_runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(upstream_error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            upstream_error.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_response_isolated(&upstream_error);
+
+        let (address, fixture) = fixture(Router::new().route(
+            "/invalid.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from(bytes::Bytes::from_static(b"#EXTM3U\n\xff\n")))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://playlist.test:{}/invalid.m3u8", address.port());
+        let uri: Uri = format!(
+            "/proxy/?d={}&h=X-Api-Key%3Asecret",
+            urlencoding::encode(&target)
+        )
+        .parse()
+        .unwrap();
+        let rewrite_error = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(rewrite_error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            rewrite_error.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_response_isolated(&rewrite_error);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn playlist_content_encoding_requires_only_identity_in_every_field_and_coding() {
+        async fn encoded(Path(kind): Path<String>) -> Response {
+            let mut response = Response::new(Body::from("#EXTM3U\nsegment.ts\n"));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            );
+            match kind.trim_end_matches(".m3u8") {
+                "separate-gzip" => {
+                    response.headers_mut().append(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static("identity"),
+                    );
+                    response
+                        .headers_mut()
+                        .append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                }
+                "mixed-list" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static("identity, gzip"),
+                    );
+                }
+                "repeated-identity" => {
+                    response.headers_mut().append(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static("identity"),
+                    );
+                    response.headers_mut().append(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static("IDENTITY"),
+                    );
+                }
+                "identity-list" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static(" identity ,\tIDENTITY "),
+                    );
+                }
+                "non-ascii" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_bytes(b"identity, \x80").unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            response
+        }
+
+        let (address, fixture) = fixture(Router::new().route("/{kind}", get(encoded))).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        for (kind, expected) in [
+            ("separate-gzip", StatusCode::BAD_GATEWAY),
+            ("mixed-list", StatusCode::BAD_GATEWAY),
+            ("repeated-identity", StatusCode::OK),
+            ("identity-list", StatusCode::OK),
+            ("non-ascii", StatusCode::BAD_GATEWAY),
+        ] {
+            let target = format!("http://encoding.test:{}/{kind}.m3u8", address.port());
+            let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+                .parse()
+                .unwrap();
+            let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+            assert_eq!(response.status(), expected, "{kind}");
+            if expected == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("/proxy/?d="),
+                    "{kind}"
+                );
+            } else {
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "private, no-store",
+                    "{kind}"
+                );
+            }
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn playlist_semantic_headers_are_byte_safe_and_quote_aware() {
+        async fn semantic_headers(Path(kind): Path<String>) -> Response {
+            let mut response = Response::new(Body::from("#EXTM3U\nsegment.ts\n"));
+            response
+                .headers_mut()
+                .insert(header::ETAG, HeaderValue::from_static("\"source\""));
+            match kind.trim_end_matches(".bin") {
+                "actual-no-transform" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                    );
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_bytes(b"extension=\"\x80\", no-transform").unwrap(),
+                    );
+                }
+                "quoted-no-transform" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                    );
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("extension=\"no-transform\""),
+                    );
+                }
+                "invalid-cache-control" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                    );
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("extension=\"unterminated"),
+                    );
+                }
+                "obs-content-type" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_bytes(
+                            b"application/vnd.apple.mpegurl; extension=\"\x80\"",
+                        )
+                        .unwrap(),
+                    );
+                }
+                "invalid-content-type" => {
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application /vnd.apple.mpegurl"),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            response
+        }
+
+        let (address, fixture) =
+            fixture(Router::new().route("/{kind}", get(semantic_headers))).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        for (kind, rewritten) in [
+            ("actual-no-transform", false),
+            ("quoted-no-transform", true),
+            ("invalid-cache-control", false),
+            ("obs-content-type", true),
+            ("invalid-content-type", false),
+        ] {
+            let target = format!("http://semantic.test:{}/{kind}.bin", address.port());
+            let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+                .parse()
+                .unwrap();
+            let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            if rewritten {
+                assert!(!response.headers().contains_key(header::ETAG), "{kind}");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("/proxy/?d="),
+                    "{kind}"
+                );
+            } else {
+                assert_eq!(response.headers()[header::ETAG], "\"source\"", "{kind}");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                    "#EXTM3U\nsegment.ts\n",
+                    "{kind}"
+                );
+            }
+        }
         fixture.abort();
     }
 
