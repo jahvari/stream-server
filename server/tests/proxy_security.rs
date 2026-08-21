@@ -147,6 +147,135 @@ fn proxy_url(server: std::net::SocketAddr, target: &str) -> String {
 }
 
 #[tokio::test]
+async fn proxy_failure_bodies_never_expose_request_credentials() -> anyhow::Result<()> {
+    const SECRETS: &[&str] = &[
+        "parser-header-secret-9c30",
+        "policy-user-secret-9c30",
+        "policy-query-secret-9c30",
+        "policy-header-secret-9c30",
+        "redirect-user-secret-9c30",
+        "redirect-query-secret-9c30",
+        "redirect-header-secret-9c30",
+        "upstream-user-secret-9c30",
+        "upstream-query-secret-9c30",
+        "upstream-header-secret-9c30",
+    ];
+
+    let redirect_router = Router::new().route(
+        "/redirect",
+        get(|| async {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(
+                    header::LOCATION,
+                    concat!(
+                        "http://redirect-user:redirect-user-secret-9c30@169.254.169.254/",
+                        "latest/meta-data/?token=redirect-query-secret-9c30"
+                    ),
+                )],
+            )
+        }),
+    );
+    let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let redirect_address = redirect_listener.local_addr()?;
+    let redirect_task = tokio::spawn(async move {
+        axum::serve(redirect_listener, redirect_router)
+            .await
+            .unwrap();
+    });
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let closed_address = closed_listener.local_addr()?;
+    drop(closed_listener);
+
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        config_dir: Some(config_dir.clone()),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    let client = reqwest::Client::new();
+    let token = std::fs::read_to_string(config_dir.join("settings-control.token"))?;
+    client
+        .post(format!("http://{}/settings", server.http_addr()))
+        .header("x-stream-server-settings-token", token)
+        .json(&json!({"allowPrivateNetworkSources": true}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let requests = [
+        (
+            format!(
+                "http://{}/proxy/?d=not-a-url&h={}",
+                server.http_addr(),
+                urlencoding::encode("X-Api-Key:parser-header-secret-9c30")
+            ),
+            StatusCode::BAD_REQUEST,
+            "Invalid proxy request",
+        ),
+        (
+            format!(
+                "http://{}/proxy/?d={}&h={}",
+                server.http_addr(),
+                urlencoding::encode(concat!(
+                    "http://policy-user:policy-user-secret-9c30@169.254.169.254/",
+                    "latest/meta-data/?token=policy-query-secret-9c30"
+                )),
+                urlencoding::encode("X-Api-Key:policy-header-secret-9c30")
+            ),
+            StatusCode::FORBIDDEN,
+            "Proxy destination is blocked",
+        ),
+        (
+            format!(
+                "http://{}/proxy/?d={}&h={}",
+                server.http_addr(),
+                urlencoding::encode(&format!(
+                    "http://redirect-user:redirect-user-secret-9c30@{redirect_address}/redirect?token=redirect-query-secret-9c30"
+                )),
+                urlencoding::encode("X-Api-Key:redirect-header-secret-9c30")
+            ),
+            StatusCode::FORBIDDEN,
+            "Proxy destination is blocked",
+        ),
+        (
+            format!(
+                "http://{}/proxy/?d={}&h={}",
+                server.http_addr(),
+                urlencoding::encode(&format!(
+                    "http://upstream-user:upstream-user-secret-9c30@{closed_address}/asset?token=upstream-query-secret-9c30"
+                )),
+                urlencoding::encode("X-Api-Key:upstream-header-secret-9c30")
+            ),
+            StatusCode::BAD_GATEWAY,
+            "Proxy upstream request failed",
+        ),
+    ];
+    for (url, expected_status, expected_body) in requests {
+        let response = client.get(url).send().await?;
+        assert_eq!(response.status(), expected_status);
+        let body = response.text().await?;
+        assert_eq!(body, expected_body);
+        for secret in SECRETS {
+            assert!(!body.contains(secret));
+        }
+    }
+
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    redirect_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn marker_preserving_reverse_proxy_cannot_reenter_application_routes() -> anyhow::Result<()> {
     let server_address = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
     let fixture_server_address = server_address.clone();

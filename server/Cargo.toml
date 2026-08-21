@@ -110,6 +110,9 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+
 
 [features]
 default = ["libtorrent"]

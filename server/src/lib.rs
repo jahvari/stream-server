@@ -1014,14 +1014,22 @@ pub fn build_router(state: AppState) -> Router {
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                let target = diagnostics::logging::sanitize_request_target(request.uri());
-                tracing::info_span!(
-                    "request",
-                    method = %request.method(),
-                    path = %target.path,
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let target = diagnostics::logging::sanitize_request_target(request.uri());
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        path = %target.path,
+                    )
+                })
+                .on_request(
+                    |request: &axum::http::Request<axum::body::Body>, span: &tracing::Span| {
+                        if request.uri().path().starts_with("/proxy") {
+                            tracing::info!(parent: span, "proxy request started");
+                        }
+                    },
+                ),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.proxy_runtime.clone(),
@@ -1076,6 +1084,202 @@ async fn root_redirect(State(state): State<AppState>) -> Redirect {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_request_traces_and_diagnostics_export_only_redacted_targets() {
+        use std::io::Read;
+        use tower::ServiceExt;
+
+        const SECRETS: &[&str] = &[
+            "parser-header-secret-9c30",
+            "policy-user-secret-9c30",
+            "policy-query-secret-9c30",
+            "policy-header-secret-9c30",
+            "redirect-user-secret-9c30",
+            "redirect-query-secret-9c30",
+            "redirect-header-secret-9c30",
+            "upstream-user-secret-9c30",
+            "upstream-query-secret-9c30",
+            "upstream-header-secret-9c30",
+        ];
+
+        #[derive(Clone)]
+        struct TestLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for TestLogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _engine_test_guard = TEST_ENGINE_MUTEX.lock().await;
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let redirect_task = tokio::spawn(async move {
+            axum::serve(
+                redirect_listener,
+                Router::new().route(
+                    "/redirect",
+                    get(|| async {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(
+                                axum::http::header::LOCATION,
+                                concat!(
+                                    "http://redirect-user:redirect-user-secret-9c30@169.254.169.254/",
+                                    "latest/meta-data/?token=redirect-query-secret-9c30"
+                                ),
+                            )],
+                        )
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_address = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let settings = routes::system::ServerSettings {
+            allow_private_network_sources: true,
+            ..routes::system::ServerSettings::default()
+        };
+        let state = AppState::new(engine, settings, temp.path().join("config"));
+        std::fs::create_dir_all(&state.log_dir).unwrap();
+        let router = build_router(state.clone());
+        let requests = [
+            (
+                format!(
+                    "/proxy/?d=not-a-url&h={}",
+                    urlencoding::encode("X-Api-Key:parser-header-secret-9c30")
+                ),
+                StatusCode::BAD_REQUEST,
+                "Invalid proxy request",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(concat!(
+                        "http://policy-user:policy-user-secret-9c30@169.254.169.254/",
+                        "latest/meta-data/?token=policy-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:policy-header-secret-9c30")
+                ),
+                StatusCode::FORBIDDEN,
+                "Proxy destination is blocked",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(&format!(
+                        "http://redirect-user:redirect-user-secret-9c30@{redirect_address}/redirect?token=redirect-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:redirect-header-secret-9c30")
+                ),
+                StatusCode::FORBIDDEN,
+                "Proxy destination is blocked",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(&format!(
+                        "http://upstream-user:upstream-user-secret-9c30@{closed_address}/asset?token=upstream-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:upstream-header-secret-9c30")
+                ),
+                StatusCode::BAD_GATEWAY,
+                "Proxy upstream request failed",
+            ),
+        ];
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = TestLogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        for (uri, expected_status, expected_body) in requests {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(body, expected_body);
+            for secret in SECRETS {
+                assert!(
+                    !body
+                        .windows(secret.len())
+                        .any(|part| part == secret.as_bytes())
+                );
+            }
+        }
+        drop(subscriber_guard);
+
+        let captured = logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let captured_text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            captured_text.matches("proxy request started").count(),
+            4,
+            "unexpected proxy trace output:\n{captured_text}"
+        );
+        assert!(captured_text.matches("/proxy/<redacted>").count() >= 4);
+        for secret in SECRETS {
+            assert!(
+                !captured_text.contains(secret),
+                "captured log leaked {secret}"
+            );
+        }
+        std::fs::write(state.log_dir.join("proxy-redaction.log"), &captured).unwrap();
+
+        let diagnostics = diagnostics::build_diagnostics_zip(&state).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(diagnostics)).unwrap();
+        let mut saw_redacted_proxy = false;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            saw_redacted_proxy |= bytes
+                .windows(b"/proxy/<redacted>".len())
+                .any(|part| part == b"/proxy/<redacted>");
+            for secret in SECRETS {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|part| part == secret.as_bytes()),
+                    "diagnostics entry {} leaked {secret}",
+                    entry.name()
+                );
+            }
+        }
+        assert!(saw_redacted_proxy);
+        redirect_task.abort();
+    }
 
     #[tokio::test]
     async fn listener_aware_embedding_blocks_supplied_socket_while_legacy_keeps_default() {
