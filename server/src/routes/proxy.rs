@@ -1,7 +1,10 @@
 #[cfg(test)]
 use crate::network_security::ProxyProducerProbe;
 use crate::{
-    network_security::{DestinationError, ProxyProducerLease, ProxyRequestContext, ProxyRuntime},
+    network_security::{
+        DestinationError, ProxyPlaylistPermit, ProxyProducerLease, ProxyRequestContext,
+        ProxyRuntime,
+    },
     state::AppState,
 };
 use axum::{
@@ -38,6 +41,7 @@ const RAW_CANONICAL_PATH_OPTION: &str = "&x-stream-path=raw";
 const RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(30);
 const UPSTREAM_READ_IDLE_DEADLINE: Duration = Duration::from_secs(30);
 const DOWNSTREAM_NO_PROGRESS_DEADLINE: Duration = Duration::from_secs(120);
+const PLAYLIST_LIFETIME_DEADLINE: Duration = Duration::from_secs(120);
 const PROXY_BODY_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -580,28 +584,47 @@ async fn handle_proxy_suffix_for_peer(
         if !content_encoding_is_identity_only(&upstream_headers) {
             return proxy_error_response(ProxyError::Upstream);
         }
-        let body = match collect_playlist(upstream, &context).await {
+        if declared_playlist_length_exceeds_limit(&upstream) {
+            return proxy_error_response(ProxyError::Upstream);
+        }
+        let playlist_capacity = match runtime.try_playlist(&context) {
+            Ok(permit) => permit,
+            Err(_) => return proxy_error_response(ProxyError::Capacity),
+        };
+        let collection_deadline = tokio::time::Instant::now() + PLAYLIST_LIFETIME_DEADLINE;
+        let body = match collect_playlist_until(upstream, &context, collection_deadline).await {
             Ok(body) => body,
             Err(error) => return proxy_error_response(error),
         };
-        let body = match String::from_utf8(body)
-            .map_err(|_| ProxyError::Upstream)
-            .and_then(|body| {
-                rewrite_playlist_with_options(
-                    &body,
-                    &final_url,
-                    &effective_custom_request_headers,
-                    &effective_response_headers,
-                )
-            }) {
-            Ok(body) => body,
+        let rewritten = match rewrite_playlist_off_thread(
+            body,
+            final_url,
+            effective_custom_request_headers,
+            effective_response_headers.clone(),
+            context,
+            playlist_capacity,
+        )
+        .await
+        {
+            Ok(output) => output,
             Err(error) => return proxy_error_response(error),
         };
+        let PlaylistRewriteOutput {
+            body,
+            context,
+            playlist_capacity,
+        } = rewritten;
         return build_proxy_response(
             status,
             &upstream_headers,
             &effective_response_headers,
-            buffered_proxy_body(Bytes::from(body), context.into_producer_lease()),
+            buffered_proxy_body(
+                Bytes::from(body),
+                context.into_playlist_producer_lease(
+                    playlist_capacity,
+                    tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE,
+                ),
+            ),
             true,
             credential_bearing,
         );
@@ -838,6 +861,10 @@ impl ProxyBodySource {
                 .map_or(ProxySourceItem::Eof, ProxySourceItem::Chunk),
         }
     }
+
+    fn is_drained(&self) -> bool {
+        matches!(self, Self::Buffered(None))
+    }
 }
 
 enum ProxyHandoffSlot {
@@ -868,6 +895,7 @@ struct ProxyHandoff {
     producer_notify: Notify,
     consumer_notify: Notify,
     cancellation: CancellationToken,
+    fixed_delivery_deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
     producer_probe: Option<ProxyProducerProbe>,
 }
@@ -885,7 +913,10 @@ enum ProxyConsumerItem {
 }
 
 impl ProxyHandoff {
-    fn new(cancellation: CancellationToken) -> Self {
+    fn new(
+        cancellation: CancellationToken,
+        fixed_delivery_deadline: Option<tokio::time::Instant>,
+    ) -> Self {
         Self {
             state: Mutex::new(ProxyHandoffState {
                 slot: ProxyHandoffSlot::Empty,
@@ -895,6 +926,7 @@ impl ProxyHandoff {
             producer_notify: Notify::new(),
             consumer_notify: Notify::new(),
             cancellation,
+            fixed_delivery_deadline,
             #[cfg(test)]
             producer_probe: None,
         }
@@ -957,6 +989,15 @@ impl ProxyHandoff {
                 if state.terminal != ProxyHandoffTerminal::Running {
                     return Err(ProxyProducerStop::Failed);
                 }
+                if self
+                    .fixed_delivery_deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    Self::fail_locked(&mut state);
+                    drop(state);
+                    self.consumer_notify.notify_waiters();
+                    return Err(ProxyProducerStop::Failed);
+                }
                 if matches!(state.slot, ProxyHandoffSlot::Empty) {
                     state.slot = ProxyHandoffSlot::Reserved;
                     return Ok(());
@@ -965,6 +1006,10 @@ impl ProxyHandoff {
             tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => {
+                    self.fail();
+                    return Err(ProxyProducerStop::Failed);
+                }
+                _ = wait_for_optional_deadline(self.fixed_delivery_deadline) => {
                     self.fail();
                     return Err(ProxyProducerStop::Failed);
                 }
@@ -993,17 +1038,39 @@ impl ProxyHandoff {
             self.consumer_notify.notify_waiters();
             return Err(ProxyProducerStop::Failed);
         }
+        if self
+            .fixed_delivery_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            Self::fail_locked(&mut state);
+            drop(state);
+            #[cfg(test)]
+            if let Some(producer_probe) = &self.producer_probe {
+                producer_probe.mark_terminated_before_ready();
+            }
+            self.consumer_notify.notify_waiters();
+            return Err(ProxyProducerStop::Failed);
+        }
         debug_assert!(matches!(state.slot, ProxyHandoffSlot::Reserved));
         state.slot = ProxyHandoffSlot::Full { bytes, deadline };
         #[cfg(test)]
         let consumer_notification_deferred = self.producer_probe.is_some();
         drop(state);
         #[cfg(test)]
+        if let Some(producer_probe) = &self.producer_probe {
+            producer_probe.mark_chunk_published();
+        }
+        #[cfg(test)]
         if consumer_notification_deferred {
             return Ok(());
         }
         self.consumer_notify.notify_waiters();
         Ok(())
+    }
+
+    fn delivery_deadline(&self, sliding_deadline: tokio::time::Instant) -> tokio::time::Instant {
+        self.fixed_delivery_deadline
+            .map_or(sliding_deadline, |fixed| fixed.min(sliding_deadline))
     }
 
     async fn wait_until_consumed(
@@ -1100,7 +1167,10 @@ impl ProxyHandoff {
         if self.cancellation.is_cancelled() {
             Self::fail_locked(&mut state);
         } else if !state.consumer_closed && state.terminal == ProxyHandoffTerminal::Running {
-            debug_assert!(matches!(state.slot, ProxyHandoffSlot::Reserved));
+            debug_assert!(matches!(
+                state.slot,
+                ProxyHandoffSlot::Empty | ProxyHandoffSlot::Reserved
+            ));
             state.slot = ProxyHandoffSlot::Empty;
             state.terminal = ProxyHandoffTerminal::Clean;
         }
@@ -1299,6 +1369,10 @@ async fn read_source_chunk(
             _ = handoff.consumer_closed() => {
                 return Err(ProxyProducerStop::ConsumerClosed);
             }
+            _ = wait_for_optional_deadline(handoff.fixed_delivery_deadline) => {
+                handoff.fail();
+                return Err(ProxyProducerStop::Failed);
+            }
             _ = &mut deadline => {
                 handoff.fail();
                 return Err(ProxyProducerStop::Failed);
@@ -1315,6 +1389,13 @@ async fn read_source_chunk(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => futures_util::future::pending().await,
     }
 }
 
@@ -1352,7 +1433,8 @@ async fn run_proxy_body_producer(
                 .saturating_add(PROXY_BODY_CHUNK_SIZE)
                 .min(bytes.len());
             let chunk = Bytes::copy_from_slice(&bytes[offset..end]);
-            let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
+            let deadline = handoff
+                .delivery_deadline(tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE);
             if handoff.publish(chunk, deadline).is_err() {
                 guard.disarm();
                 return;
@@ -1363,6 +1445,12 @@ async fn run_proxy_body_producer(
             }
             offset = end;
         }
+        if resources.source.is_drained() {
+            drop(resources);
+            handoff.clean();
+            guard.disarm();
+            return;
+        }
     }
 }
 
@@ -1370,7 +1458,10 @@ fn spawn_proxy_body(
     source: ProxyBodySource,
     lease: ProxyProducerLease,
 ) -> (Body, tokio::task::AbortHandle) {
-    let handoff = ProxyHandoff::new(lease.cancellation().clone());
+    let handoff = ProxyHandoff::new(
+        lease.cancellation().clone(),
+        lease.playlist_delivery_deadline(),
+    );
     #[cfg(test)]
     let handoff = handoff.with_producer_probe(lease.producer_probe());
     let handoff = Arc::new(handoff);
@@ -1409,47 +1500,108 @@ fn buffered_proxy_body(bytes: Bytes, lease: ProxyProducerLease) -> Body {
 
 const MAX_PLAYLIST_INPUT: usize = 8 * 1024 * 1024;
 
+fn declared_playlist_length_exceeds_limit(response: &reqwest::Response) -> bool {
+    response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .is_some_and(|length| length > MAX_PLAYLIST_INPUT)
+}
+
+#[cfg(test)]
 async fn collect_playlist(
     response: reqwest::Response,
     context: &ProxyRequestContext,
 ) -> Result<Vec<u8>, ProxyError> {
-    if response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .is_some_and(|length| length > MAX_PLAYLIST_INPUT)
-    {
+    collect_playlist_until(
+        response,
+        context,
+        tokio::time::Instant::now() + PLAYLIST_LIFETIME_DEADLINE,
+    )
+    .await
+}
+
+async fn collect_playlist_until(
+    response: reqwest::Response,
+    context: &ProxyRequestContext,
+    collection_deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, ProxyError> {
+    if declared_playlist_length_exceeds_limit(&response) {
         return Err(ProxyError::Upstream);
     }
-    let mut bytes = Vec::with_capacity(
-        response
-            .content_length()
-            .and_then(|length| usize::try_from(length).ok())
-            .unwrap_or(0)
-            .min(MAX_PLAYLIST_INPUT),
-    );
-    let mut stream = response.bytes_stream();
+    let declared_length = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok());
+    #[cfg(test)]
+    let playlist_body_polls = context.playlist_body_polls();
+    let stream = Box::pin(response.bytes_stream().map(move |item| {
+        #[cfg(test)]
+        playlist_body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        item.map_err(|_| ProxySourceError)
+    }));
+    collect_playlist_stream(
+        stream,
+        declared_length,
+        &context.cancellation,
+        collection_deadline,
+    )
+    .await
+}
+
+async fn collect_playlist_stream(
+    mut stream: UpstreamByteStream,
+    declared_length: Option<usize>,
+    cancellation: &CancellationToken,
+    collection_deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, ProxyError> {
+    let mut bytes = Vec::new();
+    if let Some(declared_length) = declared_length {
+        reserve_playlist_input(&mut bytes, declared_length)?;
+    }
+    let mut read_deadline = tokio::time::Instant::now() + UPSTREAM_READ_IDLE_DEADLINE;
     loop {
         let next = tokio::select! {
             biased;
-            _ = context.cancellation.cancelled() => return Err(ProxyError::Cancelled),
-            result = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
-                result.map_err(|_| ProxyError::Upstream)?
+            _ = cancellation.cancelled() => return Err(ProxyError::Cancelled),
+            _ = tokio::time::sleep_until(collection_deadline) => {
+                return Err(ProxyError::Upstream);
             }
+            _ = tokio::time::sleep_until(read_deadline) => {
+                return Err(ProxyError::Upstream);
+            }
+            item = stream.next() => item,
         };
         let Some(chunk) = next else {
             break;
         };
         let chunk = chunk.map_err(|_| ProxyError::Upstream)?;
-        let next_length = bytes
-            .len()
-            .checked_add(chunk.len())
-            .ok_or(ProxyError::Upstream)?;
-        if next_length > MAX_PLAYLIST_INPUT {
-            return Err(ProxyError::Upstream);
+        if chunk.is_empty() {
+            tokio::task::yield_now().await;
+            continue;
         }
+        reserve_playlist_input(&mut bytes, chunk.len())?;
         bytes.extend_from_slice(&chunk);
+        read_deadline = tokio::time::Instant::now() + UPSTREAM_READ_IDLE_DEADLINE;
     }
     Ok(bytes)
+}
+
+fn reserve_playlist_input(bytes: &mut Vec<u8>, additional: usize) -> Result<(), ProxyError> {
+    let next_length = bytes
+        .len()
+        .checked_add(additional)
+        .ok_or(ProxyError::Upstream)?;
+    if next_length > MAX_PLAYLIST_INPUT {
+        return Err(ProxyError::Upstream);
+    }
+    if next_length > bytes.capacity() {
+        bytes
+            .try_reserve_exact(next_length - bytes.len())
+            .map_err(|_| ProxyError::Upstream)?;
+        if bytes.capacity() > MAX_PLAYLIST_INPUT {
+            return Err(ProxyError::Upstream);
+        }
+    }
+    Ok(())
 }
 
 fn build_proxy_response(
@@ -1573,24 +1725,387 @@ fn proxy_error_response(error: ProxyError) -> Response {
 
 const MAX_PLAYLIST_OUTPUT: usize = 16 * 1024 * 1024;
 
+struct PlaylistRewriteJob {
+    input: Vec<u8>,
+    base_url: Url,
+    request_headers: HeaderMap,
+    response_headers: HeaderMap,
+    context: ProxyRequestContext,
+    playlist_capacity: ProxyPlaylistPermit,
+    request_cancellation: CancellationToken,
+    #[cfg(test)]
+    worker_gate: Option<PlaylistRewriteTestGate>,
+}
+
+struct PlaylistRewriteOutput {
+    body: String,
+    context: ProxyRequestContext,
+    playlist_capacity: ProxyPlaylistPermit,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct PlaylistRewriteTestGate {
+    state: Arc<PlaylistRewriteTestGateState>,
+}
+
+#[cfg(test)]
+struct PlaylistRewriteTestGateState {
+    scheduled: std::sync::atomic::AtomicBool,
+    scheduled_notify: Notify,
+    claimed: std::sync::atomic::AtomicBool,
+    claimed_notify: Notify,
+    released: Mutex<bool>,
+    release_notify: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl PlaylistRewriteTestGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(PlaylistRewriteTestGateState {
+                scheduled: std::sync::atomic::AtomicBool::new(false),
+                scheduled_notify: Notify::new(),
+                claimed: std::sync::atomic::AtomicBool::new(false),
+                claimed_notify: Notify::new(),
+                released: Mutex::new(false),
+                release_notify: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    fn mark_scheduled(&self) {
+        self.state
+            .scheduled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.scheduled_notify.notify_waiters();
+    }
+
+    async fn wait_until_scheduled(&self) {
+        loop {
+            let notified = self.state.scheduled_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .scheduled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn is_claimed(&self) -> bool {
+        self.state.claimed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_until_claimed(&self) {
+        loop {
+            let notified = self.state.claimed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.claimed.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn block_worker(&self) {
+        self.state
+            .claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.claimed_notify.notify_waiters();
+        let released = self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.state
+                .release_notify
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    fn release(&self) {
+        *self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.release_notify.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct PlaylistJobSlotState {
+    pending: Option<PlaylistRewriteJob>,
+    completed: Option<Result<PlaylistRewriteOutput, ProxyError>>,
+}
+
+struct PlaylistJobSlot {
+    state: Mutex<PlaylistJobSlotState>,
+    notify: Notify,
+}
+
+impl PlaylistJobSlot {
+    fn new(job: PlaylistRewriteJob) -> Self {
+        Self {
+            state: Mutex::new(PlaylistJobSlotState {
+                pending: Some(job),
+                completed: None,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PlaylistJobSlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn run(&self) {
+        let job = self.lock_state().pending.take();
+        let Some(job) = job else {
+            self.notify.notify_waiters();
+            return;
+        };
+        #[cfg(test)]
+        if let Some(worker_gate) = &job.worker_gate {
+            worker_gate.block_worker();
+        }
+        let result = run_playlist_rewrite_job(job);
+        self.lock_state().completed = Some(result);
+        self.notify.notify_waiters();
+    }
+
+    fn take_completed(&self) -> Option<Result<PlaylistRewriteOutput, ProxyError>> {
+        self.lock_state().completed.take()
+    }
+
+    fn clear(&self) {
+        let (pending, completed) = {
+            let mut state = self.lock_state();
+            (state.pending.take(), state.completed.take())
+        };
+        drop(pending);
+        drop(completed);
+    }
+}
+
+struct PlaylistRewriteGuard {
+    slot: Arc<PlaylistJobSlot>,
+    request_cancellation: CancellationToken,
+    abort: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl PlaylistRewriteGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PlaylistRewriteGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.slot.clear();
+        self.request_cancellation.cancel();
+        self.abort.abort();
+        self.slot.notify.notify_waiters();
+    }
+}
+
+struct PlaylistRewriteCancellation<'a> {
+    policy: &'a CancellationToken,
+    request: &'a CancellationToken,
+}
+
+impl PlaylistRewriteCancellation<'_> {
+    fn check(&self) -> Result<(), ProxyError> {
+        if self.policy.is_cancelled() || self.request.is_cancelled() {
+            Err(ProxyError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn run_playlist_rewrite_job(job: PlaylistRewriteJob) -> Result<PlaylistRewriteOutput, ProxyError> {
+    let PlaylistRewriteJob {
+        input,
+        base_url,
+        request_headers,
+        response_headers,
+        context,
+        playlist_capacity,
+        request_cancellation,
+        #[cfg(test)]
+            worker_gate: _,
+    } = job;
+    let policy_cancellation = context.cancellation.clone();
+    let cancellation = PlaylistRewriteCancellation {
+        policy: &policy_cancellation,
+        request: &request_cancellation,
+    };
+    cancellation.check()?;
+    let input = String::from_utf8(input).map_err(|_| ProxyError::Upstream)?;
+    let body = rewrite_playlist_with_options_cancellable(
+        &input,
+        &base_url,
+        &request_headers,
+        &response_headers,
+        &cancellation,
+    )?;
+    cancellation.check()?;
+    Ok(PlaylistRewriteOutput {
+        body,
+        context,
+        playlist_capacity,
+    })
+}
+
+async fn rewrite_playlist_off_thread(
+    input: Vec<u8>,
+    base_url: Url,
+    request_headers: HeaderMap,
+    response_headers: HeaderMap,
+    context: ProxyRequestContext,
+    playlist_capacity: ProxyPlaylistPermit,
+) -> Result<PlaylistRewriteOutput, ProxyError> {
+    let request_cancellation = CancellationToken::new();
+    run_playlist_rewrite_off_thread(PlaylistRewriteJob {
+        input,
+        base_url,
+        request_headers,
+        response_headers,
+        context,
+        playlist_capacity,
+        request_cancellation,
+        #[cfg(test)]
+        worker_gate: None,
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn rewrite_playlist_off_thread_with_gate(
+    input: Vec<u8>,
+    base_url: Url,
+    request_headers: HeaderMap,
+    response_headers: HeaderMap,
+    context: ProxyRequestContext,
+    playlist_capacity: ProxyPlaylistPermit,
+    worker_gate: PlaylistRewriteTestGate,
+) -> Result<PlaylistRewriteOutput, ProxyError> {
+    run_playlist_rewrite_off_thread(PlaylistRewriteJob {
+        input,
+        base_url,
+        request_headers,
+        response_headers,
+        context,
+        playlist_capacity,
+        request_cancellation: CancellationToken::new(),
+        worker_gate: Some(worker_gate),
+    })
+    .await
+}
+
+async fn run_playlist_rewrite_off_thread(
+    job: PlaylistRewriteJob,
+) -> Result<PlaylistRewriteOutput, ProxyError> {
+    let policy_cancellation = job.context.cancellation.clone();
+    let request_cancellation = job.request_cancellation.clone();
+    #[cfg(test)]
+    let worker_gate = job.worker_gate.clone();
+    let slot = Arc::new(PlaylistJobSlot::new(job));
+    let worker_slot = slot.clone();
+    let mut worker = tokio::task::spawn_blocking(move || worker_slot.run());
+    #[cfg(test)]
+    if let Some(worker_gate) = worker_gate {
+        worker_gate.mark_scheduled();
+    }
+    let mut guard = PlaylistRewriteGuard {
+        slot: slot.clone(),
+        request_cancellation,
+        abort: worker.abort_handle(),
+        armed: true,
+    };
+
+    loop {
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(result) = slot.take_completed() {
+            worker.await.map_err(|_| ProxyError::Upstream)?;
+            guard.disarm();
+            return result;
+        }
+        tokio::select! {
+            biased;
+            _ = policy_cancellation.cancelled() => return Err(ProxyError::Cancelled),
+            result = &mut worker => {
+                result.map_err(|_| ProxyError::Upstream)?;
+                let result = slot.take_completed().ok_or(ProxyError::Upstream)?;
+                guard.disarm();
+                return result;
+            }
+            _ = &mut notified => {}
+        }
+    }
+}
+
 #[cfg(test)]
 fn rewrite_playlist_bounded(body: &str, base_url: &Url) -> Result<String, ProxyError> {
     rewrite_playlist_with_options(body, base_url, &HeaderMap::new(), &HeaderMap::new())
 }
 
+#[cfg(test)]
 fn rewrite_playlist_with_options(
     body: &str,
     base_url: &Url,
     request_headers: &HeaderMap,
     response_headers: &HeaderMap,
 ) -> Result<String, ProxyError> {
+    let policy = CancellationToken::new();
+    let request = CancellationToken::new();
+    rewrite_playlist_with_options_cancellable(
+        body,
+        base_url,
+        request_headers,
+        response_headers,
+        &PlaylistRewriteCancellation {
+            policy: &policy,
+            request: &request,
+        },
+    )
+}
+
+fn rewrite_playlist_with_options_cancellable(
+    body: &str,
+    base_url: &Url,
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+    cancellation: &PlaylistRewriteCancellation<'_>,
+) -> Result<String, ProxyError> {
     let mut output = String::new();
     output
         .try_reserve_exact(body.len().min(MAX_PLAYLIST_OUTPUT))
         .map_err(|_| ProxyError::Upstream)?;
+    if output.capacity() > MAX_PLAYLIST_OUTPUT {
+        return Err(ProxyError::Upstream);
+    }
     let bytes = body.as_bytes();
     let mut position = 0usize;
     while position < body.len() {
+        cancellation.check()?;
         let ending_start = bytes[position..]
             .iter()
             .position(|byte| matches!(byte, b'\r' | b'\n'))
@@ -1615,6 +2130,7 @@ fn rewrite_playlist_with_options(
                 request_headers,
                 response_headers,
                 &mut output,
+                cancellation,
             )?;
         } else if line.starts_with('#') || line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
             push_playlist(&mut output, line)?;
@@ -1625,6 +2141,7 @@ fn rewrite_playlist_with_options(
                 request_headers,
                 response_headers,
                 &mut output,
+                cancellation,
             )?;
         }
         push_playlist(&mut output, ending)?;
@@ -1642,6 +2159,7 @@ fn rewrite_playlist_tag(
     request_headers: &HeaderMap,
     response_headers: &HeaderMap,
     output: &mut String,
+    cancellation: &PlaylistRewriteCancellation<'_>,
 ) -> Result<(), ProxyError> {
     let Some(colon) = line.find(':') else {
         return push_playlist(output, line);
@@ -1668,7 +2186,14 @@ fn rewrite_playlist_tag(
             };
             push_playlist(output, &line[copied..value_start])?;
             let value = &line[value_start..value_end];
-            rewrite_playlist_reference(value, base_url, request_headers, response_headers, output)?;
+            rewrite_playlist_reference(
+                value,
+                base_url,
+                request_headers,
+                response_headers,
+                output,
+                cancellation,
+            )?;
             copied = value_end;
             scan_start = value_end + 1;
         }
@@ -1717,7 +2242,9 @@ fn rewrite_playlist_reference(
     request_headers: &HeaderMap,
     response_headers: &HeaderMap,
     output: &mut String,
+    cancellation: &PlaylistRewriteCancellation<'_>,
 ) -> Result<(), ProxyError> {
+    cancellation.check()?;
     let Some(resolved) = resolve_hls_reference(reference, base_url)? else {
         return push_playlist(output, reference);
     };
@@ -2193,6 +2720,9 @@ fn reserve_bounded(
     additional: usize,
     maximum: usize,
 ) -> Result<(), ProxyError> {
+    if output.capacity() > maximum {
+        return Err(ProxyError::Upstream);
+    }
     let next_length = output
         .len()
         .checked_add(additional)
@@ -2210,6 +2740,9 @@ fn reserve_bounded(
         output
             .try_reserve_exact(desired_capacity - output.len())
             .map_err(|_| ProxyError::Upstream)?;
+        if output.capacity() > maximum {
+            return Err(ProxyError::Upstream);
+        }
     }
     Ok(())
 }
@@ -2219,12 +2752,15 @@ mod tests {
     use super::{
         DOWNSTREAM_NO_PROGRESS_DEADLINE, HLS_SCHEME_PRESCAN_BYTES, HLS_VARIABLE_RANGE_SCANS,
         MAX_HEADER_PAIR, MAX_PLAYLIST_INPUT, MAX_PLAYLIST_OUTPUT, MAX_PROXY_INPUT, MAX_TARGET_URL,
-        PROXY_BODY_CHUNK_SIZE, ProxyBodySource, ProxyConsumerItem, ProxyError, ProxyHandoff,
-        ProxyHandoffSlot, ProxyProducerStop, ProxySourceError, apply_redirect_origin_policy,
-        await_response_headers, buffered_proxy_body, collect_playlist, fetch_with_redirects,
-        handle_proxy, handle_proxy_suffix, parse_proxy_request, parse_proxy_suffix,
-        proxy_error_response, resolve_hls_reference, rewrite_playlist_bounded,
-        rewrite_playlist_with_options, runtime_service, same_origin, spawn_proxy_body,
+        PROXY_BODY_CHUNK_SIZE, PlaylistRewriteTestGate, ProxyBodySource, ProxyConsumerItem,
+        ProxyError, ProxyHandoff, ProxyHandoffSlot, ProxyProducerGuard, ProxyProducerResources,
+        ProxyProducerStop, ProxySourceError, apply_redirect_origin_policy, await_response_headers,
+        buffered_proxy_body, collect_playlist, collect_playlist_stream, fetch_with_redirects,
+        handle_proxy, handle_proxy_for_peer, handle_proxy_suffix, parse_proxy_request,
+        parse_proxy_suffix, proxy_error_response, reserve_bounded, resolve_hls_reference,
+        rewrite_playlist_bounded, rewrite_playlist_off_thread,
+        rewrite_playlist_off_thread_with_gate, rewrite_playlist_with_options,
+        run_proxy_body_producer, runtime_service, same_origin, spawn_proxy_body,
         streaming_proxy_body,
     };
     use crate::network_security::{
@@ -4071,6 +4607,11 @@ mod tests {
                 .unwrap();
             let response = handle_proxy(&runtime, uri, HeaderMap::new(), method).await;
             assert_eq!(response.status(), status, "{kind}");
+            assert_eq!(
+                runtime.playlist_capacity_snapshot(),
+                (0, 0),
+                "{kind} must remain on the ordinary streaming path"
+            );
             assert_eq!(response.headers()[header::CONTENT_LENGTH], "19", "{kind}");
             assert_eq!(
                 response.headers()[header::CONTENT_RANGE],
@@ -4110,7 +4651,61 @@ mod tests {
             } else {
                 assert_eq!(body, "#EXTM3U\nsegment.ts\n", "{kind}");
             }
+            wait_for_capacity(&runtime, (0, 0)).await;
+            assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0), "{kind}");
         }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn rewritten_playlist_holds_both_quotas_through_delivery_and_releases_them() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/master.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from("#EXTM3U\nsegment.ts\n"))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let probe = runtime.probe_next_request_producer();
+        let target = format!(
+            "http://playlist-lifecycle.test:{}/master.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        probe.wait_for_published_chunks(1).await.unwrap();
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (1, 1));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.windows(b"/proxy".len())
+                .any(|window| window == b"/proxy")
+        );
+        wait_for_capacity(&runtime, (0, 0)).await;
+        for _ in 0..32 {
+            if runtime.playlist_capacity_snapshot() == (0, 0) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
         fixture.abort();
     }
 
@@ -4608,14 +5203,20 @@ mod tests {
             ProxyPolicySettings::default(),
         );
         let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
         let cancellation = context.cancellation.clone();
-        let lease = context.into_producer_lease();
+        let lease = context.into_playlist_producer_lease(
+            playlist_capacity,
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        );
         let body = buffered_proxy_body(bytes::Bytes::from_static(b"#EXTM3U\nsegment.ts\n"), lease);
         assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (1, 1));
         cancellation.cancel();
         assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
         wait_for_capacity(&runtime, (0, 0)).await;
         assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
     }
 
     async fn wait_until(mut ready: impl FnMut() -> bool) {
@@ -4930,7 +5531,7 @@ mod tests {
         let producer_probe = runtime.probe_next_request_producer();
         let lease = runtime.try_request().unwrap().into_producer_lease();
         let handoff = Arc::new(
-            ProxyHandoff::new(lease.cancellation().clone())
+            ProxyHandoff::new(lease.cancellation().clone(), None)
                 .with_producer_probe(lease.producer_probe()),
         );
         assert!(handoff.reserve().await.is_ok());
@@ -4969,7 +5570,7 @@ mod tests {
         let producer_probe = runtime.probe_next_request_producer();
         let lease = runtime.try_request().unwrap().into_producer_lease();
         let handoff = Arc::new(
-            ProxyHandoff::new(lease.cancellation().clone())
+            ProxyHandoff::new(lease.cancellation().clone(), None)
                 .with_producer_probe(lease.producer_probe()),
         );
         assert!(handoff.reserve().await.is_ok());
@@ -5005,7 +5606,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn timely_take_wins_when_producer_observes_notify_after_deadline() {
-        let handoff = ProxyHandoff::new(CancellationToken::new());
+        let handoff = ProxyHandoff::new(CancellationToken::new(), None);
         assert!(handoff.reserve().await.is_ok());
         let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
         assert!(
@@ -5030,7 +5631,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_take_fails_without_delivering_expired_chunk() {
-        let handoff = ProxyHandoff::new(CancellationToken::new());
+        let handoff = ProxyHandoff::new(CancellationToken::new(), None);
         assert!(handoff.reserve().await.is_ok());
         let deadline = tokio::time::Instant::now() + DOWNSTREAM_NO_PROGRESS_DEADLINE;
         assert!(
@@ -5398,6 +5999,35 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn abort_before_first_playlist_producer_poll_reclaims_both_quotas() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+        let (body, abort) = spawn_proxy_body(
+            ProxyBodySource::Buffered(Some(bytes::Bytes::from_static(b"playlist"))),
+            context.into_playlist_producer_lease(
+                playlist_capacity,
+                tokio::time::Instant::now() + Duration::from_secs(120),
+            ),
+        );
+
+        abort.abort();
+
+        assert_body_error_then_eof(body).await;
+        wait_for_capacity(&runtime, (0, 0)).await;
+        for _ in 0..32 {
+            if runtime.playlist_capacity_snapshot() == (0, 0) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn slow_progress_resets_each_downstream_deadline_without_a_total_limit() {
         let (stream, polls, drops) = TestByteStream::new([
@@ -5430,6 +6060,93 @@ mod tests {
         wait_for_capacity(&runtime, (0, 0)).await;
         wait_until(|| drops.load(Ordering::SeqCst) == 1).await;
         assert_eq!(polls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn playlist_delivery_expires_after_one_hundred_twenty_seconds_despite_progress() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let probe = runtime.probe_next_request_producer();
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+        let started = tokio::time::Instant::now();
+        let source = bytes::Bytes::from(vec![b'x'; PROXY_BODY_CHUNK_SIZE * 3]);
+        let body = buffered_proxy_body(
+            source,
+            context.into_playlist_producer_lease(
+                playlist_capacity,
+                started + Duration::from_secs(120),
+            ),
+        );
+        let mut body = body.into_data_stream();
+
+        probe.wait_for_published_chunks(1).await.unwrap();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert_eq!(
+            body.next().await.unwrap().unwrap().len(),
+            PROXY_BODY_CHUNK_SIZE
+        );
+
+        probe.wait_for_published_chunks(2).await.unwrap();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert_eq!(
+            body.next().await.unwrap().unwrap().len(),
+            PROXY_BODY_CHUNK_SIZE
+        );
+
+        probe.wait_for_published_chunks(3).await.unwrap();
+        tokio::time::advance(Duration::from_secs(21)).await;
+        assert!(body.next().await.unwrap().is_err());
+        assert!(body.next().await.is_none());
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(121)
+        );
+        wait_for_capacity(&runtime, (0, 0)).await;
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timely_final_playlist_chunk_finishes_cleanly_when_producer_runs_after_deadline() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+        let started = tokio::time::Instant::now();
+        let lease = context
+            .into_playlist_producer_lease(playlist_capacity, started + Duration::from_secs(120));
+        let handoff = Arc::new(ProxyHandoff::new(
+            lease.cancellation().clone(),
+            lease.playlist_delivery_deadline(),
+        ));
+        let guard = ProxyProducerGuard::new(handoff.clone());
+        let mut producer = Box::pin(run_proxy_body_producer(
+            ProxyProducerResources {
+                source: ProxyBodySource::Buffered(Some(bytes::Bytes::from_static(b"complete"))),
+                _lease: lease,
+            },
+            handoff.clone(),
+            guard,
+        ));
+        assert!(poll_once(producer.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_secs(119)).await;
+        match handoff.take().await {
+            ProxyConsumerItem::Chunk(bytes) => assert_eq!(bytes, "complete"),
+            ProxyConsumerItem::Failed | ProxyConsumerItem::Eof => {
+                panic!("timely consumer did not receive the complete playlist")
+            }
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(matches!(poll_once(producer.as_mut()), Poll::Ready(())));
+        assert!(matches!(handoff.take().await, ProxyConsumerItem::Eof));
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
     }
 
     #[tokio::test]
@@ -5717,6 +6434,650 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(runtime.capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn exhausted_playlist_admission_rejects_before_collection() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/candidate.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from("#EXTM3U\nsegment.ts\n"))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let contexts: Vec<_> = (1..=8)
+            .map(|host| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, host))))
+                    .unwrap()
+            })
+            .collect();
+        let playlist_permits: Vec<_> = contexts
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+        let target = format!(
+            "http://playlist-capacity.test:{}/candidate.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(runtime.playlist_body_poll_count(), 0);
+        assert_eq!(runtime.playlist_capacity_snapshot(), (8, 8));
+        drop(response);
+        drop(playlist_permits);
+        drop(contexts);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn fifth_same_peer_playlist_is_rejected_without_polling_its_body() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/candidate.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from("#EXTM3U\nsegment.ts\n"))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+        let contexts: Vec<_> = (0..4)
+            .map(|_| runtime.try_request_for_peer(Some(peer)).unwrap())
+            .collect();
+        let playlist_permits: Vec<_> = contexts
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+        let target = format!(
+            "http://playlist-capacity.test:{}/candidate.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response =
+            handle_proxy_for_peer(&runtime, Some(peer), uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(runtime.playlist_body_poll_count(), 0);
+        assert_eq!(runtime.playlist_capacity_snapshot(), (4, 1));
+        drop(response);
+        drop(playlist_permits);
+        drop(contexts);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn eight_collecting_playlists_release_capacity_for_immediate_re_admission() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/pending.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let runtime = Arc::new(runtime);
+        let target = format!(
+            "http://playlist-concurrency.test:{}/pending.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+        let mut requests = Vec::new();
+        for host in 1..=8 {
+            let request_runtime = runtime.clone();
+            let request_uri = uri.clone();
+            let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, host));
+            requests.push(tokio::spawn(async move {
+                handle_proxy_for_peer(
+                    &request_runtime,
+                    Some(peer),
+                    request_uri,
+                    HeaderMap::new(),
+                    Method::GET,
+                )
+                .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.playlist_capacity_snapshot() != (8, 8) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight playlist collections did not acquire capacity");
+        let ninth = handle_proxy_for_peer(
+            &runtime,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))),
+            uri.clone(),
+            HeaderMap::new(),
+            Method::GET,
+        )
+        .await;
+        assert_eq!(ninth.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let released = requests.remove(0);
+        released.abort();
+        assert!(released.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.playlist_capacity_snapshot().0 != 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released playlist collection did not return capacity");
+
+        let replacement_runtime = runtime.clone();
+        let replacement = tokio::spawn(async move {
+            handle_proxy_for_peer(
+                &replacement_runtime,
+                Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))),
+                uri,
+                HeaderMap::new(),
+                Method::GET,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.playlist_capacity_snapshot() != (8, 8) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement playlist was not admitted immediately");
+
+        replacement.abort();
+        assert!(replacement.await.unwrap_err().is_cancelled());
+        for request in requests {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.capacity_snapshot() != (0, 0)
+                || runtime.playlist_capacity_snapshot() != (0, 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playlist collection cleanup did not return all capacity");
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn declared_oversized_playlist_precedes_exhausted_playlist_admission() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/oversized.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .header(header::CONTENT_LENGTH, MAX_PLAYLIST_INPUT + 1)
+                    .body(Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let contexts: Vec<_> = (1..=8)
+            .map(|host| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, host))))
+                    .unwrap()
+            })
+            .collect();
+        let playlist_permits: Vec<_> = contexts
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+        let target = format!(
+            "http://playlist-capacity.test:{}/oversized.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(runtime.playlist_capacity_snapshot(), (8, 8));
+        drop(response);
+        drop(playlist_permits);
+        drop(contexts);
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn policy_cancellation_during_playlist_collection_releases_both_quotas() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/pending.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let runtime = Arc::new(runtime);
+        let target = format!(
+            "http://playlist-cancel.test:{}/pending.m3u8",
+            address.port()
+        );
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            handle_proxy(&request_runtime, uri, HeaderMap::new(), Method::GET).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.playlist_capacity_snapshot() != (1, 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playlist collection did not acquire its permit");
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (1, 1));
+
+        runtime.begin_reconfigure(ProxyPolicySettings::default());
+        let response = request.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn playlist_collection_error_returns_generic_failure_and_releases_both_quotas() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/error.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from_stream(futures_util::stream::once(async {
+                        Err::<bytes::Bytes, _>(std::io::Error::other("controlled body error"))
+                    })))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://playlist-error.test:{}/error.m3u8", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "Proxy upstream request failed"
+        );
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_handler_during_playlist_collection_releases_both_quotas() {
+        let (address, fixture) = fixture(Router::new().route(
+            "/pending.m3u8",
+            get(|| async {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                    .body(Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let runtime = Arc::new(runtime);
+        let target = format!("http://playlist-drop.test:{}/pending.m3u8", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            handle_proxy(&request_runtime, uri, HeaderMap::new(), Method::GET).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.playlist_capacity_snapshot() != (1, 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playlist collection did not acquire its permit");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+        fixture.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn playlist_collection_has_a_fixed_one_hundred_twenty_second_deadline() {
+        let started = tokio::time::Instant::now();
+        let stream = futures_util::stream::unfold(0usize, |index| async move {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            Some((Ok(bytes::Bytes::from_static(b"x")), index + 1))
+        });
+        let cancellation = CancellationToken::new();
+
+        let result = collect_playlist_stream(
+            Box::pin(stream),
+            None,
+            &cancellation,
+            started + Duration::from_secs(120),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_playlist_chunks_do_not_reset_read_idle() {
+        let started = tokio::time::Instant::now();
+        let stream = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            Ok(bytes::Bytes::new())
+        })
+        .chain(futures_util::stream::pending());
+        let cancellation = CancellationToken::new();
+
+        let result = collect_playlist_stream(
+            Box::pin(stream),
+            None,
+            &cancellation,
+            started + Duration::from_secs(120),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_playlist_collection_hits_read_idle_before_absolute_deadline() {
+        let started = tokio::time::Instant::now();
+        let cancellation = CancellationToken::new();
+
+        let result = collect_playlist_stream(
+            Box::pin(futures_util::stream::pending()),
+            None,
+            &cancellation,
+            started + Duration::from_secs(120),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_collection_capacity_never_exceeds_the_input_limit() {
+        let first = bytes::Bytes::from(vec![b'a'; 5 * 1024 * 1024 + 3]);
+        let second = bytes::Bytes::from(vec![b'b'; MAX_PLAYLIST_INPUT - first.len()]);
+        let cancellation = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+
+        let exact = collect_playlist_stream(
+            Box::pin(futures_util::stream::iter([Ok(first), Ok(second)])),
+            None,
+            &cancellation,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exact.len(), MAX_PLAYLIST_INPUT);
+        assert!(exact.capacity() <= MAX_PLAYLIST_INPUT);
+
+        let overflow = collect_playlist_stream(
+            Box::pin(futures_util::stream::iter([
+                Ok(bytes::Bytes::from(vec![b'a'; MAX_PLAYLIST_INPUT])),
+                Ok(bytes::Bytes::from_static(b"x")),
+            ])),
+            None,
+            &cancellation,
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        )
+        .await;
+        assert!(matches!(overflow, Err(ProxyError::Upstream)));
+    }
+
+    #[tokio::test]
+    async fn blocking_playlist_rewrite_observes_policy_cancellation_and_releases_both_quotas() {
+        let settings = ProxyPolicySettings {
+            allow_private_network_sources: true,
+            allow_invalid_proxy_tls_certificates: false,
+        };
+        let (runtime, _) = test_runtime("127.0.0.1:1".parse().unwrap(), settings);
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+        runtime.begin_reconfigure(ProxyPolicySettings::default());
+
+        let result = rewrite_playlist_off_thread(
+            b"#EXTM3U\nsegment.ts\n".to_vec(),
+            Url::parse("https://media.example/master.m3u8").unwrap(),
+            HeaderMap::new(),
+            HeaderMap::new(),
+            context,
+            playlist_capacity,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Cancelled)));
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn blocking_playlist_rewrite_rejects_invalid_utf8_and_releases_both_quotas() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+
+        let result = rewrite_playlist_off_thread(
+            vec![b'#', b'X', b'\n', 0xff],
+            Url::parse("https://media.example/master.m3u8").unwrap(),
+            HeaderMap::new(),
+            HeaderMap::new(),
+            context,
+            playlist_capacity,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream)));
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn dropping_async_owner_cancels_a_claimed_playlist_worker_and_releases_payload() {
+        let (runtime, _) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let context = runtime.try_request().unwrap();
+        let playlist_capacity = runtime.try_playlist(&context).unwrap();
+        let gate = PlaylistRewriteTestGate::new();
+        let worker_gate = gate.clone();
+        let rewrite = tokio::spawn(async move {
+            rewrite_playlist_off_thread_with_gate(
+                vec![b'x'; MAX_PLAYLIST_INPUT],
+                Url::parse("https://media.example/master.m3u8").unwrap(),
+                HeaderMap::new(),
+                HeaderMap::new(),
+                context,
+                playlist_capacity,
+                worker_gate,
+            )
+            .await
+        });
+        gate.wait_until_claimed().await;
+        assert_eq!(runtime.capacity_snapshot(), (1, 1));
+        assert_eq!(runtime.playlist_capacity_snapshot(), (1, 1));
+
+        rewrite.abort();
+        let join_error = match rewrite.await {
+            Err(error) => error,
+            Ok(_) => panic!("aborted playlist owner unexpectedly completed"),
+        };
+        assert!(join_error.is_cancelled());
+        gate.release();
+
+        wait_for_capacity(&runtime, (0, 0)).await;
+        for _ in 0..32 {
+            if runtime.playlist_capacity_snapshot() == (0, 0) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn dropping_async_owner_clears_a_queued_playlist_job_before_the_queue_drains() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+            let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocker_started_tx.send(());
+                blocker_release_rx.recv().unwrap();
+            });
+            blocker_started_rx.await.unwrap();
+
+            let (runtime, _) = test_runtime(
+                "127.0.0.1:1".parse().unwrap(),
+                ProxyPolicySettings::default(),
+            );
+            let context = runtime.try_request().unwrap();
+            let playlist_capacity = runtime.try_playlist(&context).unwrap();
+            let gate = PlaylistRewriteTestGate::new();
+            let worker_gate = gate.clone();
+            let rewrite = tokio::spawn(async move {
+                rewrite_playlist_off_thread_with_gate(
+                    vec![b'x'; MAX_PLAYLIST_INPUT],
+                    Url::parse("https://media.example/master.m3u8").unwrap(),
+                    HeaderMap::new(),
+                    HeaderMap::new(),
+                    context,
+                    playlist_capacity,
+                    worker_gate,
+                )
+                .await
+            });
+            gate.wait_until_scheduled().await;
+            assert!(!gate.is_claimed());
+
+            rewrite.abort();
+            let join_error = match rewrite.await {
+                Err(error) => error,
+                Ok(_) => panic!("aborted queued playlist owner unexpectedly completed"),
+            };
+            assert!(join_error.is_cancelled());
+            assert_eq!(runtime.capacity_snapshot(), (0, 0));
+            assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
+
+            blocker_release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(!gate.is_claimed());
+        });
     }
 
     #[tokio::test]
@@ -6423,10 +7784,21 @@ mod tests {
 
         let rewritten = rewrite_playlist_bounded(&exact, &base).unwrap();
         assert_eq!(rewritten.len(), MAX_PLAYLIST_OUTPUT);
+        assert!(rewritten.capacity() <= MAX_PLAYLIST_OUTPUT);
 
         exact.push('a');
         assert!(matches!(
             rewrite_playlist_bounded(&exact, &base),
+            Err(ProxyError::Upstream)
+        ));
+    }
+
+    #[test]
+    fn bounded_playlist_reservation_rejects_an_already_oversized_allocation() {
+        let mut output = String::with_capacity(MAX_PLAYLIST_OUTPUT + 1);
+
+        assert!(matches!(
+            reserve_bounded(&mut output, 0, MAX_PLAYLIST_OUTPUT),
             Err(ProxyError::Upstream)
         ));
     }

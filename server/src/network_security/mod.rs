@@ -7,7 +7,7 @@ pub(crate) use resolver::{
     SystemLocalNetworkProvider,
 };
 pub(crate) use runtime::{
-    ProxyPolicySettings, ProxyProducerLease, ProxyRequestContext, ProxyRuntime,
+    ProxyPlaylistPermit, ProxyPolicySettings, ProxyProducerLease, ProxyRequestContext, ProxyRuntime,
 };
 
 #[cfg(test)]

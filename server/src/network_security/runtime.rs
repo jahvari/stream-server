@@ -1,6 +1,8 @@
 use super::resolver::{
     DestinationError, DestinationValidator, OutboundPolicy, ResolvedDestination,
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -13,6 +15,8 @@ use url::Url;
 
 const MAX_CONCURRENT_PROXY_REQUESTS: usize = 64;
 const MAX_CONCURRENT_PROXY_REQUESTS_PER_PEER: usize = 16;
+const MAX_CONCURRENT_PLAYLISTS: usize = 8;
+const MAX_CONCURRENT_PLAYLISTS_PER_PEER: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProxyPolicySettings {
@@ -26,13 +30,21 @@ pub(crate) struct ProxyRequestContext {
     capacity: ProxyCapacityPermit,
     #[cfg(test)]
     producer_probe: Option<ProxyProducerProbe>,
+    #[cfg(test)]
+    playlist_body_polls: Arc<AtomicUsize>,
 }
 
 pub(crate) struct ProxyProducerLease {
     cancellation: CancellationToken,
     _capacity: ProxyCapacityPermit,
+    _playlist_capacity: Option<ProxyPlaylistPermit>,
+    playlist_delivery_deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
     producer_probe: Option<ProxyProducerProbe>,
+}
+
+pub(crate) struct ProxyPlaylistPermit {
+    _capacity: ProxyCapacityPermit,
 }
 
 #[cfg(test)]
@@ -50,6 +62,7 @@ struct ProxyProducerProbeState {
 #[cfg(test)]
 struct ProxyProducerProbeSignals {
     outcome: ProxyProducerProbeOutcome,
+    published_chunks: usize,
 }
 
 #[cfg(test)]
@@ -71,6 +84,7 @@ impl ProxyProducerProbe {
             state: Arc::new(ProxyProducerProbeState {
                 signals: Mutex::new(ProxyProducerProbeSignals {
                     outcome: ProxyProducerProbeOutcome::Pending,
+                    published_chunks: 0,
                 }),
                 notify: Notify::new(),
             }),
@@ -129,6 +143,31 @@ impl ProxyProducerProbe {
         self.wait_for(Self::outcome).await
     }
 
+    pub(crate) async fn wait_for_published_chunks(
+        &self,
+        expected: usize,
+    ) -> Result<(), ProxyProducerProbeTerminated> {
+        self.wait_for(|signals| {
+            if signals.published_chunks >= expected {
+                Some(Ok(()))
+            } else if signals.outcome == ProxyProducerProbeOutcome::Terminated {
+                Some(Err(ProxyProducerProbeTerminated))
+            } else {
+                None
+            }
+        })
+        .await
+    }
+
+    pub(crate) fn mark_chunk_published(&self) {
+        self.update(|signals| {
+            signals.published_chunks = signals
+                .published_chunks
+                .checked_add(1)
+                .expect("proxy producer test publication counter overflow");
+        });
+    }
+
     pub(crate) fn mark_full_deadline_armed(&self) {
         self.update(|signals| {
             if signals.outcome == ProxyProducerProbeOutcome::Pending {
@@ -147,10 +186,32 @@ impl ProxyProducerProbe {
 }
 
 impl ProxyRequestContext {
+    #[cfg(test)]
+    pub(crate) fn playlist_body_polls(&self) -> Arc<AtomicUsize> {
+        self.playlist_body_polls.clone()
+    }
+
     pub(crate) fn into_producer_lease(self) -> ProxyProducerLease {
         ProxyProducerLease {
             cancellation: self.cancellation,
             _capacity: self.capacity,
+            _playlist_capacity: None,
+            playlist_delivery_deadline: None,
+            #[cfg(test)]
+            producer_probe: self.producer_probe,
+        }
+    }
+
+    pub(crate) fn into_playlist_producer_lease(
+        self,
+        playlist_capacity: ProxyPlaylistPermit,
+        delivery_deadline: tokio::time::Instant,
+    ) -> ProxyProducerLease {
+        ProxyProducerLease {
+            cancellation: self.cancellation,
+            _capacity: self.capacity,
+            _playlist_capacity: Some(playlist_capacity),
+            playlist_delivery_deadline: Some(delivery_deadline),
             #[cfg(test)]
             producer_probe: self.producer_probe,
         }
@@ -160,6 +221,10 @@ impl ProxyRequestContext {
 impl ProxyProducerLease {
     pub(crate) fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    pub(crate) fn playlist_delivery_deadline(&self) -> Option<tokio::time::Instant> {
+        self.playlist_delivery_deadline
     }
 
     #[cfg(test)]
@@ -202,16 +267,24 @@ impl ProxyCapacity {
     fn try_acquire(
         self: &Arc<Self>,
         peer: Option<IpAddr>,
+        global_limit: usize,
+        peer_limit: usize,
     ) -> Result<ProxyCapacityPermit, ProxyCapacityError> {
-        let peer = normalize_peer(peer);
+        self.try_acquire_normalized(normalize_peer(peer), global_limit, peer_limit)
+    }
+
+    fn try_acquire_normalized(
+        self: &Arc<Self>,
+        peer: ProxyPeer,
+        global_limit: usize,
+        peer_limit: usize,
+    ) -> Result<ProxyCapacityPermit, ProxyCapacityError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let peer_active = state.peers.get(&peer).copied().unwrap_or(0);
-        if state.global >= MAX_CONCURRENT_PROXY_REQUESTS
-            || peer_active >= MAX_CONCURRENT_PROXY_REQUESTS_PER_PEER
-        {
+        if state.global >= global_limit || peer_active >= peer_limit {
             return Err(ProxyCapacityError);
         }
         state.global += 1;
@@ -265,9 +338,12 @@ fn normalize_peer(peer: Option<IpAddr>) -> ProxyPeer {
 pub(crate) struct ProxyRuntime {
     validator: Arc<DestinationValidator>,
     capacity: Arc<ProxyCapacity>,
+    playlist_capacity: Arc<ProxyCapacity>,
     generation: Mutex<ProxyGeneration>,
     #[cfg(test)]
     next_producer_probe: Mutex<Option<ProxyProducerProbe>>,
+    #[cfg(test)]
+    playlist_body_polls: Arc<AtomicUsize>,
 }
 
 impl ProxyRuntime {
@@ -275,12 +351,15 @@ impl ProxyRuntime {
         Self {
             validator,
             capacity: Arc::new(ProxyCapacity::default()),
+            playlist_capacity: Arc::new(ProxyCapacity::default()),
             generation: Mutex::new(ProxyGeneration {
                 settings,
                 cancellation: CancellationToken::new(),
             }),
             #[cfg(test)]
             next_producer_probe: Mutex::new(None),
+            #[cfg(test)]
+            playlist_body_polls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -293,7 +372,11 @@ impl ProxyRuntime {
         &self,
         peer: Option<IpAddr>,
     ) -> Result<ProxyRequestContext, ProxyCapacityError> {
-        let capacity = self.capacity.try_acquire(peer)?;
+        let capacity = self.capacity.try_acquire(
+            peer,
+            MAX_CONCURRENT_PROXY_REQUESTS,
+            MAX_CONCURRENT_PROXY_REQUESTS_PER_PEER,
+        )?;
         let generation = self
             .generation
             .lock()
@@ -310,7 +393,24 @@ impl ProxyRuntime {
             capacity,
             #[cfg(test)]
             producer_probe,
+            #[cfg(test)]
+            playlist_body_polls: self.playlist_body_polls.clone(),
         })
+    }
+
+    pub(crate) fn try_playlist(
+        &self,
+        context: &ProxyRequestContext,
+    ) -> Result<ProxyPlaylistPermit, ProxyCapacityError> {
+        self.playlist_capacity
+            .try_acquire_normalized(
+                context.capacity.peer,
+                MAX_CONCURRENT_PLAYLISTS,
+                MAX_CONCURRENT_PLAYLISTS_PER_PEER,
+            )
+            .map(|capacity| ProxyPlaylistPermit {
+                _capacity: capacity,
+            })
     }
 
     #[cfg(test)]
@@ -336,6 +436,21 @@ impl ProxyRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.global, state.peers.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn playlist_capacity_snapshot(&self) -> (usize, usize) {
+        let state = self
+            .playlist_capacity
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.global, state.peers.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn playlist_body_poll_count(&self) -> usize {
+        self.playlist_body_polls.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn validate(
@@ -574,6 +689,91 @@ mod tests {
             drop(permits);
             assert_eq!(runtime.capacity_snapshot(), (0, 0));
         }
+    }
+
+    #[test]
+    fn playlist_admission_limits_one_peer_to_four_without_blocking_another() {
+        let runtime = runtime(ProxyPolicySettings::default());
+        let first = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 21));
+        let second = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 22));
+        let first_contexts: Vec<_> = (0..5)
+            .map(|_| runtime.try_request_for_peer(Some(first)).unwrap())
+            .collect();
+        let permits: Vec<_> = first_contexts[..4]
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+
+        assert!(runtime.try_playlist(&first_contexts[4]).is_err());
+        let other = runtime.try_request_for_peer(Some(second)).unwrap();
+        assert!(runtime.try_playlist(&other).is_ok());
+
+        drop(permits);
+        assert!(runtime.try_playlist(&first_contexts[4]).is_ok());
+    }
+
+    #[test]
+    fn playlist_admission_limits_global_work_to_eight() {
+        let runtime = runtime(ProxyPolicySettings::default());
+        let contexts: Vec<_> = (1..=9)
+            .map(|host| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, host))))
+                    .unwrap()
+            })
+            .collect();
+        let mut permits: Vec<_> = contexts[..8]
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+
+        assert!(runtime.try_playlist(&contexts[8]).is_err());
+        drop(permits.pop().unwrap());
+        let replacement = runtime.try_playlist(&contexts[8]).unwrap();
+        assert_eq!(runtime.playlist_capacity_snapshot(), (8, 8));
+        drop(replacement);
+        drop(permits);
+        assert!(runtime.try_playlist(&contexts[8]).is_ok());
+    }
+
+    #[test]
+    fn playlist_admission_normalizes_ipv4_mapped_peers() {
+        let runtime = runtime(ProxyPolicySettings::default());
+        let ipv4 = Ipv4Addr::new(203, 0, 113, 31);
+        let contexts: Vec<_> = (0..2)
+            .map(|_| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V4(ipv4)))
+                    .unwrap()
+            })
+            .chain((0..3).map(|_| {
+                runtime
+                    .try_request_for_peer(Some(IpAddr::V6(ipv4.to_ipv6_mapped())))
+                    .unwrap()
+            }))
+            .collect();
+        let permits: Vec<_> = contexts[..4]
+            .iter()
+            .map(|context| runtime.try_playlist(context).unwrap())
+            .collect();
+
+        assert!(runtime.try_playlist(&contexts[4]).is_err());
+        drop(permits);
+        assert!(runtime.try_playlist(&contexts[4]).is_ok());
+    }
+
+    #[test]
+    fn dropping_last_playlist_permits_removes_idle_peer_entries() {
+        let runtime = runtime(ProxyPolicySettings::default());
+
+        for host in 1..=200 {
+            let context = runtime
+                .try_request_for_peer(Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, host))))
+                .unwrap();
+            drop(runtime.try_playlist(&context).unwrap());
+        }
+
+        assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
     }
 
     #[tokio::test]
