@@ -8,6 +8,10 @@ repository = "https://github.com/user/async-rar"
 keywords = ["rar", "unrar", "archive", "async", "ffi"]
 categories = ["compression", "asynchronous"]
 
+[[test]]
+name = "build-support"
+path = "build_support.rs"
+
 [dependencies]
 autocxx = "0.30"
 cxx = "1.0.199"
