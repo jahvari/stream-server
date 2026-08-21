@@ -20,6 +20,9 @@ pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 pub static GLOBAL_STATE: once_cell::sync::Lazy<std::sync::RwLock<Option<AppState>>> =
     once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
 
+#[cfg(test)]
+pub(crate) static TEST_ENGINE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub mod tray;
 
@@ -50,6 +53,7 @@ mod ffmpeg_setup;
 mod local_addon;
 mod network_security;
 mod routes;
+mod safe_file;
 mod settings_control;
 mod ssdp;
 mod state;
@@ -381,11 +385,13 @@ async fn run_inner(
         ..routes::system::ServerSettings::default()
     };
 
-    let settings = AppState::load_settings(&config_dir, &default_settings);
+    let raw_settings = AppState::load_raw_settings(&config_dir, &default_settings);
+    let mut settings = raw_settings.clone();
+    routes::system::apply_proxy_environment_overrides(&mut settings);
     let settings_control = settings_control::SettingsControl::load_or_create(&config_dir)?;
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
     let settings_path = config_dir.join("settings.json");
-    let settings_persistence = Arc::new(tokio::sync::Mutex::new(()));
+    let settings_persistence = Arc::new(state::SettingsPersistenceCoordinator::new(raw_settings));
     let tracker_storage = Arc::new(state::TrackerStorageBridge::new_with_persistence(
         settings_arc.clone(),
         settings_path.clone(),
@@ -620,6 +626,8 @@ async fn run_inner(
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
 
+    let settings_persistence_for_shutdown = state.settings_persistence.clone();
+    let settings_persistence_for_drain = state.settings_persistence.clone();
     let app = build_router(state);
 
     tracing::info!("listening on {}", bound_http_addr);
@@ -650,6 +658,7 @@ async fn run_inner(
             }
         };
 
+        settings_persistence_for_shutdown.close();
         let _ = shutdown_started_tx.send(source);
     };
 
@@ -692,9 +701,11 @@ async fn run_inner(
 
     tokio::pin!(server);
 
+    let mut force_exit_after_drain = false;
+    let mut server_result = Ok(());
     let shutdown_source = tokio::select! {
         result = &mut server => {
-            result?;
+            server_result = result;
             match shutdown_started_rx.try_recv() {
                 Ok(source) => Some(source),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
@@ -704,7 +715,7 @@ async fn run_inner(
         Ok(source) = &mut shutdown_started_rx => {
             match tokio::time::timeout(cfg.graceful_shutdown_timeout, &mut server).await {
                 Ok(result) => {
-                    result?;
+                    server_result = result;
                 }
                 Err(_) => {
                     if cfg.exit_process_on_shutdown_timeout {
@@ -713,14 +724,14 @@ async fn run_inner(
                             timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
                             "Shutdown taking too long, forcing process exit"
                         );
-                        std::process::exit(0);
+                        force_exit_after_drain = true;
+                    } else {
+                        tracing::warn!(
+                            ?source,
+                            timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
+                            "Shutdown taking too long, dropping server future so restart can continue"
+                        );
                     }
-
-                    tracing::warn!(
-                        ?source,
-                        timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
-                        "Shutdown taking too long, dropping server future so restart can continue"
-                    );
                 }
             }
             Some(source)
@@ -731,6 +742,14 @@ async fn run_inner(
         task.abort();
     }
 
+    finish_settings_shutdown(
+        settings_persistence_for_drain,
+        force_exit_after_drain,
+        || std::process::exit(0),
+        server_result,
+    )
+    .await?;
+
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
         if let Ok(mut guard) = GLOBAL_STATE.write() {
@@ -739,6 +758,24 @@ async fn run_inner(
     }
 
     Ok(shutdown_source)
+}
+
+async fn finish_settings_shutdown<F>(
+    settings_persistence: Arc<state::SettingsPersistenceCoordinator>,
+    force_exit: bool,
+    exit_action: F,
+    server_result: std::io::Result<()>,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(),
+{
+    settings_persistence.close();
+    settings_persistence.drain().await;
+    if force_exit {
+        exit_action();
+    }
+    server_result?;
+    Ok(())
 }
 
 async fn maybe_ctrl_c(enabled: bool) {
@@ -930,4 +967,70 @@ async fn root_redirect(State(state): State<AppState>) -> Redirect {
         "https://web.stremio.com/#/?streamingServer={}",
         encoded_url
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn forced_exit_waits_for_admitted_settings_transactions_to_drain() {
+        let coordinator = Arc::new(state::SettingsPersistenceCoordinator::new(
+            routes::system::ServerSettings::default(),
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let admitted = coordinator
+            .register_transaction(async move {
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .unwrap();
+        coordinator.close();
+        let exit_called = Arc::new(AtomicBool::new(false));
+        let observed = exit_called.clone();
+        let drain = finish_settings_shutdown(
+            coordinator,
+            true,
+            move || {
+                observed.store(true, Ordering::Release);
+            },
+            Ok(()),
+        );
+        tokio::pin!(drain);
+
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        assert!(!exit_called.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        drain.await.unwrap();
+        admitted.await.unwrap().unwrap();
+        assert!(exit_called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn server_error_is_returned_only_after_settings_transactions_drain() {
+        let coordinator = Arc::new(state::SettingsPersistenceCoordinator::new(
+            routes::system::ServerSettings::default(),
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let completion = coordinator
+            .register_transaction(async move {
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .unwrap();
+        let finish = finish_settings_shutdown(
+            coordinator,
+            false,
+            || {},
+            Err(std::io::Error::other("injected server failure")),
+        );
+        tokio::pin!(finish);
+
+        assert!(futures_util::poll!(&mut finish).is_pending());
+        release_tx.send(()).unwrap();
+        let error = finish.await.unwrap_err();
+        completion.await.unwrap().unwrap();
+        assert_eq!(error.to_string(), "injected server failure");
+    }
 }

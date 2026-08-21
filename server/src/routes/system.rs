@@ -290,28 +290,65 @@ fn parse_environment_bool(value: &str) -> Option<bool> {
     }
 }
 
-pub(crate) fn apply_proxy_environment_overrides(settings: &mut ServerSettings) {
-    for (name, target) in [
-        (
-            "STREMIO_ALLOW_PRIVATE_NETWORK_SOURCES",
-            &mut settings.allow_private_network_sources,
-        ),
-        (
-            "STREMIO_ALLOW_INVALID_PROXY_TLS_CERTIFICATES",
-            &mut settings.allow_invalid_proxy_tls_certificates,
-        ),
-    ] {
-        if let Ok(value) = std::env::var(name) {
-            if let Some(value) = parse_environment_bool(&value) {
-                *target = value;
-            } else {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProxyEnvironmentOverrides {
+    pub(crate) allow_private_network_sources: Option<bool>,
+    pub(crate) allow_invalid_proxy_tls_certificates: Option<bool>,
+}
+
+impl ProxyEnvironmentOverrides {
+    pub(crate) fn apply_to(self, settings: &mut ServerSettings) {
+        if let Some(value) = self.allow_private_network_sources {
+            settings.allow_private_network_sources = value;
+        }
+        if let Some(value) = self.allow_invalid_proxy_tls_certificates {
+            settings.allow_invalid_proxy_tls_certificates = value;
+        }
+    }
+
+    fn from_environment() -> Self {
+        Self::from_reader(
+            |name| std::env::var(name),
+            |name| {
                 tracing::warn!(
                     variable = name,
                     "ignoring invalid boolean environment override"
                 );
+            },
+        )
+    }
+
+    fn from_reader<R, W>(mut read: R, mut warn_invalid: W) -> Self
+    where
+        R: FnMut(&str) -> Result<String, std::env::VarError>,
+        W: FnMut(&str),
+    {
+        let mut overrides = Self::default();
+        for (name, target) in [
+            (
+                "STREMIO_ALLOW_PRIVATE_NETWORK_SOURCES",
+                &mut overrides.allow_private_network_sources,
+            ),
+            (
+                "STREMIO_ALLOW_INVALID_PROXY_TLS_CERTIFICATES",
+                &mut overrides.allow_invalid_proxy_tls_certificates,
+            ),
+        ] {
+            match read(name) {
+                Ok(value) => match parse_environment_bool(&value) {
+                    Some(value) => *target = Some(value),
+                    None => warn_invalid(name),
+                },
+                Err(std::env::VarError::NotPresent) => {}
+                Err(std::env::VarError::NotUnicode(_)) => warn_invalid(name),
             }
         }
+        overrides
     }
+}
+
+pub(crate) fn apply_proxy_environment_overrides(settings: &mut ServerSettings) {
+    ProxyEnvironmentOverrides::from_environment().apply_to(settings);
 }
 
 fn parse_torrent_encryption_mode(value: &Value) -> Option<TorrentEncryptionMode> {
@@ -476,6 +513,31 @@ impl Default for ServerSettings {
 
 pub(crate) struct PreparedSettingsUpdate {
     pub(crate) next: ServerSettings,
+    allow_private_network_sources_changed: bool,
+    allow_invalid_proxy_tls_certificates_changed: bool,
+}
+
+impl PreparedSettingsUpdate {
+    fn disk_candidate(&self, live: &ServerSettings, raw: &ServerSettings) -> ServerSettings {
+        let mut disk = live.clone();
+        if !self.allow_private_network_sources_changed {
+            disk.allow_private_network_sources = raw.allow_private_network_sources;
+        }
+        if !self.allow_invalid_proxy_tls_certificates_changed {
+            disk.allow_invalid_proxy_tls_certificates = raw.allow_invalid_proxy_tls_certificates;
+        }
+        disk
+    }
+}
+
+pub(crate) fn preserve_raw_protected_settings(
+    live: &ServerSettings,
+    raw: &ServerSettings,
+) -> ServerSettings {
+    let mut disk = live.clone();
+    disk.allow_private_network_sources = raw.allow_private_network_sources;
+    disk.allow_invalid_proxy_tls_certificates = raw.allow_invalid_proxy_tls_certificates;
+    disk
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -497,16 +559,20 @@ fn prepare_settings_update(
         .as_object()
         .ok_or(SettingsUpdateError::Invalid("expected a JSON object"))?;
     let mut next = current.clone();
-    for (key, current_value, target) in [
+    let mut allow_private_network_sources_changed = false;
+    let mut allow_invalid_proxy_tls_certificates_changed = false;
+    for (key, current_value, target, changed) in [
         (
             "allowPrivateNetworkSources",
             current.allow_private_network_sources,
             &mut next.allow_private_network_sources,
+            &mut allow_private_network_sources_changed,
         ),
         (
             "allowInvalidProxyTlsCertificates",
             current.allow_invalid_proxy_tls_certificates,
             &mut next.allow_invalid_proxy_tls_certificates,
+            &mut allow_invalid_proxy_tls_certificates_changed,
         ),
     ] {
         if let Some(value) = object.get(key) {
@@ -516,11 +582,16 @@ fn prepare_settings_update(
             if value != current_value && authority == SettingsMutationAuthority::Untrusted {
                 return Err(SettingsUpdateError::Forbidden);
             }
+            *changed = value != current_value;
             *target = value;
         }
     }
 
-    Ok(PreparedSettingsUpdate { next })
+    Ok(PreparedSettingsUpdate {
+        next,
+        allow_private_network_sources_changed,
+        allow_invalid_proxy_tls_certificates_changed,
+    })
 }
 
 /// Returns server settings in the SettingsResponse format expected by stremio-core
@@ -534,10 +605,52 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+#[cfg(not(test))]
 pub(crate) async fn persist_settings_atomic(
     path: &std::path::Path,
     settings: &ServerSettings,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SettingsPersistenceOutcome> {
+    persist_settings_atomic_with_after_rename(path, settings, async {}).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsPersistenceOutcome {
+    Durable,
+    CommittedWithDurabilityWarning,
+}
+
+#[cfg(not(test))]
+pub(crate) async fn persist_settings_atomic_with_after_rename<F>(
+    path: &std::path::Path,
+    settings: &ServerSettings,
+    after_rename: F,
+) -> anyhow::Result<SettingsPersistenceOutcome>
+where
+    F: std::future::Future<Output = ()>,
+{
+    persist_settings_atomic_with_hooks(path, settings, after_rename, sync_settings_parent).await
+}
+
+#[cfg(not(test))]
+async fn sync_settings_parent(parent: std::path::PathBuf) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+pub(crate) async fn persist_settings_atomic_with_hooks<F, S, SF>(
+    path: &std::path::Path,
+    settings: &ServerSettings,
+    after_rename: F,
+    sync_parent: S,
+) -> anyhow::Result<SettingsPersistenceOutcome>
+where
+    F: std::future::Future<Output = ()>,
+    S: FnOnce(std::path::PathBuf) -> SF,
+    SF: std::future::Future<Output = anyhow::Result<()>>,
+{
     let bytes = serde_json::to_vec_pretty(settings)?;
     let path = path.to_owned();
     let parent = path
@@ -545,6 +658,7 @@ pub(crate) async fn persist_settings_atomic(
         .ok_or_else(|| anyhow::anyhow!("settings path has no parent"))?
         .to_owned();
     tokio::fs::create_dir_all(&parent).await?;
+    let parent_to_sync = parent.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         use std::io::Write;
         let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
@@ -552,12 +666,17 @@ pub(crate) async fn persist_settings_atomic(
         temporary.flush()?;
         temporary.as_file().sync_all()?;
         temporary.persist(&path).map_err(|error| error.error)?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })
     .await??;
-    Ok(())
+    after_rename.await;
+    match sync_parent(parent_to_sync).await {
+        Ok(()) => Ok(SettingsPersistenceOutcome::Durable),
+        Err(_) => {
+            tracing::warn!("settings persistence durability warning");
+            Ok(SettingsPersistenceOutcome::CommittedWithDurabilityWarning)
+        }
+    }
 }
 
 pub async fn update_settings(
@@ -565,7 +684,7 @@ pub async fn update_settings(
     payload: &Value,
     authority: SettingsMutationAuthority,
 ) -> Result<(), SettingsUpdateError> {
-    let _persistence = state.settings_persistence.lock().await;
+    let mut raw = state.settings_persistence.lock_owned().await;
     let current = state.settings.read().await.clone();
     let protected = prepare_settings_update(&current, payload, authority)?;
     let mut settings = current;
@@ -780,29 +899,60 @@ pub async fn update_settings(
         allow_private_network_sources: settings.allow_private_network_sources,
         allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
     };
-    persist_settings_atomic(&state.settings_path, &settings)
-        .await
-        .map_err(SettingsUpdateError::Persistence)?;
-    let mut published = state.settings.write().await;
-    state.proxy_runtime.begin_reconfigure(proxy_policy);
-    *published = settings;
-    state.proxy_runtime.finish_reconfigure(proxy_policy);
-    drop(published);
+    let disk = protected.disk_candidate(&settings, &raw);
+    let transaction_state = state.clone();
+    let persistence = state.settings_persistence.clone();
+    #[cfg(test)]
+    let before_final_side_effect = state
+        .settings_persistence
+        .take_before_final_side_effect_gate();
+    let completion = state
+        .settings_persistence
+        .register_transaction(async move {
+            persistence
+                .persist_settings(&transaction_state.settings_path, &disk)
+                .await?;
+            *raw = disk;
+            let mut published = transaction_state.settings.write().await;
+            transaction_state
+                .proxy_runtime
+                .begin_reconfigure(proxy_policy);
+            *published = settings;
+            transaction_state
+                .proxy_runtime
+                .finish_reconfigure(proxy_policy);
+            drop(published);
 
-    // Apply updated torrent session settings dynamically.
-    state
-        .engine
-        .update_torrent_settings(&new_profile, &new_privacy)
-        .await;
-    state
-        .download_engine
-        .update_torrent_settings(&new_profile, &new_privacy)
-        .await;
+            transaction_state
+                .engine
+                .update_torrent_settings(&new_profile, &new_privacy)
+                .await;
+            transaction_state
+                .download_engine
+                .update_torrent_settings(&new_profile, &new_privacy)
+                .await;
 
-    state.engine.set_seeding_enabled(seeding_enabled);
-    state.download_engine.set_seeding_enabled(seeding_enabled);
+            transaction_state
+                .engine
+                .set_seeding_enabled(seeding_enabled);
+            #[cfg(test)]
+            if let Some(gate) = before_final_side_effect {
+                gate.reach_and_wait().await;
+            }
+            transaction_state
+                .download_engine
+                .set_seeding_enabled(seeding_enabled);
+            Ok(())
+        })
+        .map_err(|error| SettingsUpdateError::Persistence(error.into()))?;
 
-    Ok(())
+    match completion.await {
+        Ok(result) => result.map_err(SettingsUpdateError::Persistence),
+        Err(error) => {
+            tracing::error!("settings transaction failed");
+            Err(SettingsUpdateError::Persistence(error.into()))
+        }
+    }
 }
 
 pub async fn set_settings(
@@ -827,17 +977,14 @@ pub async fn set_settings(
             Json(json!({"success": false, "error": "invalid settings payload"})),
         )
             .into_response(),
-        Err(SettingsUpdateError::Persistence(_)) => {
-            tracing::error!("settings persistence failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "error": "settings could not be saved"
-                })),
-            )
-                .into_response()
-        }
+        Err(SettingsUpdateError::Persistence(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "error": "settings could not be saved"
+            })),
+        )
+            .into_response(),
     }
 }
 pub async fn get_device_info() -> impl IntoResponse {
@@ -1248,6 +1395,53 @@ mod tests {
     }
 
     #[test]
+    fn same_effective_protected_values_do_not_overwrite_raw_settings() {
+        for (raw_value, effective_value) in [(false, true), (true, false)] {
+            for authority in [
+                SettingsMutationAuthority::Untrusted,
+                SettingsMutationAuthority::TrustedLocal,
+                SettingsMutationAuthority::HttpAuthorized,
+            ] {
+                for field in [
+                    "allowPrivateNetworkSources",
+                    "allowInvalidProxyTlsCertificates",
+                ] {
+                    let raw = ServerSettings {
+                        allow_private_network_sources: raw_value,
+                        allow_invalid_proxy_tls_certificates: raw_value,
+                        ..ServerSettings::default()
+                    };
+                    let mut effective = raw.clone();
+                    effective.allow_private_network_sources = effective_value;
+                    effective.allow_invalid_proxy_tls_certificates = effective_value;
+                    let payload = json!({field: effective_value});
+                    let prepared =
+                        prepare_settings_update(&effective, &payload, authority).unwrap();
+                    let mut live = prepared.next.clone();
+                    live.cache_size = 321.0;
+
+                    let disk = prepared.disk_candidate(&live, &raw);
+
+                    assert_eq!(disk.allow_private_network_sources, raw_value, "{field}");
+                    assert_eq!(
+                        disk.allow_invalid_proxy_tls_certificates, raw_value,
+                        "{field}"
+                    );
+                    assert_eq!(disk.cache_size, 321.0, "{field}");
+                    assert_eq!(
+                        prepared.next.allow_private_network_sources, effective_value,
+                        "{field}"
+                    );
+                    assert_eq!(
+                        prepared.next.allow_invalid_proxy_tls_certificates, effective_value,
+                        "{field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_boolean_protected_values_are_invalid_even_when_falsey() {
         let current = ServerSettings::default();
         for payload in [
@@ -1277,5 +1471,89 @@ mod tests {
         for value in ["", " true ", "enabled", "2"] {
             assert_eq!(parse_environment_bool(value), None, "{value}");
         }
+    }
+
+    #[test]
+    fn pure_environment_overrides_apply_in_both_directions_and_win_on_restart() {
+        for (raw_value, override_value) in [(false, true), (true, false)] {
+            let raw = ServerSettings {
+                allow_private_network_sources: raw_value,
+                allow_invalid_proxy_tls_certificates: raw_value,
+                ..ServerSettings::default()
+            };
+            let overrides = ProxyEnvironmentOverrides {
+                allow_private_network_sources: Some(override_value),
+                allow_invalid_proxy_tls_certificates: Some(override_value),
+            };
+
+            let mut effective = raw.clone();
+            overrides.apply_to(&mut effective);
+
+            assert_eq!(effective.allow_private_network_sources, override_value);
+            assert_eq!(
+                effective.allow_invalid_proxy_tls_certificates,
+                override_value
+            );
+            assert_eq!(raw.allow_private_network_sources, raw_value);
+            assert_eq!(raw.allow_invalid_proxy_tls_certificates, raw_value);
+
+            let mut restarted = raw;
+            overrides.apply_to(&mut restarted);
+            assert_eq!(restarted.allow_private_network_sources, override_value);
+            assert_eq!(
+                restarted.allow_invalid_proxy_tls_certificates,
+                override_value
+            );
+        }
+    }
+
+    #[test]
+    fn environment_reader_reports_invalid_unicode_by_name_without_value() {
+        let mut warnings = Vec::new();
+        let overrides = ProxyEnvironmentOverrides::from_reader(
+            |_| {
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "secret-environment-bytes",
+                )))
+            },
+            |name| warnings.push(name.to_string()),
+        );
+
+        assert_eq!(overrides, ProxyEnvironmentOverrides::default());
+        assert_eq!(
+            warnings,
+            [
+                "STREMIO_ALLOW_PRIVATE_NETWORK_SOURCES",
+                "STREMIO_ALLOW_INVALID_PROXY_TLS_CERTIFICATES",
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("secret-environment-bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_commit_survives_a_parent_directory_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let candidate = ServerSettings {
+            cache_size: 654.0,
+            ..ServerSettings::default()
+        };
+
+        let outcome = persist_settings_atomic_with_hooks(&path, &candidate, async {}, |_| async {
+            Err(anyhow::anyhow!("injected parent sync failure"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            SettingsPersistenceOutcome::CommittedWithDurabilityWarning
+        );
+        let disk: ServerSettings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(disk.cache_size, 654.0);
     }
 }

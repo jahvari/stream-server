@@ -45,10 +45,22 @@ Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11470/settings' -Headers $
 Remove-Variable settingsToken, headers, body
 ```
 
-On Linux or macOS with `curl`:
+On Linux with `curl`:
 
 ```sh
 token_file="${XDG_CONFIG_HOME:-$HOME/.config}/stremio-server/settings-control.token"
+settings_token="$(tr -d '\r\n' < "$token_file")"
+curl --fail-with-body --request POST 'http://127.0.0.1:11470/settings' \
+  --header "x-stream-server-settings-token: ${settings_token}" \
+  --header 'content-type: application/json' \
+  --data '{"allowPrivateNetworkSources":true,"allowInvalidProxyTlsCertificates":false}'
+unset settings_token
+```
+
+On macOS with `curl` (the quoted path normally contains a space):
+
+```sh
+token_file="$HOME/Library/Application Support/stremio-server/settings-control.token"
 settings_token="$(tr -d '\r\n' < "$token_file")"
 curl --fail-with-body --request POST 'http://127.0.0.1:11470/settings' \
   --header "x-stream-server-settings-token: ${settings_token}" \
@@ -80,7 +92,9 @@ environment variables:
 Accepted values are `1`, `true`, `yes`, or `on`, and `0`, `false`, `no`, or `off`, without leading
 or trailing whitespace and case-insensitively. Environment values override the persisted file at
 startup. A runtime GUI/API change can affect the current process, but the environment value wins
-again after the next restart.
+again after the next restart. Environment-only values are not copied into `settings.json` by
+ordinary settings changes, tracker-cache updates, or background saves; removing the environment
+variable therefore restores the persisted value on the next restart.
 
 ## Destination policy
 

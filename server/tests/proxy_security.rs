@@ -6,7 +6,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use serde_json::json;
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, io::Read, time::Duration};
 
 async fn range(headers: HeaderMap) -> Response<Body> {
     let bytes = b"0123456789";
@@ -346,6 +346,9 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
     assert_eq!(settings["values"]["allowPrivateNetworkSources"], false);
     assert!(!settings.to_string().contains(&token));
 
+    let log_dir = config_dir.join("logs");
+    std::fs::write(log_dir.join("proof.dmp"), token.as_bytes())?;
+    std::fs::write(log_dir.join("proof.log"), b"diagnostics-log-sentinel")?;
     let diagnostics = tokio::time::timeout(
         Duration::from_secs(5),
         client.get(format!("{base}/diagnostics/export")).send(),
@@ -354,11 +357,23 @@ async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> any
     .error_for_status()?
     .bytes()
     .await?;
-    assert!(
-        !diagnostics
-            .windows(token.len())
-            .any(|bytes| bytes == token.as_bytes())
-    );
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(diagnostics))?;
+    let mut saw_log_sentinel = false;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        assert_ne!(entry.name(), "logs/proof.dmp");
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        assert!(
+            !bytes
+                .windows(token.len())
+                .any(|part| part == token.as_bytes())
+        );
+        saw_log_sentinel |= bytes
+            .windows(b"diagnostics-log-sentinel".len())
+            .any(|part| part == b"diagnostics-log-sentinel");
+    }
+    assert!(saw_log_sentinel);
 
     fixture_task.abort();
     let _ = fixture_task.await;

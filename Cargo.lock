@@ -7842,6 +7842,7 @@ dependencies = [
  "image",
  "ipnet",
  "jni 0.22.4",
+ "libc",
  "librqbit",
  "lz-str",
  "mimalloc",

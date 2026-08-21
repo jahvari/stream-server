@@ -21,6 +21,8 @@ use sysinfo::{Pid, System};
 
 use crate::state::AppState;
 
+const MAX_DIAGNOSTICS_LOG_FILE_LENGTH: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 struct LocalOnly;
 
@@ -477,23 +479,52 @@ pub(crate) fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<S
 }
 
 pub(crate) fn build_diagnostics_zip(state: &AppState) -> anyhow::Result<Vec<u8>> {
+    build_diagnostics_zip_with_log_hook(state, |_| {})
+}
+
+fn build_diagnostics_zip_with_log_hook<F>(
+    state: &AppState,
+    mut after_log_open: F,
+) -> anyhow::Result<Vec<u8>>
+where
+    F: FnMut(&Path),
+{
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    for info in recent_log_files(&state.log_dir, 20) {
-        let path = PathBuf::from(&info.path);
-        if !path.is_file() {
-            continue;
+    let mut exported_logs = 0usize;
+    for info in recent_log_files(&state.log_dir, usize::MAX)
+        .into_iter()
+        .filter(|info| {
+            matches!(
+                Path::new(&info.path)
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("log" | "jsonl")
+            )
+        })
+    {
+        if exported_logs == 20 {
+            break;
         }
+        let path = PathBuf::from(&info.path);
+        let Ok(bytes) = crate::safe_file::read_regular_file_no_follow(
+            &path,
+            MAX_DIAGNOSTICS_LOG_FILE_LENGTH,
+            None,
+            || after_log_open(&path),
+        ) else {
+            continue;
+        };
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "log".to_string());
         zip.start_file(format!("logs/{name}"), options)?;
-        let bytes = std::fs::read(&path)?;
         zip.write_all(&bytes)?;
+        exported_logs += 1;
     }
 
     if let Ok(settings) = std::fs::read_to_string(&state.settings_path) {
@@ -569,4 +600,103 @@ fn modified_unix_secs(metadata: &std::fs::Metadata) -> Option<u64> {
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enginefs::EngineFS;
+    use std::{io::Read, sync::Arc};
+
+    #[tokio::test]
+    async fn diagnostics_export_excludes_opaque_dump_files_and_scans_decompressed_bytes() {
+        let _engine_test_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log_dir = temp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let token = "a".repeat(64);
+        std::fs::write(log_dir.join("proof.dmp"), token.as_bytes()).unwrap();
+        let server_log_path = log_dir.join("server.log");
+        std::fs::write(&server_log_path, b"safe-log-sentinel").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&server_log_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        for index in 0..21 {
+            let path = log_dir.join(format!("newer-{index}.dmp"));
+            std::fs::write(&path, b"opaque").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+        }
+        for index in 0..21 {
+            std::fs::create_dir(log_dir.join(format!("invalid-{index}.log"))).unwrap();
+        }
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let state = AppState::new_with_shared_settings_and_log_dir(
+            engine,
+            Arc::new(tokio::sync::RwLock::new(
+                crate::routes::system::ServerSettings::default(),
+            )),
+            temp.path().join("config"),
+            log_dir,
+        );
+
+        let bytes = build_diagnostics_zip(&state).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_string();
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
+            entries.push((name, body));
+        }
+
+        assert!(entries.iter().any(|(name, body)| {
+            name == "logs/server.log" && body.windows(17).any(|part| part == b"safe-log-sentinel")
+        }));
+        assert!(entries.iter().all(|(name, body)| {
+            name != "logs/proof.dmp"
+                && !body
+                    .windows(token.len())
+                    .any(|part| part == token.as_bytes())
+        }));
+
+        let server_log = state.log_dir.join("server.log");
+        let moved_log = state.log_dir.join("server-opened.log");
+        let replacement = state.log_dir.join("replacement.log");
+        std::fs::write(&server_log, b"opened-handle-sentinel").unwrap();
+        std::fs::write(&replacement, b"replacement-path-sentinel").unwrap();
+        let bytes = build_diagnostics_zip_with_log_hook(&state, |opened| {
+            if opened == server_log {
+                std::fs::rename(&server_log, &moved_log).unwrap();
+                std::fs::rename(&replacement, &server_log).unwrap();
+            }
+        })
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut archived_server_log = Vec::new();
+        archive
+            .by_name("logs/server.log")
+            .unwrap()
+            .read_to_end(&mut archived_server_log)
+            .unwrap();
+        assert_eq!(archived_server_log, b"opened-handle-sentinel");
+    }
 }

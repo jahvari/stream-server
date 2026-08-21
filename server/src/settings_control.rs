@@ -29,11 +29,48 @@ pub(crate) enum SettingsMutationAuthority {
 
 impl SettingsControl {
     pub(crate) fn load_or_create(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_create_with(config_dir, create_token_file)
+    }
+
+    fn load_or_create_with<F>(config_dir: &Path, create: F) -> anyhow::Result<Self>
+    where
+        F: FnOnce(&Path) -> io::Result<[u8; TOKEN_LENGTH]>,
+    {
+        Self::load_or_create_with_hooks(config_dir, create, || {})
+    }
+
+    fn load_or_create_with_hooks<F, H>(
+        config_dir: &Path,
+        create: F,
+        before_existing_load: H,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(&Path) -> io::Result<[u8; TOKEN_LENGTH]>,
+        H: FnOnce(),
+    {
         fs::create_dir_all(config_dir).with_context(|| {
             format!("failed to create config directory {}", config_dir.display())
         })?;
         let path = config_dir.join(TOKEN_FILE_NAME);
-        match create_token_file(&path) {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                before_existing_load();
+                let token = load_token_file(&path)?;
+                return Ok(Self {
+                    token: Arc::new(token),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect settings control token {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+        match create(&path) {
             Ok(token) => Ok(Self {
                 token: Arc::new(token),
             }),
@@ -126,33 +163,23 @@ fn create_token_file(path: &Path) -> io::Result<[u8; TOKEN_LENGTH]> {
 }
 
 fn load_token_file(path: &Path) -> anyhow::Result<[u8; TOKEN_LENGTH]> {
-    validate_token_metadata(path)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_TOKEN_FILE_LENGTH {
-        bail!("settings control token file is oversized");
-    }
-    let bytes = fs::read(path)?;
-    parse_token_bytes(&bytes)
+    load_token_file_with_after_open(path, || {})
 }
 
-fn validate_token_metadata(path: &Path) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed to inspect settings control token {}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        bail!("settings control token must be a regular non-symlink file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("settings control token permissions must be 0600");
-        }
-    }
-    Ok(())
+fn load_token_file_with_after_open<F>(
+    path: &Path,
+    after_open: F,
+) -> anyhow::Result<[u8; TOKEN_LENGTH]>
+where
+    F: FnOnce(),
+{
+    let bytes = crate::safe_file::read_regular_file_no_follow(
+        path,
+        MAX_TOKEN_FILE_LENGTH,
+        Some(0o600),
+        after_open,
+    )?;
+    parse_token_bytes(&bytes)
 }
 
 fn parse_token_bytes(bytes: &[u8]) -> anyhow::Result<[u8; TOKEN_LENGTH]> {
@@ -281,6 +308,63 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_valid_token_is_loaded_without_attempting_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings-control.token");
+        fs::write(&path, [b'a'; 64]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let creation_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = creation_attempted.clone();
+
+        let control = SettingsControl::load_or_create_with(temp.path(), move |_| {
+            observed.store(true, std::sync::atomic::Ordering::Release);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "creation must not be attempted",
+            ))
+        })
+        .unwrap();
+
+        assert!(!creation_attempted.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            control.authorize_http(
+                "127.0.0.1:40000".parse().unwrap(),
+                &headers_with(&[b'a'; 64]),
+            ),
+            SettingsMutationAuthority::HttpAuthorized
+        );
+    }
+
+    #[test]
+    fn token_bytes_are_read_from_the_validated_handle_after_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings-control.token");
+        let replacement = temp.path().join("replacement.token");
+        let original_moved = temp.path().join("original.token");
+        fs::write(&path, [b'a'; 64]).unwrap();
+        fs::write(&replacement, [b'b'; 64]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let token = super::load_token_file_with_after_open(&path, || {
+            fs::rename(&path, &original_moved).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(token, [b'a'; 64]);
+        assert_eq!(fs::read(path).unwrap(), [b'b'; 64]);
+    }
+
+    #[test]
     fn concurrent_token_creation_observes_only_a_complete_winner() {
         let temp = tempfile::tempdir().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
@@ -322,5 +406,107 @@ mod tests {
         fs::write(&path, b"not-a-token").unwrap();
         assert!(SettingsControl::load_or_create(temp.path()).is_err());
         assert_eq!(fs::read(path).unwrap(), b"not-a-token");
+    }
+
+    #[test]
+    fn oversized_token_is_rejected_without_truncation_or_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings-control.token");
+        let oversized = vec![b'a'; super::MAX_TOKEN_FILE_LENGTH as usize + 1];
+        fs::write(&path, &oversized).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(SettingsControl::load_or_create(temp.path()).is_err());
+        assert_eq!(fs::read(path).unwrap(), oversized);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_token_symlinks_fifos_and_broad_permissions_are_rejected() {
+        use std::os::{unix::ffi::OsStrExt, unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.token");
+        fs::write(&target, [b'a'; 64]).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let path = temp.path().join("settings-control.token");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(SettingsControl::load_or_create(temp.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), [b'a'; 64]);
+
+        fs::remove_file(&path).unwrap();
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        assert!(SettingsControl::load_or_create(temp.path()).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, [b'a'; 64]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(SettingsControl::load_or_create(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_existing_token_preopen_swaps_cannot_follow_symlinks_or_block_on_fifos() {
+        use std::os::{unix::ffi::OsStrExt, unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings-control.token");
+        let target = temp.path().join("target.token");
+        fs::write(&path, [b'a'; 64]).unwrap();
+        fs::write(&target, [b'b'; 64]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let path_for_swap = path.clone();
+        let target_for_swap = target.clone();
+        assert!(
+            SettingsControl::load_or_create_with_hooks(
+                temp.path(),
+                |_| panic!("existing token must not create"),
+                move || {
+                    fs::remove_file(&path_for_swap).unwrap();
+                    std::os::unix::fs::symlink(&target_for_swap, &path_for_swap).unwrap();
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), [b'b'; 64]);
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, [b'a'; 64]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let path_for_swap = path.clone();
+        assert!(
+            SettingsControl::load_or_create_with_hooks(
+                temp.path(),
+                |_| panic!("existing token must not create"),
+                move || {
+                    fs::remove_file(&path_for_swap).unwrap();
+                    let bytes =
+                        std::ffi::CString::new(path_for_swap.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(bytes.as_ptr(), 0o600) }, 0);
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_token_reloads_from_a_nonwritable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings-control.token");
+        fs::write(&path, [b'a'; 64]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = SettingsControl::load_or_create(temp.path());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_ok());
     }
 }
