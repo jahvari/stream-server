@@ -74,6 +74,7 @@ struct FetchedProxyResponse {
     final_url: Url,
     effective_custom_request_headers: HeaderMap,
     effective_response_headers: HeaderMap,
+    credential_bearing: bool,
 }
 
 #[cfg(test)]
@@ -271,8 +272,8 @@ fn validate_proxy_target(mut target: Url) -> Result<Url, ProxyError> {
 
 fn parse_custom_header(value: &str) -> Result<(HeaderName, HeaderValue), ProxyError> {
     let (name, value) = value.split_once(':').ok_or(ProxyError::InvalidRequest)?;
-    let name = name.trim();
-    let value = value.trim();
+    let name = name.trim_matches(|character| matches!(character, ' ' | '\t'));
+    let value = value.trim_matches(|character| matches!(character, ' ' | '\t'));
     if name.is_empty()
         || !name
             .bytes()
@@ -371,8 +372,12 @@ async fn fetch_with_redirects(
         }
     }
     let mut redirects = 0usize;
+    let mut credential_bearing = false;
     loop {
         let destination = runtime.validate(context, &target).await?;
+        credential_bearing |= !destination.url.username().is_empty()
+            || destination.url.password().is_some()
+            || !custom_headers.is_empty();
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -408,6 +413,7 @@ async fn fetch_with_redirects(
                 final_url: destination.url,
                 effective_custom_request_headers: custom_headers,
                 effective_response_headers: request.response_headers.clone(),
+                credential_bearing,
             });
         }
         if redirects >= 5 {
@@ -544,9 +550,6 @@ async fn handle_proxy_suffix_for_peer(
         Ok(request) => request,
         Err(error) => return proxy_error_response(error),
     };
-    let credential_bearing = !request.target.username().is_empty()
-        || request.target.password().is_some()
-        || !request.request_headers.is_empty();
     let request_method = method.clone();
     let fetched = match fetch_with_redirects(runtime, &context, &request, method, &headers).await {
         Ok(response) => response,
@@ -557,6 +560,7 @@ async fn handle_proxy_suffix_for_peer(
         final_url,
         effective_custom_request_headers,
         effective_response_headers,
+        credential_bearing,
     } = fetched;
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -1584,14 +1588,25 @@ fn rewrite_playlist_with_options(
     output
         .try_reserve_exact(body.len().min(MAX_PLAYLIST_OUTPUT))
         .map_err(|_| ProxyError::Upstream)?;
-    for line_with_ending in body.split_inclusive('\n') {
-        let (line, ending) = if let Some(line) = line_with_ending.strip_suffix("\r\n") {
-            (line, "\r\n")
-        } else if let Some(line) = line_with_ending.strip_suffix('\n') {
-            (line, "\n")
+    let bytes = body.as_bytes();
+    let mut position = 0usize;
+    while position < body.len() {
+        let ending_start = bytes[position..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+            .map_or(body.len(), |offset| position + offset);
+        let ending_end = if ending_start == body.len() {
+            ending_start
+        } else if bytes
+            .get(ending_start + 1)
+            .is_some_and(|next| *next != bytes[ending_start] && matches!(next, b'\r' | b'\n'))
+        {
+            ending_start + 2
         } else {
-            (line_with_ending, "")
+            ending_start + 1
         };
+        let line = &body[position..ending_start];
+        let ending = &body[ending_start..ending_end];
 
         if line.starts_with("#EXT") {
             rewrite_playlist_tag(
@@ -1613,6 +1628,7 @@ fn rewrite_playlist_with_options(
             )?;
         }
         push_playlist(&mut output, ending)?;
+        position = ending_end;
     }
     if body.is_empty() {
         return Ok(String::new());
@@ -2334,6 +2350,39 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.target.as_str(), "https://example.com/%2F");
         assert_eq!(parsed.request_headers["x-test"], "a&b=c+d e");
+    }
+
+    #[test]
+    fn parse_custom_headers_reject_boundary_line_and_control_bytes() {
+        for encoded_control in ["%0D", "%0A", "%0B", "%0C"] {
+            for encoded_header in [
+                format!("{encoded_control}X-Test%3Avalue"),
+                format!("X-Test%3Avalue{encoded_control}"),
+            ] {
+                let query = format!("d=https%3A%2F%2Fexample.com&h={encoded_header}");
+                assert!(
+                    matches!(
+                        parse_proxy_request("", Some(&query)),
+                        Err(ProxyError::InvalidRequest)
+                    ),
+                    "accepted boundary control in {encoded_header:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_custom_headers_trim_sp_and_htab_only() {
+        let parsed = parse_proxy_request(
+            "",
+            Some(concat!(
+                "d=https%3A%2F%2Fexample.com",
+                "&h=%20%09X-Test%09%20%3A%09%20value%20%09",
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.request_headers["x-test"], "value");
     }
 
     #[test]
@@ -4223,6 +4272,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_introduced_url_credentials_force_no_store_after_later_redirect_removes_them()
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let credential_location = format!(
+            "http://user:secret@cache.test:{}/credential-hop",
+            address.port()
+        );
+        let final_location = format!("http://cache.test:{}/final", address.port());
+        let (authorization_tx, authorization_rx) = tokio::sync::oneshot::channel();
+        let authorization_tx = Arc::new(std::sync::Mutex::new(Some(authorization_tx)));
+        let router = Router::new()
+            .route(
+                "/start",
+                get(move || {
+                    let credential_location = credential_location.clone();
+                    async move {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, credential_location)],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/credential-hop",
+                get(move |headers: HeaderMap| {
+                    let final_location = final_location.clone();
+                    let authorization_tx = authorization_tx.clone();
+                    async move {
+                        if let Some(sender) = authorization_tx.lock().unwrap().take() {
+                            let authorization = headers
+                                .get(header::AUTHORIZATION)
+                                .cloned()
+                                .unwrap_or_else(|| HeaderValue::from_static("missing"));
+                            let _ = sender.send(authorization);
+                        }
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, final_location)],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/final",
+                get(|| async {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .body(Body::from("asset"))
+                        .unwrap()
+                }),
+            );
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let target = format!("http://cache.test:{}/start", address.port());
+        let uri: Uri = format!("/proxy/?d={}", urlencoding::encode(&target))
+            .parse()
+            .unwrap();
+
+        let response = handle_proxy(&runtime, uri, HeaderMap::new(), Method::GET).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(authorization_rx.await.unwrap(), "Basic dXNlcjpzZWNyZXQ=");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
     async fn credential_bearing_upstream_and_rewrite_errors_are_no_store() {
         let (unreachable_runtime, _) = test_runtime(
             "127.0.0.1:1".parse().unwrap(),
@@ -5700,6 +5830,23 @@ mod tests {
         let rewritten = rewrite_playlist_bounded(body, &base).unwrap();
 
         assert_eq!(rewritten, body);
+    }
+
+    #[test]
+    fn playlist_rewriter_preserves_cr_lf_crlf_and_lfcr_endings() {
+        let base = Url::parse("https://media.example/path/master.m3u8").unwrap();
+        let body = "one.ts\rtwo.ts\nthree.ts\r\nfour.ts\n\rfive.ts";
+        let expected = concat!(
+            "/proxy/?d=https%3A%2F%2Fmedia.example%2Fpath%2Fone.ts\r",
+            "/proxy/?d=https%3A%2F%2Fmedia.example%2Fpath%2Ftwo.ts\n",
+            "/proxy/?d=https%3A%2F%2Fmedia.example%2Fpath%2Fthree.ts\r\n",
+            "/proxy/?d=https%3A%2F%2Fmedia.example%2Fpath%2Ffour.ts\n\r",
+            "/proxy/?d=https%3A%2F%2Fmedia.example%2Fpath%2Ffive.ts",
+        );
+
+        let rewritten = rewrite_playlist_bounded(body, &base).unwrap();
+
+        assert_eq!(rewritten, expected);
     }
 
     #[test]
