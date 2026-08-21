@@ -1,12 +1,19 @@
 use axum::{
     Router,
     body::Body,
+    extract::Path,
     http::{HeaderMap, Response, StatusCode, header},
+    response::IntoResponse,
     routing::get,
 };
 use futures_util::{StreamExt, stream};
 use serde_json::json;
-use std::{convert::Infallible, io::Read, time::Duration};
+use std::{
+    convert::Infallible,
+    io::Read,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 async fn range(headers: HeaderMap) -> Response<Body> {
     let bytes = b"0123456789";
@@ -116,8 +123,310 @@ async fn start_tls_fixture() -> anyhow::Result<(
     Ok((address, task))
 }
 
+fn install_https_fixture(config_dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(config_dir)?;
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/localhost-cert.pem"
+        ),
+        config_dir.join("https-cert.pem"),
+    )?;
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/localhost-key.pem"
+        ),
+        config_dir.join("https-key.pem"),
+    )?;
+    Ok(())
+}
+
 fn proxy_url(server: std::net::SocketAddr, target: &str) -> String {
     format!("http://{server}/proxy/?d={}", urlencoding::encode(target))
+}
+
+#[tokio::test]
+async fn marker_preserving_reverse_proxy_cannot_reenter_application_routes() -> anyhow::Result<()> {
+    let server_address = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
+    let fixture_server_address = server_address.clone();
+    let fixture_router = Router::new().route(
+        "/{mode}",
+        get(move |Path(mode): Path<String>, headers: HeaderMap| {
+            let server_address = fixture_server_address.clone();
+            async move {
+                let server = server_address.lock().unwrap().unwrap();
+                let client = reqwest::Client::new();
+                let (method, path, preserve_marker) = match mode.as_str() {
+                    "heartbeat" => (reqwest::Method::GET, "/heartbeat", true),
+                    "proxyevil" => (reqwest::Method::GET, "/proxyevil", true),
+                    "strip" => (reqwest::Method::GET, "/heartbeat", false),
+                    "preflight" => (reqwest::Method::OPTIONS, "/heartbeat", true),
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+                let mut request = client.request(method, format!("http://{server}{path}"));
+                if preserve_marker {
+                    request = request.header(
+                        "x-stream-server-proxy-hop",
+                        headers["x-stream-server-proxy-hop"].clone(),
+                    );
+                }
+                if mode == "preflight" {
+                    request = request
+                        .header(header::ORIGIN, "https://app.example")
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET");
+                }
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let body = response.bytes().await.unwrap();
+                (status, body).into_response()
+            }
+        }),
+    );
+    let fixture_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let fixture_address = fixture_listener.local_addr()?;
+    let fixture_task = tokio::spawn(async move {
+        axum::serve(fixture_listener, fixture_router).await.unwrap();
+    });
+
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        config_dir: Some(config_dir.clone()),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    *server_address.lock().unwrap() = Some(server.http_addr());
+    let client = reqwest::Client::new();
+    let token = std::fs::read_to_string(config_dir.join("settings-control.token"))?;
+    assert_eq!(
+        client
+            .post(format!("http://{}/settings", server.http_addr()))
+            .header("x-stream-server-settings-token", token)
+            .json(&json!({"allowPrivateNetworkSources": true}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    for (mode, expected) in [
+        ("heartbeat", StatusCode::FORBIDDEN),
+        ("proxyevil", StatusCode::FORBIDDEN),
+        ("strip", StatusCode::OK),
+        ("preflight", StatusCode::OK),
+    ] {
+        let target = format!("http://{fixture_address}/{mode}");
+        let response = client
+            .get(proxy_url(server.http_addr(), &target))
+            .send()
+            .await?;
+        assert_eq!(response.status(), expected, "mode={mode}");
+    }
+
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    fixture_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_https_port_zero_reports_serves_and_blocks_the_exact_socket() -> anyhow::Result<()>
+{
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    install_https_fixture(&config_dir)?;
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        https_addr: Some("127.0.0.1:0".parse().unwrap()),
+        config_dir: Some(config_dir.clone()),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    let https_address = server
+        .bound_https_addr()
+        .expect("prepared HTTPS listener must be exposed");
+    assert_ne!(https_address.port(), 0);
+    let tls_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    assert_eq!(
+        tls_client
+            .get(format!("https://{https_address}/heartbeat"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let client = reqwest::Client::new();
+    let token = std::fs::read_to_string(config_dir.join("settings-control.token"))?;
+    assert_eq!(
+        client
+            .post(format!("http://{}/settings", server.http_addr()))
+            .header("x-stream-server-settings-token", token)
+            .json(&json!({"allowPrivateNetworkSources": true}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let target = format!("https://{https_address}/heartbeat");
+    assert_eq!(
+        client
+            .get(proxy_url(server.http_addr(), &target))
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_https_preparation_is_not_registered_and_http_remains_usable() -> anyhow::Result<()>
+{
+    let occupied_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let occupied_address = occupied_listener.local_addr()?;
+    let fixture = tokio::spawn(async move {
+        axum::serve(
+            occupied_listener,
+            Router::new().route("/ok", get(|| async { "occupied-fixture" })),
+        )
+        .await
+        .unwrap();
+    });
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    install_https_fixture(&config_dir)?;
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        https_addr: Some(occupied_address),
+        config_dir: Some(config_dir.clone()),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    assert_eq!(server.bound_https_addr(), None);
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("http://{}/heartbeat", server.http_addr()))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let token = std::fs::read_to_string(config_dir.join("settings-control.token"))?;
+    client
+        .post(format!("http://{}/settings", server.http_addr()))
+        .header("x-stream-server-settings-token", token)
+        .json(&json!({"allowPrivateNetworkSources": true}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let target = format!("http://{occupied_address}/ok");
+    let response = client
+        .get(proxy_url(server.http_addr(), &target))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await?, "occupied-fixture");
+
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    fixture.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_https_pem_leaves_http_ready_without_a_stale_listener() -> anyhow::Result<()> {
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(config_dir.join("https-cert.pem"), b"not a certificate")?;
+    std::fs::write(config_dir.join("https-key.pem"), b"not a key")?;
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        https_addr: Some("127.0.0.1:0".parse().unwrap()),
+        config_dir: Some(config_dir),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    assert_eq!(server.bound_https_addr(), None);
+    assert_eq!(
+        reqwest::get(format!("http://{}/heartbeat", server.http_addr()))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unreadable_https_pem_leaves_http_ready_without_a_stale_listener() -> anyhow::Result<()> {
+    let config = tempfile::tempdir()?;
+    let cache = tempfile::tempdir()?;
+    let config_dir = config.path().join("config");
+    std::fs::create_dir_all(config_dir.join("https-cert.pem"))?;
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/localhost-key.pem"
+        ),
+        config_dir.join("https-key.pem"),
+    )?;
+    let server_config = stream_server::ServerConfig {
+        http_addr: "127.0.0.1:0".parse().unwrap(),
+        https_addr: Some("127.0.0.1:0".parse().unwrap()),
+        config_dir: Some(config_dir),
+        cache_dir: Some(cache.path().join("cache")),
+        ..stream_server::ServerConfig::embedded()
+    };
+    let server = tokio::task::spawn_blocking(move || stream_server::start(server_config)).await??;
+    assert_eq!(server.bound_https_addr(), None);
+    assert_eq!(
+        reqwest::get(format!("http://{}/heartbeat", server.http_addr()))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let shutdown = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        server.shutdown()?;
+        server.join()
+    })
+    .await??;
+    assert_eq!(shutdown, Some(stream_server::ShutdownSource::External));
+    Ok(())
 }
 
 #[tokio::test]

@@ -152,6 +152,7 @@ pub enum ShutdownSource {
 pub struct ServerHandle {
     http_addr: SocketAddr,
     bound_http_addr: SocketAddr,
+    bound_https_addr: Option<SocketAddr>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     join: std::thread::JoinHandle<anyhow::Result<Option<ShutdownSource>>>,
 }
@@ -163,6 +164,10 @@ impl ServerHandle {
 
     pub fn bound_http_addr(&self) -> SocketAddr {
         self.bound_http_addr
+    }
+
+    pub fn bound_https_addr(&self) -> Option<SocketAddr> {
+        self.bound_https_addr
     }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
@@ -190,11 +195,17 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
         .name("stream-server".to_string())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run(thread_cfg, shutdown_rx, Some(ready_tx)))
+            rt.block_on(run_inner(
+                thread_cfg,
+                shutdown_rx,
+                None,
+                None,
+                Some(ready_tx),
+            ))
         })?;
 
-    let bound_http_addr = match ready_rx.blocking_recv() {
-        Ok(addr) => addr,
+    let bindings = match ready_rx.blocking_recv() {
+        Ok(bindings) => bindings,
         Err(_) => {
             return match join.join() {
                 Ok(result) => match result {
@@ -209,8 +220,9 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     };
 
     Ok(ServerHandle {
-        http_addr: connectable_addr(bound_http_addr),
-        bound_http_addr,
+        http_addr: connectable_addr(bindings.http),
+        bound_http_addr: bindings.http,
+        bound_https_addr: bindings.https,
         shutdown_tx,
         join,
     })
@@ -221,7 +233,7 @@ pub async fn run(
     external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, None, ready_tx).await
+    run_inner(cfg, external_shutdown_rx, None, ready_tx, None).await
 }
 
 pub async fn run_with_tray_stats(
@@ -230,7 +242,30 @@ pub async fn run_with_tray_stats(
     tray_stats: Arc<tray::TrayStats>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, Some(tray_stats), ready_tx).await
+    run_inner(cfg, external_shutdown_rx, Some(tray_stats), ready_tx, None).await
+}
+
+struct StartupBindings {
+    http: SocketAddr,
+    https: Option<SocketAddr>,
+}
+
+struct PreparedHttpsListener {
+    bound_addr: SocketAddr,
+    server: axum_server::Server<SocketAddr, axum_server::tls_rustls::RustlsAcceptor>,
+}
+
+async fn prepare_https_listener(
+    configured_addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<PreparedHttpsListener> {
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    let listener = std::net::TcpListener::bind(configured_addr)?;
+    listener.set_nonblocking(true)?;
+    let bound_addr = listener.local_addr()?;
+    let server = axum_server::from_tcp_rustls(listener, tls)?;
+    Ok(PreparedHttpsListener { bound_addr, server })
 }
 
 async fn run_inner(
@@ -238,6 +273,7 @@ async fn run_inner(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     tray_stats: Option<Arc<tray::TrayStats>>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    startup_ready_tx: Option<tokio::sync::oneshot::Sender<StartupBindings>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
@@ -481,18 +517,35 @@ async fn run_inner(
     state.settings_persistence = settings_persistence;
     let https_cert_path = config_dir.join("https-cert.pem");
     let https_key_path = config_dir.join("https-key.pem");
+    let prepared_https = if https_cert_path.exists() && https_key_path.exists() {
+        match cfg.https_addr {
+            Some(https_addr) => {
+                match prepare_https_listener(https_addr, &https_cert_path, &https_key_path).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(_) => {
+                        tracing::error!("HTTPS server preparation failed");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        if let Some(https_addr) = cfg.https_addr {
+            tracing::info!(
+                "No HTTPS certificates found in {:?}, skipping HTTPS server on {:?}",
+                config_dir,
+                https_addr
+            );
+        }
+        None
+    };
+    let bound_https_addr = prepared_https.as_ref().map(|prepared| prepared.bound_addr);
     let mut listeners = vec![network_security::ListenerBinding {
-        address: bound_http_addr.ip(),
-        port: bound_http_addr.port(),
+        socket: bound_http_addr,
     }];
-    if https_cert_path.exists()
-        && https_key_path.exists()
-        && let Some(https_addr) = cfg.https_addr
-    {
-        listeners.push(network_security::ListenerBinding {
-            address: https_addr.ip(),
-            port: https_addr.port(),
-        });
+    if let Some(https_addr) = bound_https_addr {
+        listeners.push(network_security::ListenerBinding { socket: https_addr });
     }
     let validator = Arc::new(network_security::DestinationValidator::new(
         Arc::new(network_security::SystemDnsResolver),
@@ -638,6 +691,12 @@ async fn run_inner(
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(bound_http_addr);
     }
+    if let Some(startup_ready_tx) = startup_ready_tx {
+        let _ = startup_ready_tx.send(StartupBindings {
+            http: bound_http_addr,
+            https: bound_https_addr,
+        });
+    }
 
     let (shutdown_started_tx, mut shutdown_started_rx) =
         tokio::sync::oneshot::channel::<ShutdownSource>();
@@ -662,34 +721,25 @@ async fn run_inner(
         let _ = shutdown_started_tx.send(source);
     };
 
-    if let Some(https_addr) = cfg.https_addr {
-        if https_cert_path.exists() && https_key_path.exists() {
-            tracing::info!("Found HTTPS certificates, starting HTTPS server on {https_addr}");
-            let https_app = app.clone();
-            let https_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                https_cert_path,
-                https_key_path,
-            )
-            .await?;
-
-            background_tasks.push(diagnostics::logging::spawn_logged(
-                "https-server",
-                async move {
-                    if let Err(e) = axum_server::bind_rustls(https_addr, https_config)
-                        .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
-                        .await
-                    {
-                        tracing::error!("HTTPS server error: {}", e);
-                    }
-                },
-            ));
-        } else {
-            tracing::info!(
-                "No HTTPS certificates found in {:?}, skipping HTTPS server on {:?}",
-                config_dir,
-                https_addr
-            );
-        }
+    if let Some(prepared_https) = prepared_https {
+        tracing::info!(
+            "Found HTTPS certificates, starting HTTPS server on {}",
+            prepared_https.bound_addr
+        );
+        let https_app = app.clone();
+        background_tasks.push(diagnostics::logging::spawn_logged(
+            "https-server",
+            async move {
+                if prepared_https
+                    .server
+                    .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("HTTPS server failed");
+                }
+            },
+        ));
     }
 
     let server = axum::serve(
@@ -798,6 +848,22 @@ fn connectable_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+async fn reject_proxy_hop_reentry(
+    State(runtime): State<Arc<network_security::ProxyRuntime>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    let is_proxy_path = path == "/proxy" || path.starts_with("/proxy/");
+    if !is_proxy_path && runtime.matches_inbound_hop_marker(request.headers()) {
+        return routes::proxy::blocked_response();
+    }
+    next.run(request).await
+}
+
+/// Builds the legacy convenience router. Its proxy self-listener policy uses
+/// the default `127.0.0.1:11470` binding installed by [`AppState`]. Embedders
+/// serving on any other socket must use [`build_router_with_listeners`].
 pub fn build_router(state: AppState) -> Router {
     fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
         req.extensions()
@@ -957,8 +1023,45 @@ pub fn build_router(state: AppState) -> Router {
                 )
             }),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.proxy_runtime.clone(),
+            reject_proxy_hop_reentry,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Builds a router whose proxy destination policy knows the complete sockets
+/// on which the caller will serve it. Pass every actual bound `SocketAddr`
+/// after binding, including IPv6 scope IDs; configured or requested addresses
+/// are not a substitute for the sockets returned by the operating system.
+pub fn build_router_with_listeners(mut state: AppState, listeners: Vec<SocketAddr>) -> Router {
+    assert!(
+        !listeners.is_empty(),
+        "listener-aware router requires at least one actual bound socket"
+    );
+    let settings = state
+        .settings
+        .try_read()
+        .expect("settings must be uncontended during router construction")
+        .clone();
+    let validator = Arc::new(network_security::DestinationValidator::new(
+        Arc::new(network_security::SystemDnsResolver),
+        Arc::new(network_security::SystemLocalNetworkProvider),
+        Arc::new(network_security::SystemClock),
+        listeners
+            .into_iter()
+            .map(|socket| network_security::ListenerBinding { socket })
+            .collect(),
+    ));
+    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+        network_security::ProxyPolicySettings {
+            allow_private_network_sources: settings.allow_private_network_sources,
+            allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+        },
+        validator,
+    ));
+    build_router(state)
 }
 
 async fn root_redirect(State(state): State<AppState>) -> Redirect {
@@ -973,6 +1076,59 @@ async fn root_redirect(State(state): State<AppState>) -> Redirect {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn listener_aware_embedding_blocks_supplied_socket_while_legacy_keeps_default() {
+        let _engine_test_guard = TEST_ENGINE_MUTEX.lock().await;
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new().route("/ok", get(|| async { "fixture-ok" })),
+            )
+            .await
+            .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let settings = routes::system::ServerSettings {
+            allow_private_network_sources: true,
+            ..routes::system::ServerSettings::default()
+        };
+        let state = AppState::new(engine, settings, temp.path().join("config"));
+        let target = format!("http://{upstream_address}/ok");
+
+        for (router, expected) in [
+            (
+                build_router_with_listeners(state.clone(), vec![upstream_address]),
+                StatusCode::FORBIDDEN,
+            ),
+            (build_router(state), StatusCode::OK),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let response = reqwest::get(format!(
+                "http://{address}/proxy/?d={}",
+                urlencoding::encode(&target)
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                assert_eq!(response.text().await.unwrap(), "fixture-ok");
+            }
+            server.abort();
+        }
+        upstream.abort();
+    }
 
     #[tokio::test]
     async fn forced_exit_waits_for_admitted_settings_transactions_to_drain() {

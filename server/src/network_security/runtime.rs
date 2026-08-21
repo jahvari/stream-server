@@ -1,6 +1,7 @@
 use super::resolver::{
     DestinationError, DestinationValidator, OutboundPolicy, ResolvedDestination,
 };
+use axum::http::{HeaderMap, HeaderValue};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
@@ -13,6 +14,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+pub(crate) const PROXY_HOP_HEADER_NAME: &str = "x-stream-server-proxy-hop";
 const MAX_CONCURRENT_PROXY_REQUESTS: usize = 64;
 const MAX_CONCURRENT_PROXY_REQUESTS_PER_PEER: usize = 16;
 const MAX_CONCURRENT_PLAYLISTS: usize = 8;
@@ -337,6 +339,7 @@ fn normalize_peer(peer: Option<IpAddr>) -> ProxyPeer {
 
 pub(crate) struct ProxyRuntime {
     validator: Arc<DestinationValidator>,
+    hop_marker: HeaderValue,
     capacity: Arc<ProxyCapacity>,
     playlist_capacity: Arc<ProxyCapacity>,
     generation: Mutex<ProxyGeneration>,
@@ -348,8 +351,20 @@ pub(crate) struct ProxyRuntime {
 
 impl ProxyRuntime {
     pub(crate) fn new(settings: ProxyPolicySettings, validator: Arc<DestinationValidator>) -> Self {
+        let marker = uuid::Uuid::new_v4().to_string();
+        let marker = HeaderValue::from_str(&marker).expect("UUID v4 is a valid HTTP header value");
+        Self::with_hop_marker(settings, validator, marker)
+    }
+
+    fn with_hop_marker(
+        settings: ProxyPolicySettings,
+        validator: Arc<DestinationValidator>,
+        mut hop_marker: HeaderValue,
+    ) -> Self {
+        hop_marker.set_sensitive(true);
         Self {
             validator,
+            hop_marker,
             capacity: Arc::new(ProxyCapacity::default()),
             playlist_capacity: Arc::new(ProxyCapacity::default()),
             generation: Mutex::new(ProxyGeneration {
@@ -361,6 +376,30 @@ impl ProxyRuntime {
             #[cfg(test)]
             playlist_body_polls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_hop_marker(
+        settings: ProxyPolicySettings,
+        validator: Arc<DestinationValidator>,
+        hop_marker: HeaderValue,
+    ) -> Self {
+        Self::with_hop_marker(settings, validator, hop_marker)
+    }
+
+    pub(crate) fn hop_marker(&self) -> &HeaderValue {
+        &self.hop_marker
+    }
+
+    pub(crate) fn matches_inbound_hop_marker(&self, headers: &HeaderMap) -> bool {
+        use subtle::ConstantTimeEq;
+
+        headers
+            .get_all(PROXY_HOP_HEADER_NAME)
+            .iter()
+            .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+            .map(trim_http_ows)
+            .any(|value| bool::from(value.ct_eq(self.hop_marker.as_bytes())))
     }
 
     #[cfg(test)]
@@ -512,6 +551,22 @@ impl ProxyRuntime {
     }
 }
 
+fn trim_http_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -520,6 +575,7 @@ mod tests {
     };
     use super::{ProxyPolicySettings, ProxyRuntime};
     use async_trait::async_trait;
+    use axum::http::{HeaderMap, HeaderValue};
     use std::{
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -561,6 +617,62 @@ mod tests {
             Vec::new(),
         ));
         ProxyRuntime::new(settings, validator)
+    }
+
+    fn runtime_with_marker(marker: HeaderValue) -> ProxyRuntime {
+        let validator = Arc::new(DestinationValidator::new(
+            Arc::new(NoDns),
+            Arc::new(NoLocalNetworks),
+            Arc::new(FixedClock),
+            Vec::new(),
+        ));
+        ProxyRuntime::new_with_hop_marker(ProxyPolicySettings::default(), validator, marker)
+    }
+
+    #[test]
+    fn hop_marker_is_stable_across_requests_and_reconfiguration_but_unique_per_runtime() {
+        let first_runtime = runtime(ProxyPolicySettings::default());
+        let marker = first_runtime.hop_marker().clone();
+        let request = first_runtime.try_request().unwrap();
+        assert_eq!(first_runtime.hop_marker(), &marker);
+        drop(request);
+
+        first_runtime.begin_reconfigure(ProxyPolicySettings {
+            allow_private_network_sources: true,
+            allow_invalid_proxy_tls_certificates: false,
+        });
+        first_runtime.finish_reconfigure(ProxyPolicySettings {
+            allow_private_network_sources: true,
+            allow_invalid_proxy_tls_certificates: false,
+        });
+        assert_eq!(first_runtime.hop_marker(), &marker);
+        assert_ne!(
+            first_runtime.hop_marker(),
+            runtime(ProxyPolicySettings::default()).hop_marker()
+        );
+        assert!(first_runtime.hop_marker().is_sensitive());
+    }
+
+    #[test]
+    fn inbound_hop_marker_matches_raw_repeated_and_comma_coalesced_fields() {
+        let runtime = runtime_with_marker(HeaderValue::from_static("test-marker"));
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-stream-server-proxy-hop",
+            HeaderValue::from_bytes(b"\x80-not-utf8, other").unwrap(),
+        );
+        headers.append(
+            "x-stream-server-proxy-hop",
+            HeaderValue::from_static("not-it,\ttest-marker \t"),
+        );
+        assert!(runtime.matches_inbound_hop_marker(&headers));
+
+        headers.clear();
+        headers.insert(
+            "x-stream-server-proxy-hop",
+            HeaderValue::from_static("not-test-marker"),
+        );
+        assert!(!runtime.matches_inbound_hop_marker(&headers));
     }
 
     #[test]

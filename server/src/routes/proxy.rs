@@ -2,8 +2,8 @@
 use crate::network_security::ProxyProducerProbe;
 use crate::{
     network_security::{
-        DestinationError, ProxyPlaylistPermit, ProxyProducerLease, ProxyRequestContext,
-        ProxyRuntime,
+        DestinationError, PROXY_HOP_HEADER_NAME, ProxyPlaylistPermit, ProxyProducerLease,
+        ProxyRequestContext, ProxyRuntime,
     },
     state::AppState,
 };
@@ -319,6 +319,7 @@ fn request_header_forbidden(name: &HeaderName) -> bool {
             | "http2-settings"
             | "x-real-ip"
             | "x-host"
+            | PROXY_HOP_HEADER_NAME
     ) || name.starts_with("x-forwarded-")
         || name.starts_with("x-original-")
         || name.starts_with("x-rewrite-")
@@ -401,6 +402,7 @@ async fn fetch_with_redirects(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
         );
+        headers.insert(PROXY_HOP_HEADER_NAME, runtime.hop_marker().clone());
         let send = client
             .request(method.clone(), destination.url.clone())
             .headers(headers)
@@ -543,6 +545,9 @@ async fn handle_proxy_suffix_for_peer(
     if raw_suffix.len() > MAX_PROXY_INPUT {
         return proxy_error_response(ProxyError::InvalidRequest);
     }
+    if runtime.matches_inbound_hop_marker(&headers) {
+        return proxy_error_response(ProxyError::Blocked);
+    }
     if method == Method::CONNECT {
         return proxy_error_response(ProxyError::InvalidRequest);
     }
@@ -646,6 +651,10 @@ async fn handle_proxy_suffix_for_peer(
         false,
         credential_bearing,
     )
+}
+
+pub(crate) fn blocked_response() -> Response {
+    proxy_error_response(ProxyError::Blocked)
 }
 
 fn content_type_is_playlist(value: &HeaderValue) -> bool {
@@ -3339,6 +3348,7 @@ mod tests {
             "h=Content-Length%3A4",
             "h=Connection%3Akeep-alive",
             "h=Expect%3A100-continue",
+            "h=X-Stream-Server-Proxy-Hop%3Acustom-marker",
             "h=X-Test%3Aok%0D%0AX-Evil%3Ayes",
             "r=Set-Cookie%3Astolen%3D1",
             "r=Transfer-Encoding%3Achunked",
@@ -3353,6 +3363,53 @@ mod tests {
                 "{option}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn matching_inbound_marker_runs_after_raw_cap_but_before_all_proxy_work() {
+        let (runtime, resolver) = test_runtime(
+            "127.0.0.1:1".parse().unwrap(),
+            ProxyPolicySettings::default(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.append("x-stream-server-proxy-hop", runtime.hop_marker().clone());
+
+        let prefix = "?d=http%3A%2F%2Fblocked.example&unknown=";
+        let overlong = format!("{prefix}{}", "a".repeat(MAX_PROXY_INPUT + 1 - prefix.len()));
+        let response =
+            handle_proxy_suffix(&runtime, &overlong, headers.clone(), Method::CONNECT).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        for (suffix, method) in [
+            ("?malformed", Method::GET),
+            ("?d=http%3A%2F%2Fblocked.example", Method::CONNECT),
+        ] {
+            let response = handle_proxy_suffix(&runtime, suffix, headers.clone(), method).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_response_isolated(&response);
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
+
+        let permits = (0..64)
+            .map(|index| {
+                runtime
+                    .try_request_for_peer(Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                        index + 1,
+                    ))))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let response = handle_proxy_suffix(
+            &runtime,
+            "?d=http%3A%2F%2Fblocked.example",
+            headers,
+            Method::GET,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(runtime.capacity_snapshot(), (64, 64));
+        drop(permits);
     }
 
     #[test]
@@ -4212,6 +4269,85 @@ mod tests {
             .await,
             Err(ProxyError::Upstream)
         ));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn route_owned_hop_marker_is_overwritten_on_every_redirect_hop() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<HeaderValue>::new()));
+        let first_observed = observed.clone();
+        let final_observed = observed.clone();
+        let router = Router::new()
+            .route(
+                "/first",
+                get(move |headers: HeaderMap| {
+                    let observed = first_observed.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(headers["x-stream-server-proxy-hop"].clone());
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, "/final")],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/final",
+                get(move |headers: HeaderMap| {
+                    let observed = final_observed.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(headers["x-stream-server-proxy-hop"].clone());
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                            .body(Body::from("#EXTM3U\nsegment.ts\n"))
+                            .unwrap()
+                    }
+                }),
+            );
+        let (address, fixture) = fixture(router).await;
+        let (runtime, _) = test_runtime(
+            address,
+            ProxyPolicySettings {
+                allow_private_network_sources: true,
+                allow_invalid_proxy_tls_certificates: false,
+            },
+        );
+        let expected = runtime.hop_marker().clone();
+        let uri: Uri = format!(
+            "/proxy/?d=http%3A%2F%2Fmarker.test%3A{}%2Ffirst",
+            address.port()
+        )
+        .parse()
+        .unwrap();
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            "x-stream-server-proxy-hop",
+            HeaderValue::from_static("attacker-controlled-nonmatch"),
+        );
+        let response = handle_proxy(&runtime, uri, incoming, Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), MAX_PLAYLIST_OUTPUT)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("x-stream-server-proxy-hop"));
+        assert!(!body.contains("attacker-controlled-nonmatch"));
+        let child = body
+            .lines()
+            .find(|line| line.starts_with("/proxy"))
+            .unwrap();
+        let parsed = parse_proxy_suffix(child.strip_prefix("/proxy").unwrap()).unwrap();
+        assert!(parsed.request_headers.is_empty());
+        assert_eq!(*observed.lock().unwrap(), vec![expected.clone(), expected]);
         fixture.abort();
     }
 

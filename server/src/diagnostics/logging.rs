@@ -54,6 +54,10 @@ fn format_headers(headers: &axum::http::HeaderMap) -> String {
         if !out.is_empty() {
             out.push_str(", ");
         }
+        if name.as_str() == crate::network_security::PROXY_HOP_HEADER_NAME {
+            out.push_str("<internal-header-redacted>");
+            continue;
+        }
         out.push_str(name.as_str());
         out.push('=');
         if is_sensitive(name) {
@@ -414,6 +418,21 @@ mod tests {
             "x-stream-server-settings-token=<redacted:64 bytes>"
         );
         assert!(!rendered.contains("aaaaaaaa"));
+    }
+
+    #[test]
+    fn internal_proxy_hop_header_is_replaced_by_a_fixed_placeholder() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-stream-server-proxy-hop",
+            HeaderValue::from_static("secret-marker-value"),
+        );
+
+        let rendered = format_headers(&headers);
+        assert_eq!(rendered, "<internal-header-redacted>");
+        assert!(!rendered.contains("x-stream-server-proxy-hop"));
+        assert!(!rendered.contains("secret-marker-value"));
+        assert!(!rendered.contains("19"));
     }
 
     #[test]

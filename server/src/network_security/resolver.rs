@@ -1,8 +1,8 @@
-use super::ip::{DestinationClass, LocalNetworks, Nat64Prefix, extract_rfc6052};
+use super::ip::{DestinationClass, LocalNetworkEntry, LocalNetworks, Nat64Prefix, extract_rfc6052};
 use async_trait::async_trait;
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -76,7 +76,7 @@ impl LocalNetworkProvider for SystemLocalNetworkProvider {
     }
 }
 
-fn network_for_interface(interface: &if_addrs::Interface) -> Option<ipnet::IpNet> {
+fn network_for_interface(interface: &if_addrs::Interface) -> Option<LocalNetworkEntry> {
     if matches!(
         interface.oper_status,
         if_addrs::IfOperStatus::Down
@@ -90,7 +90,23 @@ fn network_for_interface(interface: &if_addrs::Interface) -> Option<ipnet::IpNet
         if_addrs::IfAddr::V4(address) => (IpAddr::V4(address.ip), address.prefixlen),
         if_addrs::IfAddr::V6(address) => (IpAddr::V6(address.ip), address.prefixlen),
     };
-    ipnet::IpNet::new(ip, prefix).ok()
+    let network = ipnet::IpNet::new(ip, prefix).ok()?;
+    Some(LocalNetworkEntry {
+        network,
+        name: interface.name.clone(),
+        index: interface.index,
+        adapter_id: adapter_id(interface),
+    })
+}
+
+#[cfg(windows)]
+fn adapter_id(interface: &if_addrs::Interface) -> Option<String> {
+    Some(interface.adapter_name.clone())
+}
+
+#[cfg(not(windows))]
+fn adapter_id(_interface: &if_addrs::Interface) -> Option<String> {
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -102,8 +118,7 @@ pub(crate) struct ResolvedDestination {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ListenerBinding {
-    pub(crate) address: IpAddr,
-    pub(crate) port: u16,
+    pub(crate) socket: SocketAddr,
 }
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
@@ -147,7 +162,12 @@ impl DestinationValidator {
             resolver,
             local_networks,
             clock,
-            listeners,
+            listeners: listeners
+                .into_iter()
+                .map(|listener| ListenerBinding {
+                    socket: normalize_socket(listener.socket),
+                })
+                .collect(),
             nat64_cache: tokio::sync::Mutex::new(None),
             nat64_refresh: tokio::sync::Mutex::new(()),
         }
@@ -198,6 +218,7 @@ impl DestinationValidator {
                 }
                 for address in &mut resolved {
                     address.set_port(port);
+                    *address = normalize_socket(*address);
                 }
                 resolved.sort_unstable();
                 resolved.dedup();
@@ -233,6 +254,12 @@ impl DestinationValidator {
         policy: OutboundPolicy,
     ) -> Result<(), DestinationError> {
         for address in addresses {
+            if let SocketAddr::V6(address) = address
+                && address.ip().is_unicast_link_local()
+                && address.scope_id() == 0
+            {
+                return Err(DestinationError::Blocked);
+            }
             if self.matches_listener(*address, local, nat64) {
                 return Err(DestinationError::Blocked);
             }
@@ -253,31 +280,35 @@ impl DestinationValidator {
         local: &LocalNetworks,
         nat64: &[Nat64Prefix],
     ) -> bool {
-        let target_ip = normalized_listener_ip(target.ip(), nat64);
+        let target = normalize_socket(target);
+        let target_candidates = listener_socket_candidates(target, nat64);
         self.listeners.iter().any(|listener| {
-            if listener.port != target.port() {
+            if listener.socket.port() != target.port() {
                 return false;
             }
 
-            let listener_ip = normalized_listener_ip(listener.address, nat64);
-            if listener.address.is_unspecified() {
-                return match (listener.address, target_ip) {
-                    (IpAddr::V4(_), IpAddr::V4(ip)) => {
-                        ip.is_loopback() || local.contains_address(IpAddr::V4(ip))
+            if listener.socket.ip().is_unspecified() {
+                return target_candidates.iter().any(|candidate| {
+                    let candidate_ip = candidate.ip();
+                    match listener.socket {
+                        SocketAddr::V4(_) => {
+                            candidate.is_ipv4()
+                                && (candidate_ip.is_loopback()
+                                    || local.contains_address(candidate_ip))
+                        }
+                        SocketAddr::V6(_) => {
+                            candidate_ip.is_loopback() || local.contains_address(candidate_ip)
+                        }
                     }
-                    (IpAddr::V6(_), IpAddr::V6(ip)) => {
-                        ip.is_loopback() || local.contains_address(IpAddr::V6(ip))
-                    }
-                    // An unspecified IPv6 socket can be dual-stack. Treat mapped
-                    // IPv4 addresses on local interfaces as self-listener targets.
-                    (IpAddr::V6(_), IpAddr::V4(ip)) => {
-                        ip.is_loopback() || local.contains_address(IpAddr::V4(ip))
-                    }
-                    _ => false,
-                };
+                });
             }
 
-            listener_ip == target_ip
+            let listener_candidates = listener_socket_candidates(listener.socket, nat64);
+            listener_candidates.iter().any(|listener_candidate| {
+                target_candidates.iter().any(|target_candidate| {
+                    listener_endpoint_matches(*listener_candidate, *target_candidate)
+                })
+            })
         })
     }
 
@@ -292,6 +323,9 @@ impl DestinationValidator {
             IpAddr::V6(ip) => {
                 if super::ip::normalized_embedded_ipv4(ip, &[]).is_some() {
                     return false;
+                }
+                if super::ip::is_rfc8215_address(ip) {
+                    return true;
                 }
                 match super::ip::classify_ip(IpAddr::V6(ip), local, &[]) {
                     DestinationClass::Public => true,
@@ -317,16 +351,8 @@ impl DestinationValidator {
             return prefixes;
         }
 
-        let discovered = match self.resolver.resolve("ipv4only.arpa", 0).await {
-            Ok(answers) if !answers.is_empty() && answers.len() <= MAX_DNS_ANSWERS => {
-                let has_ipv6 = answers.iter().any(SocketAddr::is_ipv6);
-                let prefixes = discover_nat64_prefixes(&answers);
-                if has_ipv6 && prefixes.is_empty() {
-                    Err(DestinationError::ResolutionFailed)
-                } else {
-                    Ok(prefixes)
-                }
-            }
+        let discovered = match self.resolver.resolve("ipv4only.arpa.", 0).await {
+            Ok(answers) if answers.len() <= MAX_DNS_ANSWERS => discover_nat64_prefixes(&answers),
             Ok(_) | Err(_) => Err(DestinationError::ResolutionFailed),
         };
 
@@ -364,29 +390,82 @@ impl DestinationValidator {
     }
 }
 
-fn normalized_listener_ip(ip: IpAddr, nat64: &[Nat64Prefix]) -> IpAddr {
-    match ip {
-        IpAddr::V6(ip) => super::ip::normalized_embedded_ipv4(ip, nat64)
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(ip)),
-        ip => ip,
+fn normalize_socket(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(_) => address,
+        SocketAddr::V6(address) => SocketAddr::V6(SocketAddrV6::new(
+            *address.ip(),
+            address.port(),
+            0,
+            if address.ip().is_unicast_link_local() {
+                address.scope_id()
+            } else {
+                0
+            },
+        )),
     }
 }
 
-fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Vec<Nat64Prefix> {
+fn listener_socket_candidates(socket: SocketAddr, nat64: &[Nat64Prefix]) -> Vec<SocketAddr> {
+    let socket = normalize_socket(socket);
+    let mut candidates = vec![socket];
+    if let SocketAddr::V6(address) = socket {
+        candidates.extend(
+            super::ip::embedded_ipv4_candidates(*address.ip(), nat64)
+                .into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), address.port())),
+        );
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn listener_endpoint_matches(listener: SocketAddr, target: SocketAddr) -> bool {
+    if listener.port() != target.port() {
+        return false;
+    }
+    match (listener, target) {
+        (SocketAddr::V4(listener), SocketAddr::V4(target)) => listener.ip() == target.ip(),
+        (SocketAddr::V6(listener), SocketAddr::V6(target)) => {
+            listener.ip() == target.ip()
+                && (!listener.ip().is_unicast_link_local()
+                    || listener.scope_id() == 0
+                    || listener.scope_id() == target.scope_id())
+        }
+        _ => false,
+    }
+}
+
+fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Result<Vec<Nat64Prefix>, DestinationError> {
     const IPV4ONLY: [std::net::Ipv4Addr; 2] = [
         std::net::Ipv4Addr::new(192, 0, 0, 170),
         std::net::Ipv4Addr::new(192, 0, 0, 171),
     ];
     const LENGTHS: [u8; 6] = [32, 40, 48, 56, 64, 96];
 
-    let ipv6_answers: Vec<_> = answers
-        .iter()
-        .filter_map(|answer| match answer.ip() {
-            IpAddr::V6(ip) => Some(ip),
-            IpAddr::V4(_) => None,
-        })
-        .collect();
+    if answers.is_empty() {
+        return Err(DestinationError::ResolutionFailed);
+    }
+    let mut seen_ipv4 = [false; 2];
+    let mut ipv6_answers = Vec::new();
+    for answer in answers {
+        match answer.ip() {
+            IpAddr::V4(ip) if ip == IPV4ONLY[0] => seen_ipv4[0] = true,
+            IpAddr::V4(ip) if ip == IPV4ONLY[1] => seen_ipv4[1] = true,
+            IpAddr::V4(_) => return Err(DestinationError::ResolutionFailed),
+            IpAddr::V6(ip) => ipv6_answers.push(ip),
+        }
+    }
+    if seen_ipv4 != [false, false] && seen_ipv4 != [true, true] {
+        return Err(DestinationError::ResolutionFailed);
+    }
+    if ipv6_answers.is_empty() {
+        return (seen_ipv4 == [true, true])
+            .then(Vec::new)
+            .ok_or(DestinationError::ResolutionFailed);
+    }
+
     let mut prefixes = Vec::new();
     for length in LENGTHS {
         let mask = u128::MAX << (128 - u32::from(length));
@@ -395,6 +474,9 @@ fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Vec<Nat64Prefix> {
                 network: std::net::Ipv6Addr::from(u128::from(*address) & mask),
                 length,
             };
+            if !super::ip::nat64_prefix_is_usable(prefix) {
+                continue;
+            }
             let mut seen = [false; 2];
             for candidate in &ipv6_answers {
                 if let Some(extracted) = extract_rfc6052(*candidate, prefix) {
@@ -411,20 +493,33 @@ fn discover_nat64_prefixes(answers: &[SocketAddr]) -> Vec<Nat64Prefix> {
         }
     }
     prefixes.sort_unstable_by_key(|prefix| (prefix.length, u128::from(prefix.network)));
-    prefixes
+    let all_ipv6_answers_accounted_for = ipv6_answers.iter().all(|answer| {
+        prefixes.iter().any(|prefix| {
+            extract_rfc6052(*answer, *prefix).is_some_and(|embedded| IPV4ONLY.contains(&embedded))
+        })
+    });
+    if prefixes.is_empty() || !all_ipv6_answers_accounted_for {
+        return Err(DestinationError::ResolutionFailed);
+    }
+
+    prefixes.retain(|prefix| {
+        !(prefix.network == std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0)
+            && prefix.length == 96)
+    });
+    Ok(prefixes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::ip::LocalNetworks;
+    use super::super::ip::{LocalNetworkEntry, LocalNetworks, Nat64Prefix};
     use super::{
         Clock, DestinationError, DestinationValidator, DnsResolver, ListenerBinding,
-        LocalNetworkProvider, OutboundPolicy, network_for_interface,
+        LocalNetworkProvider, OutboundPolicy, discover_nat64_prefixes, network_for_interface,
     };
     use async_trait::async_trait;
     use std::{
         io,
-        net::SocketAddr,
+        net::{Ipv6Addr, SocketAddr, SocketAddrV6},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -447,6 +542,19 @@ mod tests {
     }
 
     struct SlowThenStalledResolver;
+
+    struct RecordingResolver {
+        answer: Vec<SocketAddr>,
+        hosts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl DnsResolver for RecordingResolver {
+        async fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            self.hosts.lock().unwrap().push(host.to_owned());
+            Ok(self.answer.clone())
+        }
+    }
 
     #[async_trait]
     impl DnsResolver for SlowThenStalledResolver {
@@ -680,6 +788,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ibm_metadata_literal_and_dns_answer_remain_blocked_with_private_opt_in() {
+        let policy = OutboundPolicy {
+            allow_private_network_sources: true,
+        };
+        let literal_resolver = FakeResolver::new(Vec::new());
+        let literal = validator(literal_resolver.clone());
+        assert_eq!(
+            literal
+                .validate(&Url::parse("http://169.254.169.253/").unwrap(), policy)
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+        assert_eq!(literal_resolver.calls.load(Ordering::SeqCst), 0);
+
+        let dns = validator(FakeResolver::new(vec![
+            "169.254.169.253:80".parse().unwrap(),
+        ]));
+        assert_eq!(
+            dns.validate(&Url::parse("http://metadata.example/").unwrap(), policy)
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+    }
+
+    #[tokio::test]
     async fn empty_failed_and_oversized_dns_answers_fail_closed() {
         for resolver in [
             FakeResolver::new(Vec::new()),
@@ -719,6 +854,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_link_local_answers_require_opt_in_and_preserve_normalized_scope() {
+        let ip: Ipv6Addr = "fe80::1234".parse().unwrap();
+        let resolver = FakeResolver::new(vec![
+            SocketAddr::V6(SocketAddrV6::new(ip, 1234, 7, 2)),
+            SocketAddr::V6(SocketAddrV6::new(ip, 4321, 11, 2)),
+        ]);
+        let validator = validator(resolver);
+        let target = Url::parse("http://link-local.example:8080/").unwrap();
+
+        assert_eq!(
+            validator
+                .validate(&target, OutboundPolicy::default())
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+        let resolved = validator
+            .validate(
+                &target,
+                OutboundPolicy {
+                    allow_private_network_sources: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.addrs,
+            vec![SocketAddr::V6(SocketAddrV6::new(ip, 8080, 0, 2))]
+        );
+    }
+
+    #[tokio::test]
+    async fn link_local_answers_with_zero_scope_are_always_blocked() {
+        let validator = validator(FakeResolver::new(vec!["[fe80::1234]:80".parse().unwrap()]));
+
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://link-local.example/").unwrap(),
+                    OutboundPolicy {
+                        allow_private_network_sources: true,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn link_local_url_literals_are_rejected_without_dns() {
+        let resolver = FakeResolver::new(Vec::new());
+        let validator = validator(resolver.clone());
+
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[fe80::1234]/").unwrap(),
+                    OutboundPolicy {
+                        allow_private_network_sources: true,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        for target in ["http://[fe80::1234%2]/", "http://[fe80::1234%252]/"] {
+            assert!(Url::parse(target).is_err(), "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn link_local_answers_on_different_nonzero_scopes_remain_distinct() {
+        let ip: Ipv6Addr = "fe80::1234".parse().unwrap();
+        let validator = validator(FakeResolver::new(vec![
+            SocketAddr::V6(SocketAddrV6::new(ip, 80, 0, 3)),
+            SocketAddr::V6(SocketAddrV6::new(ip, 80, 0, 2)),
+        ]));
+
+        let resolved = validator
+            .validate(
+                &Url::parse("http://link-local.example/").unwrap(),
+                OutboundPolicy {
+                    allow_private_network_sources: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.addrs,
+            vec![
+                SocketAddr::V6(SocketAddrV6::new(ip, 80, 0, 2)),
+                SocketAddr::V6(SocketAddrV6::new(ip, 80, 0, 3)),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn exact_and_wildcard_self_listeners_are_always_blocked() {
         let local = LocalNetworks {
             interfaces: vec!["8.8.8.8/29".parse().unwrap()],
@@ -731,8 +965,7 @@ mod tests {
             FakeResolver::new(vec!["93.184.216.34:11470".parse().unwrap()]),
             LocalNetworks::default(),
             vec![ListenerBinding {
-                address: "93.184.216.34".parse().unwrap(),
-                port: 11470,
+                socket: "93.184.216.34:11470".parse().unwrap(),
             }],
         );
         assert_eq!(
@@ -747,8 +980,7 @@ mod tests {
             FakeResolver::new(vec!["8.8.8.8:11470".parse().unwrap()]),
             local,
             vec![ListenerBinding {
-                address: "0.0.0.0".parse().unwrap(),
-                port: 11470,
+                socket: "0.0.0.0:11470".parse().unwrap(),
             }],
         );
         assert_eq!(
@@ -769,8 +1001,7 @@ mod tests {
             interfaces: vec!["8.8.8.9/29".parse().unwrap()],
         };
         let listeners = vec![ListenerBinding {
-            address: "0.0.0.0".parse().unwrap(),
-            port: 11470,
+            socket: "0.0.0.0:11470".parse().unwrap(),
         }];
         let policy = OutboundPolicy {
             allow_private_network_sources: true,
@@ -813,8 +1044,7 @@ mod tests {
                 interfaces: vec!["8.8.8.8/29".parse().unwrap()],
             },
             vec![ListenerBinding {
-                address: "::".parse().unwrap(),
-                port: 11470,
+                socket: "[::]:11470".parse().unwrap(),
             }],
         );
         assert_eq!(
@@ -837,8 +1067,7 @@ mod tests {
             FakeResolver::new(vec!["93.184.216.34:8080".parse().unwrap()]),
             LocalNetworks::default(),
             vec![ListenerBinding {
-                address: "93.184.216.34".parse().unwrap(),
-                port: 11470,
+                socket: "93.184.216.34:11470".parse().unwrap(),
             }],
         );
         assert!(
@@ -858,8 +1087,7 @@ mod tests {
             FakeResolver::new(Vec::new()),
             LocalNetworks::default(),
             vec![ListenerBinding {
-                address: "93.184.216.34".parse().unwrap(),
-                port: 80,
+                socket: "93.184.216.34:80".parse().unwrap(),
             }],
         );
         for target in [
@@ -875,6 +1103,136 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_link_local_listener_matches_only_its_nonzero_scope() {
+        let ip: Ipv6Addr = "fe80::1234".parse().unwrap();
+        let local = LocalNetworks {
+            interfaces: vec!["fe80::1234/64".parse().unwrap()],
+        };
+        let listeners = vec![ListenerBinding {
+            socket: SocketAddr::V6(SocketAddrV6::new(ip, 11470, 77, 2)),
+        }];
+        let policy = OutboundPolicy {
+            allow_private_network_sources: true,
+        };
+
+        let same_scope = validator_with_listeners(
+            FakeResolver::new(vec![SocketAddr::V6(SocketAddrV6::new(ip, 11470, 42, 2))]),
+            local.clone(),
+            listeners.clone(),
+        );
+        assert_eq!(
+            same_scope
+                .validate(
+                    &Url::parse("http://same-scope.example:11470/").unwrap(),
+                    policy
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+
+        let different_scope = validator_with_listeners(
+            FakeResolver::new(vec![SocketAddr::V6(SocketAddrV6::new(ip, 11470, 11, 3))]),
+            local,
+            listeners,
+        );
+        assert!(
+            different_scope
+                .validate(
+                    &Url::parse("http://different-scope.example:11470/").unwrap(),
+                    policy,
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_scope_and_wildcard_ipv6_listeners_block_scoped_local_targets() {
+        let ip: Ipv6Addr = "fe80::1234".parse().unwrap();
+        let local = LocalNetworks {
+            interfaces: vec!["fe80::1234/64".parse().unwrap()],
+        };
+        let policy = OutboundPolicy {
+            allow_private_network_sources: true,
+        };
+
+        for socket in [
+            SocketAddr::V6(SocketAddrV6::new(ip, 11470, 9, 0)),
+            "[::]:11470".parse().unwrap(),
+        ] {
+            for scope in [2, 3] {
+                let validator = validator_with_listeners(
+                    FakeResolver::new(vec![SocketAddr::V6(SocketAddrV6::new(ip, 11470, 0, scope))]),
+                    local.clone(),
+                    vec![ListenerBinding { socket }],
+                );
+                assert_eq!(
+                    validator
+                        .validate(
+                            &Url::parse("http://scoped-local.example:11470/").unwrap(),
+                            policy,
+                        )
+                        .await
+                        .unwrap_err(),
+                    DestinationError::Blocked,
+                    "listener={socket}, scope={scope}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_link_local_listener_scope_and_ipv6_flowinfo_are_not_endpoint_identity() {
+        let ip: Ipv6Addr = "64:ff9b::5db8:d822".parse().unwrap();
+        let validator = validator_with_listeners(
+            FakeResolver::new(vec![SocketAddr::V6(SocketAddrV6::new(ip, 11470, 3, 8))]),
+            LocalNetworks::default(),
+            vec![ListenerBinding {
+                socket: SocketAddr::V6(SocketAddrV6::new(ip, 11470, 99, 4)),
+            }],
+        );
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://same-native-ip.example:11470/").unwrap(),
+                    OutboundPolicy::default(),
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_wildcard_keeps_native_identity_when_nat64_also_decodes_target() {
+        let validator = validator_with_listeners(
+            FakeResolver::new(vec![
+                "[2001:4860:64::c000:aa]:0".parse().unwrap(),
+                "[2001:4860:64::c000:ab]:0".parse().unwrap(),
+            ]),
+            LocalNetworks {
+                interfaces: vec!["2001:4860:64::5db8:d822/128".parse().unwrap()],
+            },
+            vec![ListenerBinding {
+                socket: "[::]:80".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[2001:4860:64::5db8:d822]/").unwrap(),
+                    OutboundPolicy {
+                        allow_private_network_sources: true,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
     }
 
     #[tokio::test]
@@ -896,6 +1254,236 @@ mod tests {
             );
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pref64_discovery_uses_the_absolute_ipv4only_name() {
+        let resolver = Arc::new(RecordingResolver {
+            answer: vec![
+                "192.0.0.170:0".parse().unwrap(),
+                "192.0.0.171:0".parse().unwrap(),
+            ],
+            hosts: Mutex::new(Vec::new()),
+        });
+        let validator = DestinationValidator::new(
+            resolver.clone(),
+            Arc::new(StaticLocalNetworks(LocalNetworks::default())),
+            Arc::new(FixedClock(Instant::now())),
+            Vec::new(),
+        );
+
+        assert!(
+            validator
+                .validate(
+                    &Url::parse("http://[2001:4860:4860::8888]/").unwrap(),
+                    OutboundPolicy::default(),
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            *resolver.hosts.lock().unwrap(),
+            vec!["ipv4only.arpa.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn strict_pref64_discovery_accepts_complete_public_ula_and_reserved_pairs() {
+        let cases = [
+            (
+                vec!["192.0.0.170:0", "192.0.0.171:0"],
+                Vec::<Nat64Prefix>::new(),
+            ),
+            (
+                vec!["[64:ff9b::c000:aa]:0", "[64:ff9b::c000:ab]:0"],
+                Vec::new(),
+            ),
+            (
+                vec!["[2001:4860:64::c000:aa]:0", "[2001:4860:64::c000:ab]:0"],
+                vec![Nat64Prefix {
+                    network: "2001:4860:64::".parse().unwrap(),
+                    length: 96,
+                }],
+            ),
+            (
+                vec!["[fd12:3456:789a::c000:aa]:0", "[fd12:3456:789a::c000:ab]:0"],
+                vec![Nat64Prefix {
+                    network: "fd12:3456:789a::".parse().unwrap(),
+                    length: 96,
+                }],
+            ),
+            (
+                vec!["[64:ff9b:1:1::c000:aa]:0", "[64:ff9b:1:1::c000:ab]:0"],
+                vec![Nat64Prefix {
+                    network: "64:ff9b:1:1::".parse().unwrap(),
+                    length: 96,
+                }],
+            ),
+        ];
+
+        for (answers, expected) in cases {
+            let answers = answers
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(discover_nat64_prefixes(&answers).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn strict_pref64_discovery_accepts_every_allowed_rfc6052_length_in_reserved_space() {
+        fn embed(prefix: Nat64Prefix, ipv4: std::net::Ipv4Addr) -> Ipv6Addr {
+            let mut bytes = prefix.network.octets();
+            let ipv4 = ipv4.octets();
+            match prefix.length {
+                32 => bytes[4..8].copy_from_slice(&ipv4),
+                40 => {
+                    bytes[5..8].copy_from_slice(&ipv4[..3]);
+                    bytes[9] = ipv4[3];
+                }
+                48 => {
+                    bytes[6..8].copy_from_slice(&ipv4[..2]);
+                    bytes[9..11].copy_from_slice(&ipv4[2..]);
+                }
+                56 => {
+                    bytes[7] = ipv4[0];
+                    bytes[9..12].copy_from_slice(&ipv4[1..]);
+                }
+                64 => bytes[9..13].copy_from_slice(&ipv4),
+                96 => bytes[12..16].copy_from_slice(&ipv4),
+                _ => panic!("unsupported test prefix length"),
+            }
+            Ipv6Addr::from(bytes)
+        }
+
+        for prefix in [
+            Nat64Prefix {
+                network: "64:ff9b:1:100::".parse().unwrap(),
+                length: 56,
+            },
+            Nat64Prefix {
+                network: "64:ff9b:1:1::".parse().unwrap(),
+                length: 64,
+            },
+            Nat64Prefix {
+                network: "64:ff9b:1:1::".parse().unwrap(),
+                length: 96,
+            },
+        ] {
+            let answers = [
+                embed(prefix, std::net::Ipv4Addr::new(192, 0, 0, 170)),
+                embed(prefix, std::net::Ipv4Addr::new(192, 0, 0, 171)),
+            ]
+            .map(|ip| SocketAddr::new(ip.into(), 0));
+            let discovered = discover_nat64_prefixes(&answers).unwrap();
+            assert!(discovered.contains(&prefix), "prefix={prefix:?}");
+        }
+    }
+
+    #[test]
+    fn strict_pref64_discovery_rejects_incomplete_poisoned_and_unusable_answers() {
+        let invalid = [
+            vec![],
+            vec!["192.0.0.170:0"],
+            vec!["198.51.100.10:0", "192.0.0.170:0", "192.0.0.171:0"],
+            vec![
+                "[64:ff9b::c000:aa]:0",
+                "[64:ff9b::c000:ab]:0",
+                "198.51.100.10:0",
+            ],
+            vec![
+                "[2001:4860:64::c000:aa]:0",
+                "[2001:4860:64::c000:ab]:0",
+                "[2606:4700:64::c000:aa]:0",
+            ],
+            vec!["[fe80::c000:aa]:0", "[fe80::c000:ab]:0"],
+            vec!["[2001:db8::c000:aa]:0", "[2001:db8::c000:ab]:0"],
+            vec!["[fd00:42::c000:aa]:0", "[fd00:42::c000:ab]:0"],
+            vec![
+                "[2001:4860:64:0:100::c000:aa]:0",
+                "[2001:4860:64:0:100::c000:ab]:0",
+            ],
+            vec![
+                "[2001:4860:64::c000:aa]:0",
+                "[2001:4860:64::c000:ab]:0",
+                "[fe80::c000:aa]:0",
+                "[fe80::c000:ab]:0",
+            ],
+        ];
+
+        for values in invalid {
+            let answers = values
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                discover_nat64_prefixes(&answers).is_err(),
+                "unexpected valid answers: {answers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nat64_cache_identity_preserves_address_to_interface_assignment() {
+        fn entry(network: &str, name: &str, index: u32) -> LocalNetworkEntry {
+            LocalNetworkEntry {
+                network: network.parse().unwrap(),
+                name: name.to_owned(),
+                index: Some(index),
+                adapter_id: Some(format!("adapter-{index}")),
+            }
+        }
+
+        let resolver = Arc::new(MutableResolver {
+            answer: Mutex::new(vec![
+                "[2001:4860:64::c000:aa]:0".parse().unwrap(),
+                "[2001:4860:64::c000:ab]:0".parse().unwrap(),
+            ]),
+            calls: AtomicUsize::new(0),
+        });
+        let local = Arc::new(MutableLocalNetworks(Mutex::new(LocalNetworks {
+            interfaces: vec![
+                entry("192.168.1.10/24", "ethernet", 1),
+                entry("10.0.0.10/24", "wifi", 2),
+            ],
+        })));
+        let validator = DestinationValidator::new(
+            resolver.clone(),
+            local.clone(),
+            Arc::new(FixedClock(Instant::now())),
+            Vec::new(),
+        );
+        let policy = OutboundPolicy {
+            allow_private_network_sources: true,
+        };
+
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[2001:4860:64::a9fe:a9fd]/").unwrap(),
+                    policy,
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+        local.replace(LocalNetworks {
+            interfaces: vec![
+                entry("10.0.0.10/24", "ethernet", 1),
+                entry("192.168.1.10/24", "wifi", 2),
+            ],
+        });
+        assert_eq!(
+            validator
+                .validate(
+                    &Url::parse("http://[2001:4860:64::a9fe:a9fd]/").unwrap(),
+                    policy,
+                )
+                .await
+                .unwrap_err(),
+            DestinationError::Blocked
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -924,17 +1512,58 @@ mod tests {
 
     #[tokio::test]
     async fn nat64_discovery_failure_rejects_unclassifiable_public_ipv6() {
-        let validator = validator(FakeResolver::failing());
+        let resolver = FakeResolver::failing();
+        let validator = validator(resolver.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                validator
+                    .validate(
+                        &Url::parse("http://[2001:4860:4860::8888]/").unwrap(),
+                        OutboundPolicy::default(),
+                    )
+                    .await
+                    .unwrap_err(),
+                DestinationError::ResolutionFailed
+            );
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discovered_more_specific_rfc8215_prefix_can_authorize_public_embedding() {
+        let resolver = FakeResolver::new(vec![
+            "[64:ff9b:1:1::c000:aa]:0".parse().unwrap(),
+            "[64:ff9b:1:1::c000:ab]:0".parse().unwrap(),
+        ]);
+        let validator = validator(resolver.clone());
+        let resolved = validator
+            .validate(
+                &Url::parse("http://[64:ff9b:1:1::5db8:d822]/").unwrap(),
+                OutboundPolicy::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
+            resolved.addrs,
+            vec!["[64:ff9b:1:1::5db8:d822]:80".parse().unwrap()]
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn well_known_nat64_public_target_never_triggers_discovery() {
+        let resolver = FakeResolver::failing();
+        let validator = validator(resolver.clone());
+        assert!(
             validator
                 .validate(
-                    &Url::parse("http://[2001:4860:4860::8888]/").unwrap(),
+                    &Url::parse("http://[64:ff9b::5db8:d822]/").unwrap(),
                     OutboundPolicy::default(),
                 )
                 .await
-                .unwrap_err(),
-            DestinationError::ResolutionFailed
+                .is_ok()
         );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1099,7 +1728,7 @@ mod tests {
 
         let up = interface("8.8.8.8".parse().unwrap(), 24, if_addrs::IfOperStatus::Up);
         assert_eq!(
-            network_for_interface(&up).unwrap().to_string(),
+            network_for_interface(&up).unwrap().network.to_string(),
             "8.8.8.8/24"
         );
 

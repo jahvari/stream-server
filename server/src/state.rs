@@ -467,8 +467,7 @@ impl AppState {
             Arc::new(SystemLocalNetworkProvider),
             Arc::new(SystemClock),
             vec![ListenerBinding {
-                address: default_http_addr.ip(),
-                port: default_http_addr.port(),
+                socket: default_http_addr,
             }],
         ));
 
