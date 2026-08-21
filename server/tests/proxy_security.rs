@@ -15,6 +15,12 @@ use std::{
     time::Duration,
 };
 
+static EMBEDDED_SERVER_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serialize_embedded_servers() -> tokio::sync::MutexGuard<'static, ()> {
+    EMBEDDED_SERVER_TEST_MUTEX.lock().await
+}
+
 async fn range(headers: HeaderMap) -> Response<Body> {
     let bytes = b"0123456789";
     if headers
@@ -148,6 +154,7 @@ fn proxy_url(server: std::net::SocketAddr, target: &str) -> String {
 
 #[tokio::test]
 async fn proxy_failure_bodies_never_expose_request_credentials() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     const SECRETS: &[&str] = &[
         "parser-header-secret-9c30",
         "policy-user-secret-9c30",
@@ -277,6 +284,7 @@ async fn proxy_failure_bodies_never_expose_request_credentials() -> anyhow::Resu
 
 #[tokio::test]
 async fn marker_preserving_reverse_proxy_cannot_reenter_application_routes() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     let server_address = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
     let fixture_server_address = server_address.clone();
     let fixture_router = Router::new().route(
@@ -369,6 +377,7 @@ async fn marker_preserving_reverse_proxy_cannot_reenter_application_routes() -> 
 #[tokio::test]
 async fn managed_https_port_zero_reports_serves_and_blocks_the_exact_socket() -> anyhow::Result<()>
 {
+    let _server_test_guard = serialize_embedded_servers().await;
     let config = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let config_dir = config.path().join("config");
@@ -431,6 +440,7 @@ async fn managed_https_port_zero_reports_serves_and_blocks_the_exact_socket() ->
 #[tokio::test]
 async fn failed_https_preparation_is_not_registered_and_http_remains_usable() -> anyhow::Result<()>
 {
+    let _server_test_guard = serialize_embedded_servers().await;
     let occupied_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let occupied_address = occupied_listener.local_addr()?;
     let fixture = tokio::spawn(async move {
@@ -491,6 +501,7 @@ async fn failed_https_preparation_is_not_registered_and_http_remains_usable() ->
 
 #[tokio::test]
 async fn malformed_https_pem_leaves_http_ready_without_a_stale_listener() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     let config = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let config_dir = config.path().join("config");
@@ -523,6 +534,7 @@ async fn malformed_https_pem_leaves_http_ready_without_a_stale_listener() -> any
 
 #[tokio::test]
 async fn unreadable_https_pem_leaves_http_ready_without_a_stale_listener() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     let config = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let config_dir = config.path().join("config");
@@ -560,6 +572,7 @@ async fn unreadable_https_pem_leaves_http_ready_without_a_stale_listener() -> an
 
 #[tokio::test]
 async fn normal_encoded_core_path_form_reaches_destination_policy() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     let config = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let server_config = stream_server::ServerConfig {
@@ -599,6 +612,7 @@ async fn normal_encoded_core_path_form_reaches_destination_policy() -> anyhow::R
 
 #[tokio::test]
 async fn default_deny_protected_opt_in_and_cancellation_work_end_to_end() -> anyhow::Result<()> {
+    let _server_test_guard = serialize_embedded_servers().await;
     let (fixture_addr, fixture_task) = start_fixture().await;
     let (tls_fixture_addr, tls_fixture_task) = start_tls_fixture().await?;
     let config = tempfile::tempdir()?;
