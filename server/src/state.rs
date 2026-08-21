@@ -29,6 +29,8 @@ pub(crate) struct SettingsPersistenceCoordinator {
     fail_parent_sync: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     before_final_side_effect_gate: std::sync::Mutex<Option<Arc<SettingsPersistenceTestGate>>>,
+    #[cfg(test)]
+    post_persist_side_effect_count: std::sync::atomic::AtomicUsize,
 }
 
 struct SettingsSupervisorState {
@@ -130,6 +132,8 @@ impl SettingsPersistenceCoordinator {
             fail_parent_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             before_final_side_effect_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            post_persist_side_effect_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -354,6 +358,18 @@ impl SettingsPersistenceCoordinator {
     #[cfg(test)]
     pub(crate) fn active_transaction_count(&self) -> usize {
         self.active_transactions
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_post_persist_side_effects(&self) {
+        self.post_persist_side_effect_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_persist_side_effect_count(&self) -> usize {
+        self.post_persist_side_effect_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }

@@ -362,13 +362,13 @@ export component AppWindow inherits Window {
                         ToggleRow { label: "Validate HTTPS trackers"; checked <=> root.bt-validate-https-trackers; }
                         ToggleRow {
                             label: "Allow private/LAN proxy sources";
-                            description: "Lets /proxy reach devices and services on this computer or LAN. Known cloud metadata addresses remain blocked.";
+                            description: "Global for every /proxy request. Allows eligible computer/LAN services; metadata stays blocked.";
                             enabled: root.protected-settings-enabled;
                             checked <=> root.allow-private-network-sources;
                         }
                         ToggleRow {
                             label: "Allow invalid proxy TLS certificates";
-                            description: "Disables certificate verification for /proxy only. Enable only for a trusted self-signed source.";
+                            description: "Global for every /proxy request. Disables certificate checks; enable only when required.";
                             enabled: root.protected-settings-enabled;
                             checked <=> root.allow-invalid-proxy-tls-certificates;
                         }

@@ -923,6 +923,10 @@ pub async fn update_settings(
                 .finish_reconfigure(proxy_policy);
             drop(published);
 
+            #[cfg(test)]
+            transaction_state
+                .settings_persistence
+                .record_post_persist_side_effects();
             transaction_state
                 .engine
                 .update_torrent_settings(&new_profile, &new_privacy)
@@ -1335,7 +1339,216 @@ pub async fn get_file_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings_control::SettingsMutationAuthority;
+    use crate::settings_control::{
+        SETTINGS_TOKEN_HEADER, SettingsControl, SettingsMutationAuthority,
+    };
+    use enginefs::EngineFS;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn real_settings_handler_uses_connect_info_token_and_ignores_forwarded_headers() {
+        async fn call(
+            state: &AppState,
+            peer: &str,
+            token: Option<&[u8]>,
+            forwarded_for: Option<&str>,
+            value: bool,
+        ) -> StatusCode {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    SETTINGS_TOKEN_HEADER,
+                    axum::http::HeaderValue::from_bytes(token).unwrap(),
+                );
+            }
+            if let Some(forwarded_for) = forwarded_for {
+                headers.insert(
+                    "x-forwarded-for",
+                    axum::http::HeaderValue::from_str(forwarded_for).unwrap(),
+                );
+                headers.insert(
+                    "forwarded",
+                    axum::http::HeaderValue::from_str(&format!("for={forwarded_for}")).unwrap(),
+                );
+            }
+            set_settings(
+                ConnectInfo(peer.parse().unwrap()),
+                State(state.clone()),
+                headers,
+                Json(json!({"allowPrivateNetworkSources": value})),
+            )
+            .await
+            .status()
+        }
+
+        let _engine_test_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(
+            engine,
+            ServerSettings::default(),
+            temp.path().join("config"),
+        );
+        let token = [b'a'; 64];
+        state.settings_control = SettingsControl::for_test(token);
+
+        for (peer, next) in [
+            ("127.0.0.1:40000", true),
+            ("[::1]:40000", false),
+            ("[::ffff:127.0.0.1]:40000", true),
+        ] {
+            assert_eq!(
+                call(&state, peer, Some(&token), None, next).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            call(
+                &state,
+                "127.0.0.1:40000",
+                Some(&token),
+                Some("192.168.1.50"),
+                false,
+            )
+            .await,
+            StatusCode::OK,
+            "forwarded remote address must not override loopback ConnectInfo"
+        );
+
+        for (peer, token_value, forwarded) in [
+            ("192.168.1.50:40000", Some(&token[..]), Some("127.0.0.1")),
+            ("[::ffff:192.168.1.50]:40000", Some(&token[..]), None),
+            ("127.0.0.1:40000", None, None),
+            ("127.0.0.1:40000", Some(&[b'b'; 64][..]), None),
+        ] {
+            assert_eq!(
+                call(&state, peer, token_value, forwarded, true).await,
+                StatusCode::FORBIDDEN,
+                "peer={peer}"
+            );
+        }
+        assert_eq!(
+            call(&state, "192.168.1.50:40000", None, Some("127.0.0.1"), false,).await,
+            StatusCode::OK,
+            "unchanged protected values remain compatible for untrusted callers"
+        );
+        assert!(!state.settings.read().await.allow_private_network_sources);
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_rolls_back_handler_policy_engine_and_tracker_state() {
+        let _engine_test_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(
+            engine,
+            ServerSettings::default(),
+            temp.path().join("config"),
+        );
+        let token = [b'a'; 64];
+        state.settings_control = SettingsControl::for_test(token);
+        std::fs::create_dir_all(&state.settings_path).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SETTINGS_TOKEN_HEADER,
+            axum::http::HeaderValue::from_bytes(&token).unwrap(),
+        );
+        let response = set_settings(
+            ConnectInfo("127.0.0.1:40000".parse().unwrap()),
+            State(state.clone()),
+            headers,
+            Json(json!({
+                "allowPrivateNetworkSources": true,
+                "btMaxConnections": 321,
+                "btProxyPassword": "unique-secret-marker",
+                "cacheSize": 123.0,
+                "seedingEnabled": false,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let outward = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            outward,
+            r#"{"error":"settings could not be saved","success":false}"#
+        );
+        assert!(!outward.contains("unique-secret-marker"));
+        assert!(!outward.contains(state.settings_path.to_string_lossy().as_ref()));
+
+        let live = state.settings.read().await.clone();
+        assert!(!live.allow_private_network_sources);
+        assert_eq!(
+            live.bt_max_connections,
+            ServerSettings::default().bt_max_connections
+        );
+        assert_eq!(live.cache_size, ServerSettings::default().cache_size);
+        assert!(live.bt_proxy_password.is_empty());
+        assert!(live.cached_trackers.is_empty());
+        assert!(live.seeding_enabled);
+        let raw = state.settings_persistence.raw_snapshot().await;
+        assert!(!raw.allow_private_network_sources);
+        assert_eq!(
+            raw.bt_max_connections,
+            ServerSettings::default().bt_max_connections
+        );
+        assert_eq!(raw.cache_size, ServerSettings::default().cache_size);
+        assert!(raw.bt_proxy_password.is_empty());
+        assert!(raw.cached_trackers.is_empty());
+        assert!(raw.seeding_enabled);
+        let request = state.proxy_runtime.try_request().unwrap();
+        assert!(!request.settings.allow_private_network_sources);
+        assert!(state.engine.seeding_enabled());
+        assert!(state.download_engine.seeding_enabled());
+        assert_eq!(
+            state.settings_persistence.post_persist_side_effect_count(),
+            0
+        );
+
+        let bridge = crate::state::TrackerStorageBridge::new_with_persistence(
+            state.settings.clone(),
+            state.settings_path.clone(),
+            state.settings_persistence.clone(),
+        );
+        assert!(
+            bridge
+                .save_trackers_with_completion(
+                    vec!["udp://unique-tracker-secret".to_string()],
+                    123,
+                )
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(state.settings.read().await.cached_trackers.is_empty());
+        assert!(
+            state
+                .settings_persistence
+                .raw_snapshot()
+                .await
+                .cached_trackers
+                .is_empty()
+        );
+        assert_eq!(
+            state.settings_persistence.post_persist_side_effect_count(),
+            0
+        );
+        assert!(state.settings_path.is_dir());
+    }
 
     #[test]
     fn server_version_default_uses_crate_version() {

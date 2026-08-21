@@ -426,6 +426,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_new_token_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        SettingsControl::load_or_create(temp.path()).unwrap();
+        let mode = fs::metadata(temp.path().join("settings-control.token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_symlink_is_rejected_or_reports_missing_symlink_privilege() {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.token");
+        fs::write(&target, [b'a'; 64]).unwrap();
+        let path = temp.path().join("settings-control.token");
+        match std::os::windows::fs::symlink_file(&target, &path) {
+            Ok(()) => {
+                assert!(SettingsControl::load_or_create(temp.path()).is_err());
+                assert_eq!(fs::read(target).unwrap(), [b'a'; 64]);
+                eprintln!("Windows token symlink regression executed");
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(ERROR_PRIVILEGE_NOT_HELD),
+                    "unexpected Windows symlink creation error: {error}"
+                );
+                eprintln!("Windows token symlink regression skipped: ERROR_PRIVILEGE_NOT_HELD");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_token_symlinks_fifos_and_broad_permissions_are_rejected() {
         use std::os::{unix::ffi::OsStrExt, unix::fs::PermissionsExt};
 
