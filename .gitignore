@@ -5,5 +5,7 @@
 /vcpkg
 /vcpkg_installed
 /memory/
+/.vscode/
+/debug.log
 err.txt
 /System.Collections.Hashtable.Root/
