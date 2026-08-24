@@ -2,6 +2,7 @@
 name = "async-sevenz"
 version = "0.1.8"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 autocxx = "0.30"
