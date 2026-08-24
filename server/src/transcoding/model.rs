@@ -33,9 +33,11 @@ impl<'de> Deserialize<'de> for DeviceId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceClass {
-    Cpu,
-    IntegratedGpu,
-    DiscreteGpu,
+    Integrated,
+    Discrete,
+    Virtual,
+    Software,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -52,10 +54,13 @@ pub enum BackendKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityState {
-    Available,
+    Unknown,
+    Listed,
+    Verifying,
     Verified,
-    Unavailable,
-    Disabled,
+    Unsupported,
+    TemporarilyFailed,
+    AdministrativelyDisabled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -293,6 +298,9 @@ impl RateControlEnvelope {
         if buffer_bits == 0 {
             return Err(ModelValidationError::new("buffer size must be nonzero"));
         }
+        if audio_bps == 0 {
+            return Err(ModelValidationError::new("audio bitrate must be nonzero"));
+        }
 
         Ok(Self {
             intent,
@@ -315,12 +323,120 @@ pub enum KeyframeStrategy {
     TimeForced { segment_duration_ms: NonZeroU32 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct ValidatedMediaSource(String);
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ValidatedMediaSource {
+    CompletedFile(CompletedFileSource),
+    EngineLoopback(EngineLoopbackSource),
+    ApprovedRemote(ApprovedRemoteSource),
+    SyntheticFixture(SyntheticFixtureSource),
+}
 
 impl ValidatedMediaSource {
-    pub fn opaque(value: impl Into<String>) -> Result<Self, ModelValidationError> {
+    pub fn completed_file(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self::CompletedFile(CompletedFileSource::new(id)?))
+    }
+
+    pub fn engine_loopback(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self::EngineLoopback(EngineLoopbackSource::new(id)?))
+    }
+
+    pub fn approved_remote(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self::ApprovedRemote(ApprovedRemoteSource::new(id)?))
+    }
+
+    pub fn synthetic_fixture(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self::SyntheticFixture(SyntheticFixtureSource::new(id)?))
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::CompletedFile(source) => source.id(),
+            Self::EngineLoopback(source) => source.id(),
+            Self::ApprovedRemote(source) => source.id(),
+            Self::SyntheticFixture(source) => source.id(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedFileSource {
+    id: SourceId,
+}
+
+impl CompletedFileSource {
+    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self {
+            id: SourceId::new(id)?,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineLoopbackSource {
+    id: SourceId,
+}
+
+impl EngineLoopbackSource {
+    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self {
+            id: SourceId::new(id)?,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovedRemoteSource {
+    id: SourceId,
+}
+
+impl ApprovedRemoteSource {
+    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self {
+            id: SourceId::new(id)?,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyntheticFixtureSource {
+    id: SourceId,
+}
+
+impl SyntheticFixtureSource {
+    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+        Ok(Self {
+            id: SourceId::new(id)?,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+#[serde(transparent)]
+struct SourceId(String);
+
+impl SourceId {
+    fn new(value: impl Into<String>) -> Result<Self, ModelValidationError> {
         let value = value.into();
         if is_safe_identifier(&value) {
             Ok(Self(value))
@@ -329,18 +445,18 @@ impl ValidatedMediaSource {
         }
     }
 
-    pub fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl<'de> Deserialize<'de> for ValidatedMediaSource {
+impl<'de> Deserialize<'de> for SourceId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::opaque(value).map_err(serde::de::Error::custom)
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -527,9 +643,22 @@ mod tests {
             },
             "{\"hardware\":{\"backend\":\"vaapi\",\"device\":\"renderD128\"}}",
         );
-        round_trip(DeviceClass::IntegratedGpu, "\"integratedGpu\"");
+        round_trip(DeviceClass::Integrated, "\"integrated\"");
+        round_trip(DeviceClass::Discrete, "\"discrete\"");
+        round_trip(DeviceClass::Virtual, "\"virtual\"");
+        round_trip(DeviceClass::Software, "\"software\"");
+        round_trip(DeviceClass::Unknown, "\"unknown\"");
         round_trip(BackendKind::VideoToolbox, "\"videoToolbox\"");
-        round_trip(CapabilityState::Available, "\"available\"");
+        round_trip(CapabilityState::Unknown, "\"unknown\"");
+        round_trip(CapabilityState::Listed, "\"listed\"");
+        round_trip(CapabilityState::Verifying, "\"verifying\"");
+        round_trip(CapabilityState::Verified, "\"verified\"");
+        round_trip(CapabilityState::Unsupported, "\"unsupported\"");
+        round_trip(CapabilityState::TemporarilyFailed, "\"temporarilyFailed\"");
+        round_trip(
+            CapabilityState::AdministrativelyDisabled,
+            "\"administrativelyDisabled\"",
+        );
         round_trip(FrameRateClass::Unknown, "\"unknown\"");
         round_trip(
             RateControlIntent::ConstrainedVariable,
@@ -563,11 +692,39 @@ mod tests {
     }
 
     #[test]
+    fn media_sources_are_closed_variants_not_raw_route_text() {
+        round_trip(
+            ValidatedMediaSource::completed_file("file-a").unwrap(),
+            "{\"completedFile\":{\"id\":\"file-a\"}}",
+        );
+        round_trip(
+            ValidatedMediaSource::engine_loopback("loopback-a").unwrap(),
+            "{\"engineLoopback\":{\"id\":\"loopback-a\"}}",
+        );
+        round_trip(
+            ValidatedMediaSource::approved_remote("remote-a").unwrap(),
+            "{\"approvedRemote\":{\"id\":\"remote-a\"}}",
+        );
+        round_trip(
+            ValidatedMediaSource::synthetic_fixture("fixture-a").unwrap(),
+            "{\"syntheticFixture\":{\"id\":\"fixture-a\"}}",
+        );
+
+        assert!(serde_json::from_str::<ValidatedMediaSource>("\"media-source\"").is_err());
+        assert!(
+            serde_json::from_str::<ValidatedMediaSource>(
+                "\"https://user:secret@example.test/video?token=abc\""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn serde_deserialization_enforces_value_invariants() {
         assert!(serde_json::from_str::<DeviceId>("\"/dev/dri/renderD128\"").is_err());
         assert!(
             serde_json::from_str::<ValidatedMediaSource>(
-                "\"https://user:secret@example.test/video?token=abc\""
+                "{\"completedFile\":{\"id\":\"C:\\\\Users\\\\Hunter\\\\private.mp4\"}}"
             )
             .is_err()
         );
@@ -584,6 +741,14 @@ mod tests {
                 "{\"intent\":\"constant\",\"targetVideoBps\":7000000,\"maxVideoBps\":6000000,\
                  \"bufferBits\":12000000,\"preset\":\"speed\",\"outputFrameRate\":null,\
                  \"width\":1920,\"height\":1080,\"audioBps\":128000}"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<RateControlEnvelope>(
+                "{\"intent\":\"constant\",\"targetVideoBps\":6000000,\"maxVideoBps\":6000000,\
+                 \"bufferBits\":12000000,\"preset\":\"speed\",\"outputFrameRate\":null,\
+                 \"width\":1920,\"height\":1080,\"audioBps\":0}"
             )
             .is_err()
         );
@@ -647,6 +812,20 @@ mod tests {
                 NonZeroU32::new(1920).unwrap(),
                 NonZeroU32::new(1080).unwrap(),
                 128_000,
+            )
+            .is_err()
+        );
+        assert!(
+            RateControlEnvelope::new(
+                RateControlIntent::Constant,
+                6_000_000,
+                6_000_000,
+                12_000_000,
+                PresetIntent::Speed,
+                None,
+                NonZeroU32::new(1920).unwrap(),
+                NonZeroU32::new(1080).unwrap(),
+                0,
             )
             .is_err()
         );

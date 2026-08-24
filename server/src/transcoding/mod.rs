@@ -16,7 +16,7 @@ mod tests {
 
     #[test]
     fn public_exports_can_compose_a_minimal_request() {
-        let source = ValidatedMediaSource::opaque("media-source").unwrap();
+        let source = ValidatedMediaSource::completed_file("media-source").unwrap();
         let envelope = RateControlEnvelope::new(
             RateControlIntent::ConstrainedVariable,
             4_000_000,

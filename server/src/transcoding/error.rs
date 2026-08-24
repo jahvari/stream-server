@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -61,12 +61,12 @@ impl FailureCode {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeFailure {
     pub code: FailureCode,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub context: BTreeMap<String, String>,
+    context: BTreeMap<String, String>,
     #[serde(skip)]
     internal_detail: Option<String>,
 }
@@ -89,6 +89,10 @@ impl TranscodeFailure {
         self
     }
 
+    pub fn context(&self) -> &BTreeMap<String, String> {
+        &self.context
+    }
+
     pub fn with_internal_detail(mut self, detail: impl Into<String>) -> Self {
         self.internal_detail = Some(detail.into());
         self
@@ -97,6 +101,39 @@ impl TranscodeFailure {
     #[allow(dead_code)]
     pub(crate) fn internal_detail(&self) -> Option<&str> {
         self.internal_detail.as_deref()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscodeFailure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            code: FailureCode,
+            #[serde(default)]
+            context: BTreeMap<String, String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut failure = Self::new(raw.code);
+        for (key, value) in raw.context {
+            let sanitized_key = sanitize_context_token(key.clone())
+                .ok_or_else(|| serde::de::Error::custom("unsafe failure context key"))?;
+            if sanitized_key != key {
+                return Err(serde::de::Error::custom("unsafe failure context key"));
+            }
+            let sanitized_value = sanitize_context_token(value.clone())
+                .ok_or_else(|| serde::de::Error::custom("unsafe failure context value"))?;
+            if sanitized_value != value {
+                return Err(serde::de::Error::custom("unsafe failure context value"));
+            }
+            failure.context.insert(key, value);
+        }
+
+        Ok(failure)
     }
 }
 
@@ -217,6 +254,41 @@ mod tests {
             ] {
                 assert!(!rendered.contains(secret), "{rendered}");
             }
+        }
+    }
+
+    #[test]
+    fn unsafe_context_is_rejected_from_json() {
+        let json = concat!(
+            "{\"code\":\"process_exit\",\"context\":{",
+            "\"stage\":\"encode\",",
+            "\"path\":\"C:\\\\Users\\\\Hunter\\\\Videos\\\\private.mp4\",",
+            "\"url\":\"https://user:secret@example.test/video?token=abc\"",
+            "}}"
+        );
+
+        assert!(serde_json::from_str::<TranscodeFailure>(json).is_err());
+    }
+
+    #[test]
+    fn unsafe_context_is_not_representable_through_public_builder() {
+        let failure = TranscodeFailure::new(FailureCode::ProcessExit)
+            .with_safe_context("stage", "encode")
+            .with_safe_context("path", "C:\\Users\\Hunter\\Videos\\private.mp4")
+            .with_safe_context("url", "https://user:secret@example.test/video?token=abc")
+            .with_safe_context("stderr", "raw stderr");
+
+        let serialized = serde_json::to_string(&failure).unwrap();
+        let display = failure.to_string();
+        let debug = format!("{failure:?}");
+
+        for rendered in [serialized, display, debug] {
+            assert!(rendered.contains("process_exit"));
+            assert!(rendered.contains("encode"));
+            assert!(!rendered.contains("C:\\Users"), "{rendered}");
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(!rendered.contains("token=abc"), "{rendered}");
+            assert!(!rendered.contains("raw stderr"), "{rendered}");
         }
     }
 }
