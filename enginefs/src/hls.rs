@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::task::Poll;
@@ -493,24 +494,36 @@ impl HlsEngine {
             .max()
             .unwrap_or(4);
 
-        let mut m3u = String::from("#EXTM3U\n");
+        let mut m3u = String::with_capacity(
+            stream_playlist_capacity(
+                segments.len(),
+                max_duration,
+                segment_base_url,
+                audio_track_idx,
+                query_str,
+            )
+            .unwrap_or(0),
+        );
+        m3u.push_str("#EXTM3U\n");
         m3u.push_str("#EXT-X-VERSION:3\n");
-        m3u.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
+        writeln!(&mut m3u, "#EXT-X-TARGETDURATION:{max_duration}")
+            .expect("writing to a String cannot fail");
         m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         m3u.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
         // MPEG-TS segments (no init segment required)
         for (i, (_start, dur)) in segments.iter().enumerate() {
-            m3u.push_str(&format!("#EXTINF:{:.6},\n", dur));
-            let filename = if let Some(audio_idx) = audio_track_idx {
-                format!(
-                    "{}audio-{}-{}.ts?{}",
-                    segment_base_url, audio_idx, i, query_str
+            writeln!(&mut m3u, "#EXTINF:{dur:.6},").expect("writing to a String cannot fail");
+            if let Some(audio_idx) = audio_track_idx {
+                writeln!(
+                    &mut m3u,
+                    "{segment_base_url}audio-{audio_idx}-{i}.ts?{query_str}"
                 )
+                .expect("writing to a String cannot fail");
             } else {
-                format!("{}{}.ts?{}", segment_base_url, i, query_str)
-            };
-            m3u.push_str(&format!("{}\n", filename));
+                writeln!(&mut m3u, "{segment_base_url}{i}.ts?{query_str}")
+                    .expect("writing to a String cannot fail");
+            }
         }
         m3u.push_str("#EXT-X-ENDLIST\n");
         m3u
@@ -809,6 +822,43 @@ impl HlsEngine {
     }
 }
 
+fn stream_playlist_capacity(
+    segment_count: usize,
+    max_duration: u32,
+    segment_base_url: &str,
+    audio_track_idx: Option<usize>,
+    query_str: &str,
+) -> Option<usize> {
+    const FIXED_HEADER_BYTES: usize = "#EXTM3U\n".len()
+        + "#EXT-X-VERSION:3\n".len()
+        + "#EXT-X-TARGETDURATION:".len()
+        + 1
+        + "#EXT-X-MEDIA-SEQUENCE:0\n".len()
+        + "#EXT-X-PLAYLIST-TYPE:VOD\n".len()
+        + "#EXT-X-ENDLIST\n".len();
+    const EXTINF_FIXED_BYTES: usize = "#EXTINF:".len() + ".000000,\n".len();
+    const FILENAME_FIXED_BYTES: usize = ".ts?".len() + 1;
+
+    let decimal_digits = |value: usize| value.checked_ilog10().unwrap_or(0) as usize + 1;
+    let target_digits = decimal_digits(max_duration as usize);
+    let segment_index_digits = decimal_digits(segment_count.saturating_sub(1));
+    let audio_bytes = audio_track_idx
+        .map(|index| "audio-".len() + decimal_digits(index) + 1)
+        .unwrap_or(0);
+    let per_segment_bytes = EXTINF_FIXED_BYTES
+        .checked_add(target_digits)?
+        .checked_add(segment_base_url.len())?
+        .checked_add(audio_bytes)?
+        .checked_add(segment_index_digits)?
+        .checked_add(FILENAME_FIXED_BYTES)?
+        .checked_add(query_str.len())?;
+    let capacity = FIXED_HEADER_BYTES
+        .checked_add(target_digits)?
+        .checked_add(segment_count.checked_mul(per_segment_bytes)?)?;
+
+    (capacity <= isize::MAX as usize).then_some(capacity)
+}
+
 fn configure_low_impact_ffmpeg(_cmd: &mut Command) {
     #[cfg(windows)]
     {
@@ -922,5 +972,26 @@ mod tests {
         assert!(video_stream(Some("Main 10"), None).is_high_bit_depth_video());
         assert!(video_stream(None, Some("p010le")).is_high_bit_depth_video());
         assert!(!video_stream(Some("High"), Some("yuv420p")).is_high_bit_depth_video());
+    }
+
+    #[test]
+    fn stream_playlist_capacity_rejects_arithmetic_overflow() {
+        assert_eq!(
+            stream_playlist_capacity(usize::MAX, u32::MAX, "./", Some(usize::MAX), "q"),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_playlist_capacity_never_exceeds_the_string_limit() {
+        for divisor in 2..=128 {
+            let segment_count = isize::MAX as usize / divisor;
+            if let Some(capacity) = stream_playlist_capacity(segment_count, 0, "", None, "") {
+                assert!(
+                    capacity <= isize::MAX as usize,
+                    "divisor {divisor} produced an invalid String capacity of {capacity}"
+                );
+            }
+        }
     }
 }
