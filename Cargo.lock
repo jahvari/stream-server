@@ -2345,6 +2345,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fake-media-tool"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
