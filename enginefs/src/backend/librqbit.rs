@@ -543,7 +543,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mp_002a_cold_magnet_wait_baseline_is_immediate_without_progress_or_failure_signal() {
+    async fn mp_002a_cold_torrent_piece_readiness_is_immediate_without_progress_or_failure_signal()
+    {
         let (handle, session, test_dir) = cold_torrent_handle().await;
         let stats = handle.stats().await;
         assert!(stats.has_metadata);

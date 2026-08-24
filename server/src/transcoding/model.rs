@@ -86,14 +86,32 @@ pub enum AccelerationClass {
 }
 
 impl AccelerationClass {
-    pub fn derive(stages: &[VideoStage]) -> Self {
+    pub fn derive(stages: &[VideoStage]) -> Result<Self, ModelValidationError> {
+        validate_complete_stage_graph(stages)?;
+
         let hardware = stages.iter().any(VideoStage::is_hardware);
         let software_or_transfer = stages.iter().any(VideoStage::requires_cpu_frames);
-        match (hardware, software_or_transfer) {
-            (false, _) => Self::Software,
-            (true, true) => Self::Partial,
-            (true, false) => Self::HardwareResident,
-        }
+        let mut hardware_context = None;
+        let compatible_hardware_context = stages.iter().all(|stage| match &stage.mode {
+            StageMode::Software => true,
+            StageMode::Hardware { backend, device } => match &hardware_context {
+                Some((expected_backend, expected_device)) => {
+                    expected_backend == backend && expected_device == device
+                }
+                None => {
+                    hardware_context = Some((*backend, device.clone()));
+                    true
+                }
+            },
+        });
+
+        Ok(
+            match (hardware, software_or_transfer, compatible_hardware_context) {
+                (false, _, _) => Self::Software,
+                (true, false, true) => Self::HardwareResident,
+                (true, _, _) => Self::Partial,
+            },
+        )
     }
 }
 
@@ -125,8 +143,8 @@ pub enum StageMode {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoStage {
-    pub kind: StageKind,
-    pub mode: StageMode,
+    kind: StageKind,
+    mode: StageMode,
 }
 
 impl VideoStage {
@@ -152,13 +170,34 @@ impl VideoStage {
         matches!(self.mode, StageMode::Software)
             || matches!(self.kind, StageKind::Download | StageKind::Upload)
     }
+
+    pub fn kind(&self) -> StageKind {
+        self.kind
+    }
+
+    pub fn mode(&self) -> &StageMode {
+        &self.mode
+    }
 }
 
+/// A positive reduced rational frame rate.
+///
+/// Callers cannot bypass reduction with a struct literal:
+///
+/// ```compile_fail
+/// use std::num::NonZeroU32;
+/// use stream_server::transcoding::RationalRate;
+///
+/// let _ = RationalRate {
+///     numerator: 60_000,
+///     denominator: NonZeroU32::new(2_000).unwrap(),
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RationalRate {
-    pub numerator: u32,
-    pub denominator: NonZeroU32,
+    numerator: u32,
+    denominator: NonZeroU32,
 }
 
 impl<'de> Deserialize<'de> for RationalRate {
@@ -191,6 +230,14 @@ impl RationalRate {
                 .expect("dividing a nonzero denominator by a common divisor keeps it nonzero"),
         })
     }
+
+    pub fn numerator(&self) -> u32 {
+        self.numerator
+    }
+
+    pub fn denominator(&self) -> NonZeroU32 {
+        self.denominator
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -216,18 +263,37 @@ pub enum PresetIntent {
     Quality,
 }
 
+/// A validated, coherent rate-control envelope.
+///
+/// Fields are read-only after validation:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::{PresetIntent, RateControlEnvelope, RateControlIntent};
+///
+/// let _ = RateControlEnvelope {
+///     intent: RateControlIntent::Constant,
+///     target_video_bps: 0,
+///     max_video_bps: 0,
+///     buffer_bits: 0,
+///     preset: PresetIntent::Balanced,
+///     output_frame_rate: None,
+///     width: 0,
+///     height: 0,
+///     audio_bps: 0,
+/// };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateControlEnvelope {
-    pub intent: RateControlIntent,
-    pub target_video_bps: u64,
-    pub max_video_bps: u64,
-    pub buffer_bits: u64,
-    pub preset: PresetIntent,
-    pub output_frame_rate: Option<RationalRate>,
-    pub width: u32,
-    pub height: u32,
-    pub audio_bps: u64,
+    intent: RateControlIntent,
+    target_video_bps: u64,
+    max_video_bps: u64,
+    buffer_bits: u64,
+    preset: PresetIntent,
+    output_frame_rate: Option<RationalRate>,
+    width: u32,
+    height: u32,
+    audio_bps: u64,
 }
 
 impl<'de> Deserialize<'de> for RateControlEnvelope {
@@ -314,6 +380,42 @@ impl RateControlEnvelope {
             audio_bps,
         })
     }
+
+    pub fn intent(&self) -> RateControlIntent {
+        self.intent
+    }
+
+    pub fn target_video_bps(&self) -> u64 {
+        self.target_video_bps
+    }
+
+    pub fn max_video_bps(&self) -> u64 {
+        self.max_video_bps
+    }
+
+    pub fn buffer_bits(&self) -> u64 {
+        self.buffer_bits
+    }
+
+    pub fn preset(&self) -> PresetIntent {
+        self.preset
+    }
+
+    pub fn output_frame_rate(&self) -> Option<RationalRate> {
+        self.output_frame_rate
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn audio_bps(&self) -> u64 {
+        self.audio_bps
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -323,7 +425,26 @@ pub enum KeyframeStrategy {
     TimeForced { segment_duration_ms: NonZeroU32 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+/// A media source capability issued by a trusted internal owner.
+///
+/// Route/external code cannot manufacture a trusted source from JSON:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::ValidatedMediaSource;
+///
+/// let _: ValidatedMediaSource = serde_json::from_str(
+///     r#"{"approvedRemote":{"id":"route-text"}}"#,
+/// ).unwrap();
+/// ```
+///
+/// It also cannot call the internal issuance seams directly:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::ValidatedMediaSource;
+///
+/// let _ = ValidatedMediaSource::approved_remote("route-text");
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ValidatedMediaSource {
     CompletedFile(CompletedFileSource),
@@ -332,20 +453,32 @@ pub enum ValidatedMediaSource {
     SyntheticFixture(SyntheticFixtureSource),
 }
 
+#[allow(
+    dead_code,
+    reason = "sealed issuance seams are consumed by the source broker and verifier in later planned tasks"
+)]
 impl ValidatedMediaSource {
-    pub fn completed_file(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    pub(in crate::transcoding) fn completed_file(
+        id: impl Into<String>,
+    ) -> Result<Self, ModelValidationError> {
         Ok(Self::CompletedFile(CompletedFileSource::new(id)?))
     }
 
-    pub fn engine_loopback(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    pub(in crate::transcoding) fn engine_loopback(
+        id: impl Into<String>,
+    ) -> Result<Self, ModelValidationError> {
         Ok(Self::EngineLoopback(EngineLoopbackSource::new(id)?))
     }
 
-    pub fn approved_remote(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    pub(in crate::transcoding) fn approved_remote(
+        id: impl Into<String>,
+    ) -> Result<Self, ModelValidationError> {
         Ok(Self::ApprovedRemote(ApprovedRemoteSource::new(id)?))
     }
 
-    pub fn synthetic_fixture(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    pub(in crate::transcoding) fn synthetic_fixture(
+        id: impl Into<String>,
+    ) -> Result<Self, ModelValidationError> {
         Ok(Self::SyntheticFixture(SyntheticFixtureSource::new(id)?))
     }
 
@@ -359,14 +492,14 @@ impl ValidatedMediaSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletedFileSource {
     id: SourceId,
 }
 
 impl CompletedFileSource {
-    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
         Ok(Self {
             id: SourceId::new(id)?,
         })
@@ -377,14 +510,14 @@ impl CompletedFileSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineLoopbackSource {
     id: SourceId,
 }
 
 impl EngineLoopbackSource {
-    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
         Ok(Self {
             id: SourceId::new(id)?,
         })
@@ -395,14 +528,14 @@ impl EngineLoopbackSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovedRemoteSource {
     id: SourceId,
 }
 
 impl ApprovedRemoteSource {
-    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
         Ok(Self {
             id: SourceId::new(id)?,
         })
@@ -413,14 +546,14 @@ impl ApprovedRemoteSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyntheticFixtureSource {
     id: SourceId,
 }
 
 impl SyntheticFixtureSource {
-    pub fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
+    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
         Ok(Self {
             id: SourceId::new(id)?,
         })
@@ -450,21 +583,11 @@ impl SourceId {
     }
 }
 
-impl<'de> Deserialize<'de> for SourceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaDescriptor {
-    pub source: ValidatedMediaSource,
-    pub frame_rate_class: FrameRateClass,
+    source: ValidatedMediaSource,
+    frame_rate_class: FrameRateClass,
 }
 
 impl MediaDescriptor {
@@ -474,13 +597,21 @@ impl MediaDescriptor {
             frame_rate_class,
         }
     }
+
+    pub fn source(&self) -> &ValidatedMediaSource {
+        &self.source
+    }
+
+    pub fn frame_rate_class(&self) -> FrameRateClass {
+        self.frame_rate_class
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputContract {
-    pub rate_control: RateControlEnvelope,
-    pub keyframes: KeyframeStrategy,
+    rate_control: RateControlEnvelope,
+    keyframes: KeyframeStrategy,
 }
 
 impl OutputContract {
@@ -490,14 +621,22 @@ impl OutputContract {
             keyframes,
         }
     }
+
+    pub fn rate_control(&self) -> &RateControlEnvelope {
+        &self.rate_control
+    }
+
+    pub fn keyframes(&self) -> KeyframeStrategy {
+        self.keyframes
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeRequest {
-    pub source: ValidatedMediaSource,
-    pub output: OutputContract,
-    pub acceleration_mode: AccelerationMode,
+    source: ValidatedMediaSource,
+    output: OutputContract,
+    acceleration_mode: AccelerationMode,
 }
 
 impl TranscodeRequest {
@@ -512,46 +651,45 @@ impl TranscodeRequest {
             acceleration_mode,
         }
     }
+
+    pub fn source(&self) -> &ValidatedMediaSource {
+        &self.source
+    }
+
+    pub fn output(&self) -> &OutputContract {
+        &self.output
+    }
+
+    pub fn acceleration_mode(&self) -> AccelerationMode {
+        self.acceleration_mode
+    }
 }
 
+/// A plan whose stage graph and derived acceleration class are immutable.
+///
+/// Callers cannot replace its validated stage graph:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::{TranscodePlan, VideoStage};
+///
+/// fn replace_stages(plan: &mut TranscodePlan, stages: Vec<VideoStage>) {
+///     plan.stages = stages;
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodePlan {
-    pub request: TranscodeRequest,
-    pub stages: Vec<VideoStage>,
-    pub acceleration_class: AccelerationClass,
-}
-
-impl<'de> Deserialize<'de> for TranscodePlan {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Raw {
-            request: TranscodeRequest,
-            stages: Vec<VideoStage>,
-            acceleration_class: AccelerationClass,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::new(raw.request, raw.stages, raw.acceleration_class).map_err(serde::de::Error::custom)
-    }
+    request: TranscodeRequest,
+    stages: Vec<VideoStage>,
+    acceleration_class: AccelerationClass,
 }
 
 impl TranscodePlan {
     pub fn new(
         request: TranscodeRequest,
         stages: Vec<VideoStage>,
-        acceleration_class: AccelerationClass,
     ) -> Result<Self, ModelValidationError> {
-        let derived = AccelerationClass::derive(&stages);
-        if acceleration_class != derived {
-            return Err(ModelValidationError::new(
-                "acceleration class does not match stages",
-            ));
-        }
+        let acceleration_class = AccelerationClass::derive(&stages)?;
 
         Ok(Self {
             request,
@@ -562,6 +700,14 @@ impl TranscodePlan {
 
     pub fn acceleration_class(&self) -> AccelerationClass {
         self.acceleration_class
+    }
+
+    pub fn request(&self) -> &TranscodeRequest {
+        &self.request
+    }
+
+    pub fn stages(&self) -> &[VideoStage] {
+        &self.stages
     }
 }
 
@@ -590,6 +736,30 @@ fn is_safe_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_complete_stage_graph(stages: &[VideoStage]) -> Result<(), ModelValidationError> {
+    let decode_count = stages
+        .iter()
+        .filter(|stage| stage.kind == StageKind::Decode)
+        .count();
+    let encode_count = stages
+        .iter()
+        .filter(|stage| stage.kind == StageKind::Encode)
+        .count();
+
+    if stages.len() < 2
+        || decode_count != 1
+        || encode_count != 1
+        || stages.first().map(VideoStage::kind) != Some(StageKind::Decode)
+        || stages.last().map(VideoStage::kind) != Some(StageKind::Encode)
+    {
+        return Err(ModelValidationError::new(
+            "video stage graph must start with one decode and end with one encode",
+        ));
+    }
+
+    Ok(())
 }
 
 fn gcd(mut left: u32, mut right: u32) -> u32 {
@@ -671,8 +841,8 @@ mod tests {
     fn rational_rate_reduces_and_rejects_zero_numerator() {
         let rate = RationalRate::new(60_000, NonZeroU32::new(2_000).unwrap()).unwrap();
 
-        assert_eq!(rate.numerator, 30);
-        assert_eq!(rate.denominator.get(), 1);
+        assert_eq!(rate.numerator(), 30);
+        assert_eq!(rate.denominator().get(), 1);
         assert!(RationalRate::new(0, NonZeroU32::new(1).unwrap()).is_err());
     }
 
@@ -680,7 +850,7 @@ mod tests {
     fn device_id_rejects_raw_paths_urls_credentials_and_commands() {
         for raw in [
             "",
-            "C:\\Users\\Hunter\\device",
+            "C:\\Users\\ExampleUser\\device",
             "/dev/dri/renderD128",
             "https://user:secret@example.test/gpu?token=abc",
             "gpu 0",
@@ -693,41 +863,33 @@ mod tests {
 
     #[test]
     fn media_sources_are_closed_variants_not_raw_route_text() {
-        round_trip(
-            ValidatedMediaSource::completed_file("file-a").unwrap(),
-            "{\"completedFile\":{\"id\":\"file-a\"}}",
-        );
-        round_trip(
-            ValidatedMediaSource::engine_loopback("loopback-a").unwrap(),
-            "{\"engineLoopback\":{\"id\":\"loopback-a\"}}",
-        );
-        round_trip(
-            ValidatedMediaSource::approved_remote("remote-a").unwrap(),
-            "{\"approvedRemote\":{\"id\":\"remote-a\"}}",
-        );
-        round_trip(
-            ValidatedMediaSource::synthetic_fixture("fixture-a").unwrap(),
-            "{\"syntheticFixture\":{\"id\":\"fixture-a\"}}",
-        );
+        let sources = [
+            (
+                ValidatedMediaSource::completed_file("file-a").unwrap(),
+                "{\"completedFile\":{\"id\":\"file-a\"}}",
+            ),
+            (
+                ValidatedMediaSource::engine_loopback("loopback-a").unwrap(),
+                "{\"engineLoopback\":{\"id\":\"loopback-a\"}}",
+            ),
+            (
+                ValidatedMediaSource::approved_remote("remote-a").unwrap(),
+                "{\"approvedRemote\":{\"id\":\"remote-a\"}}",
+            ),
+            (
+                ValidatedMediaSource::synthetic_fixture("fixture-a").unwrap(),
+                "{\"syntheticFixture\":{\"id\":\"fixture-a\"}}",
+            ),
+        ];
 
-        assert!(serde_json::from_str::<ValidatedMediaSource>("\"media-source\"").is_err());
-        assert!(
-            serde_json::from_str::<ValidatedMediaSource>(
-                "\"https://user:secret@example.test/video?token=abc\""
-            )
-            .is_err()
-        );
+        for (source, expected) in sources {
+            assert_eq!(serde_json::to_string(&source).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn serde_deserialization_enforces_value_invariants() {
+    fn serde_deserialization_enforces_public_numeric_value_invariants() {
         assert!(serde_json::from_str::<DeviceId>("\"/dev/dri/renderD128\"").is_err());
-        assert!(
-            serde_json::from_str::<ValidatedMediaSource>(
-                "{\"completedFile\":{\"id\":\"C:\\\\Users\\\\Hunter\\\\private.mp4\"}}"
-            )
-            .is_err()
-        );
         assert!(
             serde_json::from_str::<RationalRate>("{\"numerator\":0,\"denominator\":1}").is_err()
         );
@@ -755,24 +917,21 @@ mod tests {
     }
 
     #[test]
-    fn transcode_plan_deserialization_enforces_acceleration_invariant() {
-        let json = concat!(
-            "{\"request\":{\"source\":{\"completedFile\":{\"id\":\"media-source\"}},\"output\":{\"rateControl\":{",
-            "\"intent\":\"constant\",\"targetVideoBps\":4000000,\"maxVideoBps\":4000000,",
-            "\"bufferBits\":8000000,\"preset\":\"balanced\",\"outputFrameRate\":null,",
-            "\"width\":1920,\"height\":1080,\"audioBps\":128000},",
-            "\"keyframes\":{\"fixedGop\":{\"frames\":120}}},\"accelerationMode\":\"auto\"},",
-            "\"stages\":[{\"kind\":\"decode\",\"mode\":\"software\"}],",
-            "\"accelerationClass\":\"hardwareResident\"}"
-        );
-
-        let error = serde_json::from_str::<TranscodePlan>(json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("acceleration class does not match stages"),
-            "{error}"
-        );
+    fn incomplete_stage_graphs_are_rejected() {
+        for stages in [
+            vec![],
+            vec![VideoStage::hardware(
+                StageKind::Encode,
+                BackendKind::Qsv,
+                device("gpu-a"),
+            )],
+            vec![
+                VideoStage::hardware(StageKind::Encode, BackendKind::Qsv, device("gpu-a")),
+                VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
+            ],
+        ] {
+            assert!(AccelerationClass::derive(&stages).is_err());
+        }
     }
 
     #[test]
@@ -782,7 +941,7 @@ mod tests {
             VideoStage::hardware(StageKind::Encode, BackendKind::Amf, device("gpu-a")),
         ];
         assert_eq!(
-            AccelerationClass::derive(&stages),
+            AccelerationClass::derive(&stages).unwrap(),
             AccelerationClass::Partial
         );
     }
@@ -791,7 +950,7 @@ mod tests {
     fn hardware_resident_rejects_cpu_transfer() {
         let stages = qsv_stages_with(StageKind::Download);
         assert_eq!(
-            AccelerationClass::derive(&stages),
+            AccelerationClass::derive(&stages).unwrap(),
             AccelerationClass::Partial
         );
     }
@@ -800,8 +959,29 @@ mod tests {
     fn all_hardware_stages_without_transfer_are_hardware_resident() {
         let stages = qsv_stages_with(StageKind::Scale);
         assert_eq!(
-            AccelerationClass::derive(&stages),
+            AccelerationClass::derive(&stages).unwrap(),
             AccelerationClass::HardwareResident
+        );
+    }
+
+    #[test]
+    fn mixed_hardware_device_or_backend_is_not_hardware_resident() {
+        let mixed_device = vec![
+            VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
+            VideoStage::hardware(StageKind::Encode, BackendKind::Qsv, device("gpu-b")),
+        ];
+        let mixed_backend = vec![
+            VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
+            VideoStage::hardware(StageKind::Encode, BackendKind::Vaapi, device("gpu-a")),
+        ];
+
+        assert_eq!(
+            AccelerationClass::derive(&mixed_device).unwrap(),
+            AccelerationClass::Partial
+        );
+        assert_eq!(
+            AccelerationClass::derive(&mixed_backend).unwrap(),
+            AccelerationClass::Partial
         );
     }
 

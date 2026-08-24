@@ -16,6 +16,7 @@ const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 20;
 const MAX_PROGRESS_INTERVAL_MS: u64 = 60_000;
 const MAX_SEGMENT_NUMBER_WIDTH: usize = 20;
 const OVERSIZED_LOG_LINES: usize = 4096;
+const STOP_FILE: &str = "fake-media-tool.stop";
 
 fn main() -> ExitCode {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
@@ -177,7 +178,8 @@ impl Default for Scenario {
 
 fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeError> {
     if contains_arg(args, "--fake-child") {
-        wait_forever();
+        wait_until_stopped("child")?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     match scenario.mode {
@@ -200,9 +202,13 @@ fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeErro
         Mode::Hang => {
             write_media_output(args, mpegts::valid_segment())?;
             write_progress(args, ProgressFinish::ContinueOnly, &mut io::stderr())?;
-            wait_forever()
+            wait_until_stopped("hang")?;
+            Ok(ExitCode::from(scenario.exit_code))
         }
-        Mode::Stall => wait_forever(),
+        Mode::Stall => {
+            wait_until_stopped("stall")?;
+            Ok(ExitCode::from(scenario.exit_code))
+        }
         Mode::OversizedLog => {
             write_oversized_log(&mut io::stderr())?;
             Ok(ExitCode::from(scenario.exit_code))
@@ -225,7 +231,8 @@ fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeErro
             let exe = env::current_exe().map_err(|_| FakeError::Spawn)?;
             let cwd = env::current_dir().map_err(|_| FakeError::Spawn)?;
             spawn_descendant(&exe, &cwd)?;
-            wait_forever()
+            wait_until_stopped("parent")?;
+            Ok(ExitCode::from(scenario.exit_code))
         }
     }
 }
@@ -636,11 +643,34 @@ fn spawn_descendant(exe: &Path, cwd: &Path) -> Result<process::Child, FakeError>
         .map_err(|_| FakeError::Spawn)
 }
 
-fn wait_forever() -> ! {
+fn wait_until_stopped(role: &str) -> Result<(), FakeError> {
+    ignore_graceful_termination();
+    let cwd = env::current_dir().map_err(|_| FakeError::Io)?;
+    fs::write(
+        cwd.join(format!("fake-media-{role}.pid")),
+        process::id().to_string(),
+    )
+    .map_err(|_| FakeError::Io)?;
+
     loop {
-        thread::park_timeout(Duration::from_secs(3600));
+        if cwd.join(STOP_FILE).exists() {
+            fs::write(cwd.join(format!("fake-media-{role}.exited")), b"exited")
+                .map_err(|_| FakeError::Io)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(unix)]
+fn ignore_graceful_termination() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(unix))]
+fn ignore_graceful_termination() {}
 
 fn nonzero_exit_code(exit_code: u8) -> u8 {
     if exit_code == 0 {

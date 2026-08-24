@@ -38,11 +38,14 @@ mod tests {
         let request = TranscodeRequest::new(source, output, AccelerationMode::Auto);
         let plan = TranscodePlan::new(
             request,
-            vec![VideoStage::software(StageKind::Decode)],
-            AccelerationClass::Software,
+            vec![
+                VideoStage::software(StageKind::Decode),
+                VideoStage::software(StageKind::Encode),
+            ],
         )
         .unwrap();
 
         assert_eq!(plan.acceleration_class(), AccelerationClass::Software);
+        assert_eq!(plan.stages().len(), 2);
     }
 }

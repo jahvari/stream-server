@@ -53,6 +53,7 @@ struct ScopedEnv {
     fake_log: Option<OsString>,
     fake_counter: Option<OsString>,
     fake_scenario: Option<OsString>,
+    fake_release: Option<OsString>,
 }
 
 impl ScopedEnv {
@@ -66,16 +67,21 @@ impl ScopedEnv {
         let fake_log = std::env::var_os("FAKE_FFMPEG_LOG");
         let fake_counter = std::env::var_os("FAKE_FFMPEG_COUNTER");
         let fake_scenario = std::env::var_os("FAKE_FFMPEG_SCENARIO");
+        let fake_release = std::env::var_os("FAKE_FFMPEG_RELEASE");
 
-        let mut new_path = OsString::from(bin_dir.as_os_str());
-        if let Some(existing) = &path {
-            new_path.push(";");
-            new_path.push(existing);
-        }
+        let new_path = std::env::join_paths(
+            std::iter::once(bin_dir.to_path_buf())
+                .chain(path.as_deref().into_iter().flat_map(std::env::split_paths)),
+        )
+        .expect("join fake ffmpeg PATH");
 
         set_env_var("PATH", new_path);
         set_env_var("FAKE_FFMPEG_LOG", log_path.as_os_str());
         set_env_var("FAKE_FFMPEG_SCENARIO", scenario);
+        set_env_var(
+            "FAKE_FFMPEG_RELEASE",
+            log_path.with_file_name("release-probe"),
+        );
         if let Some(counter_path) = counter_path {
             set_env_var("FAKE_FFMPEG_COUNTER", counter_path.as_os_str());
         } else {
@@ -87,6 +93,7 @@ impl ScopedEnv {
             fake_log,
             fake_counter,
             fake_scenario,
+            fake_release,
         }
     }
 }
@@ -109,6 +116,10 @@ impl Drop for ScopedEnv {
             Some(value) => set_env_var("FAKE_FFMPEG_SCENARIO", value),
             None => remove_env_var("FAKE_FFMPEG_SCENARIO"),
         }
+        match &self.fake_release {
+            Some(value) => set_env_var("FAKE_FFMPEG_RELEASE", value),
+            None => remove_env_var("FAKE_FFMPEG_RELEASE"),
+        }
     }
 }
 
@@ -116,8 +127,10 @@ fn fake_ffmpeg_source() -> &'static str {
     r#"
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn log_args(args: &[String]) {
     if let Some(path) = env::var_os("FAKE_FFMPEG_LOG") {
@@ -167,6 +180,50 @@ fn next_count() -> u32 {
     count
 }
 
+fn emit_probe(video_rate_fields: &str) {
+    eprintln!("Input #0, matroska,webm, from \"fixture-input\":");
+    eprintln!("Duration: 00:00:10.00, start: 0.000000, bitrate: 1200 kb/s");
+    eprintln!(
+        "Stream #0:0(eng): Video: h264 (High), yuv420p, 1920x1080, {video_rate_fields}"
+    );
+}
+
+fn read_loopback_until_release(args: &[String]) {
+    let input = args
+        .windows(2)
+        .find(|pair| pair[0] == "-i")
+        .map(|pair| pair[1].as_str())
+        .expect("probe input argument");
+    let rest = input.strip_prefix("http://").expect("numeric loopback HTTP input");
+    let (authority, path) = rest.split_once('/').expect("loopback URL path");
+    let mut stream = TcpStream::connect(authority).expect("connect loopback stream");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set loopback read timeout");
+    write!(
+        stream,
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write loopback request");
+    stream.flush().expect("flush loopback request");
+    append_raw("probe_loopback_read_started");
+
+    let release = PathBuf::from(env::var_os("FAKE_FFMPEG_RELEASE").expect("release path"));
+    let mut buffer = [0_u8; 1024];
+    while !release.exists() {
+        match stream.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("loopback read failed: {error}"),
+        }
+    }
+    append_raw("probe_loopback_read_released");
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     log_args(&args);
@@ -212,6 +269,11 @@ fn main() {
             eprintln!("Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le(tv), 3840x2160, 23.98 fps, 24000/1001 tbr, 1k tbn");
             eprintln!("Stream #0:1(jpn): Audio: aac (LC), 48000 Hz, stereo, fltp, 256 kb/s (default)");
         }
+        Ok("probe_rate_cfr") => emit_probe("24 fps, 24 tbr, 1k tbn"),
+        Ok("probe_rate_conflicting") => emit_probe("24 fps, 30000/1001 tbr, 1k tbn"),
+        Ok("probe_rate_nominal_only") => emit_probe("24000/1001 tbr, 1k tbn"),
+        Ok("probe_rate_missing") => emit_probe("1k tbn"),
+        Ok("probe_loopback_blocked") => read_loopback_until_release(&args),
         Ok(other) => panic!("unknown FAKE_FFMPEG_SCENARIO {other}"),
         Err(_) => panic!("FAKE_FFMPEG_SCENARIO not set"),
     }
@@ -229,7 +291,7 @@ fn with_fake_ffmpeg<T>(scenario: &str, test: impl FnOnce(&Path) -> T) -> T {
     fs::create_dir_all(&bin_dir).expect("fake ffmpeg bin dir");
     let log_path = temp.path().join("ffmpeg.log");
     let source_path = temp.path().join("fake_ffmpeg.rs");
-    let ffmpeg_path = bin_dir.join("ffmpeg.exe");
+    let ffmpeg_path = bin_dir.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
     fs::write(&source_path, fake_ffmpeg_source()).expect("write fake ffmpeg source");
     let compile = std::process::Command::new("rustc")
         .arg("--edition=2024")
@@ -426,6 +488,32 @@ fn accepted_segment_variant_cases(info_hash: &str) -> Vec<StatusCase> {
             path: format!("/{info_hash}/0/audio/0.ts"),
             status: reqwest::StatusCode::NOT_IMPLEMENTED,
             body: r#"{"error":"legacy HLS segment variant is not implemented"}"#,
+        },
+    ]
+}
+
+fn accepted_numeric_segment_cases(info_hash: &str) -> Vec<PlaylistCase> {
+    let hls_id = valid_hls_id(info_hash);
+    vec![
+        PlaylistCase {
+            name: "legacy numeric video resource is accepted",
+            path: format!("/{info_hash}/0/0.ts"),
+        },
+        PlaylistCase {
+            name: "legacy numeric video stream segment is accepted",
+            path: format!("/{info_hash}/0/stream/0.ts"),
+        },
+        PlaylistCase {
+            name: "legacy numeric audio resource is accepted",
+            path: format!("/{info_hash}/0/audio-1-0.ts"),
+        },
+        PlaylistCase {
+            name: "legacy numeric audio stream segment is accepted",
+            path: format!("/{info_hash}/0/stream/audio-1-0.ts"),
+        },
+        PlaylistCase {
+            name: "hlsv2 numeric segment alias is accepted",
+            path: format!("/hlsv2/{hls_id}/segment0.ts"),
         },
     ]
 }
@@ -688,6 +776,101 @@ fn probe_video_retries_until_hls_metadata_is_complete() {
 }
 
 #[test]
+fn old_scalar_fps_cannot_distinguish_conflicting_or_missing_nominal_and_average_rates() {
+    let cfr = with_fake_ffmpeg("probe_rate_cfr", |_| {
+        run_async(HlsEngine::probe_video("sample.mkv")).expect("CFR probe")
+    });
+    let conflicting = with_fake_ffmpeg("probe_rate_conflicting", |_| {
+        run_async(HlsEngine::probe_video("sample.mkv")).expect("conflicting-rate probe")
+    });
+    let nominal_only = with_fake_ffmpeg("probe_rate_nominal_only", |_| {
+        run_async(HlsEngine::probe_video("sample.mkv")).expect("nominal-only probe")
+    });
+    let no_rates = with_fake_ffmpeg("probe_rate_missing", |_| {
+        run_async(HlsEngine::probe_video("sample.mkv")).expect("missing-rate probe")
+    });
+
+    // 24/1 nominal + 24/1 average (CFR) and 30000/1001 nominal + 24/1
+    // average (conflicting/VFR evidence) collapse to the same scalar.
+    assert_eq!(cfr.streams[0].fps, Some(24.0));
+    assert_eq!(conflicting.streams[0].fps, cfr.streams[0].fps);
+
+    // A present 24000/1001 nominal rate with missing average and a source with
+    // both rates missing also collapse to `None`.
+    assert_eq!(nominal_only.streams[0].fps, None);
+    assert_eq!(no_rates.streams[0].fps, nominal_only.streams[0].fps);
+}
+
+#[test]
+fn mp_002a_cold_torrent_loopback_probe_is_pending_without_a_starvation_signal() {
+    with_fake_ffmpeg("probe_loopback_blocked", |log_path| {
+        let release_path = log_path.with_file_name("release-probe");
+        set_env_var("FAKE_FFMPEG_RELEASE", release_path.as_os_str());
+
+        with_embedded_server(|client, base| {
+            let info_hash = ensure_cold_engine(client, &base);
+            let probe_url = format!("{base}/hlsv2/{}/hls.m3u8", valid_hls_id(&info_hash));
+            let probe_client = Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("probe client");
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let result = probe_client
+                        .get(probe_url)
+                        .send()
+                        .map(|response| response.status());
+                    done_tx.send(result).expect("send probe result");
+                });
+
+                let started_deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !read_log(log_path).contains("probe_loopback_read_started")
+                    && std::time::Instant::now() < started_deadline
+                {
+                    std::thread::yield_now();
+                }
+                assert_contains(&read_log(log_path), "probe_loopback_read_started");
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+                    "the real cold loopback probe unexpectedly reached a terminal condition"
+                );
+
+                let stats = client
+                    .get(format!("{base}/{info_hash}/stats.json"))
+                    .send()
+                    .expect("cold torrent stats request")
+                    .error_for_status()
+                    .expect("cold torrent stats status")
+                    .json::<Value>()
+                    .expect("cold torrent stats json");
+                assert_eq!(stats["downloaded"], 0);
+                assert_eq!(stats["peers"], 0);
+                assert_eq!(stats["files"][0]["downloaded"], 0);
+                assert!(stats.get("sourceStarved").is_none());
+                assert!(stats.get("probeFailure").is_none());
+
+                fs::write(&release_path, b"release").expect("release blocked fake probe");
+                let status = done_rx
+                    .recv_timeout(Duration::from_secs(8))
+                    .expect("released probe remained hung")
+                    .expect("released probe request");
+                assert_eq!(status, reqwest::StatusCode::OK);
+            });
+        });
+
+        let log = read_log(log_path);
+        assert_eq!(
+            log.matches("probe_loopback_read_started").count(),
+            log.matches("probe_loopback_read_released").count(),
+            "every probe child must exit before fixture teardown:\n{log}"
+        );
+        remove_env_var("FAKE_FFMPEG_RELEASE");
+    });
+}
+
+#[test]
 fn transcode_video_segment_software_contract_is_stable() {
     with_fake_ffmpeg("command_log", |log_path| {
         let config = TranscodeConfig::browser();
@@ -821,7 +1004,12 @@ fn hls_resource_parser_tables_cover_current_route_contracts() {
                     .send()
                     .expect(case.name);
                 assert_eq!(response.status(), case.status, "{}", case.name);
-                assert_eq!(response.text().expect(case.name), case.body, "{}", case.name);
+                assert_eq!(
+                    response.text().expect(case.name),
+                    case.body,
+                    "{}",
+                    case.name
+                );
             }
 
             for case in accepted_segment_variant_cases(&info_hash) {
@@ -830,7 +1018,35 @@ fn hls_resource_parser_tables_cover_current_route_contracts() {
                     .send()
                     .expect(case.name);
                 assert_eq!(response.status(), case.status, "{}", case.name);
-                assert_eq!(response.text().expect(case.name), case.body, "{}", case.name);
+                assert_eq!(
+                    response.text().expect(case.name),
+                    case.body,
+                    "{}",
+                    case.name
+                );
+            }
+
+            for case in accepted_numeric_segment_cases(&info_hash) {
+                let response = client
+                    .get(format!("{base}{}", case.path))
+                    .send()
+                    .expect(case.name);
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::OK,
+                    "{} returned {}",
+                    case.name,
+                    response.status()
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("video/mp2t"),
+                    "{} content-type regressed",
+                    case.name
+                );
             }
         });
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,12 +61,20 @@ impl FailureCode {
     }
 }
 
+/// A stable public failure with arbitrary diagnostic detail kept internal.
+///
+/// Free-form public context is deliberately unavailable:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::{FailureCode, TranscodeFailure};
+///
+/// let _ = TranscodeFailure::new(FailureCode::ProcessExit)
+///     .with_safe_context("username", "ExampleUser");
+/// ```
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeFailure {
-    pub code: FailureCode,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    context: BTreeMap<String, String>,
+    code: FailureCode,
     #[serde(skip)]
     internal_detail: Option<String>,
 }
@@ -75,22 +83,12 @@ impl TranscodeFailure {
     pub fn new(code: FailureCode) -> Self {
         Self {
             code,
-            context: BTreeMap::new(),
             internal_detail: None,
         }
     }
 
-    pub fn with_safe_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        let key = sanitize_context_token(key.into());
-        let value = sanitize_context_token(value.into());
-        if let (Some(key), Some(value)) = (key, value) {
-            self.context.insert(key, value);
-        }
-        self
-    }
-
-    pub fn context(&self) -> &BTreeMap<String, String> {
-        &self.context
+    pub fn code(&self) -> FailureCode {
+        self.code
     }
 
     pub fn with_internal_detail(mut self, detail: impl Into<String>) -> Self {
@@ -110,30 +108,14 @@ impl<'de> Deserialize<'de> for TranscodeFailure {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         #[serde(rename_all = "camelCase")]
         struct Raw {
             code: FailureCode,
-            #[serde(default)]
-            context: BTreeMap<String, String>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        let mut failure = Self::new(raw.code);
-        for (key, value) in raw.context {
-            let sanitized_key = sanitize_context_token(key.clone())
-                .ok_or_else(|| serde::de::Error::custom("unsafe failure context key"))?;
-            if sanitized_key != key {
-                return Err(serde::de::Error::custom("unsafe failure context key"));
-            }
-            let sanitized_value = sanitize_context_token(value.clone())
-                .ok_or_else(|| serde::de::Error::custom("unsafe failure context value"))?;
-            if sanitized_value != value {
-                return Err(serde::de::Error::custom("unsafe failure context value"));
-            }
-            failure.context.insert(key, value);
-        }
-
-        Ok(failure)
+        Ok(Self::new(raw.code))
     }
 }
 
@@ -141,7 +123,6 @@ impl fmt::Debug for TranscodeFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TranscodeFailure")
             .field("code", &self.code.as_str())
-            .field("context", &self.context)
             .finish()
     }
 }
@@ -149,30 +130,11 @@ impl fmt::Debug for TranscodeFailure {
 impl fmt::Display for TranscodeFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.code.as_str())?;
-        for (key, value) in &self.context {
-            write!(f, " {key}={value}")?;
-        }
         Ok(())
     }
 }
 
 impl std::error::Error for TranscodeFailure {}
-
-fn sanitize_context_token(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return None;
-    }
-
-    if trimmed
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -226,13 +188,11 @@ mod tests {
 
     #[test]
     fn failure_serialization_display_and_debug_are_safe() {
-        let failure = TranscodeFailure::new(FailureCode::ProcessExit)
-            .with_safe_context("stage", "encode")
-            .with_internal_detail(
-                "C:\\Users\\Hunter\\Videos\\private.mp4 /home/hunter/private.mp4 \
+        let failure = TranscodeFailure::new(FailureCode::ProcessExit).with_internal_detail(
+            "C:\\Users\\ExampleUser\\Videos\\private.mp4 /home/ExampleUser/private.mp4 \
                  https://user:secret@example.test/video?token=abc \
-                 ffmpeg -i secret raw stderr username=Hunter /dev/dri/renderD128",
-            );
+                 ffmpeg -i secret raw stderr username=ExampleUser /dev/dri/renderD128",
+        );
 
         let serialized = serde_json::to_string(&failure).unwrap();
         let display = failure.to_string();
@@ -240,15 +200,14 @@ mod tests {
 
         for rendered in [serialized, display, debug] {
             assert!(rendered.contains("process_exit"));
-            assert!(rendered.contains("encode"));
             for secret in [
                 "C:\\Users",
-                "/home/hunter",
+                "/home/ExampleUser",
                 "secret",
                 "token=abc",
                 "ffmpeg -i",
                 "raw stderr",
-                "Hunter",
+                "ExampleUser",
                 "/dev/dri",
                 "renderD128",
             ] {
@@ -258,25 +217,34 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_context_is_rejected_from_json() {
-        let json = concat!(
-            "{\"code\":\"process_exit\",\"context\":{",
-            "\"stage\":\"encode\",",
-            "\"path\":\"C:\\\\Users\\\\Hunter\\\\Videos\\\\private.mp4\",",
-            "\"url\":\"https://user:secret@example.test/video?token=abc\"",
-            "}}"
-        );
-
-        assert!(serde_json::from_str::<TranscodeFailure>(json).is_err());
+    fn public_failure_json_rejects_every_free_form_secret_class() {
+        for (key, value) in [
+            ("username", "ExampleUser"),
+            ("password", "CorrectHorseBatteryStaple"),
+            ("infoHash", "0123456789abcdef0123456789abcdef01234567"),
+            ("capabilityToken", "opaqueCapabilityToken123"),
+            ("deviceLocator", "PCI00000001"),
+        ] {
+            let json =
+                format!("{{\"code\":\"process_exit\",\"context\":{{\"{key}\":\"{value}\"}}}}");
+            assert!(
+                serde_json::from_str::<TranscodeFailure>(&json).is_err(),
+                "accepted {key}"
+            );
+        }
     }
 
     #[test]
-    fn unsafe_context_is_not_representable_through_public_builder() {
-        let failure = TranscodeFailure::new(FailureCode::ProcessExit)
-            .with_safe_context("stage", "encode")
-            .with_safe_context("path", "C:\\Users\\Hunter\\Videos\\private.mp4")
-            .with_safe_context("url", "https://user:secret@example.test/video?token=abc")
-            .with_safe_context("stderr", "raw stderr");
+    fn alphanumeric_internal_secrets_never_reach_public_surfaces() {
+        let secrets = [
+            "ExampleUser",
+            "CorrectHorseBatteryStaple",
+            "0123456789abcdef0123456789abcdef01234567",
+            "opaqueCapabilityToken123",
+            "PCI00000001",
+        ];
+        let failure =
+            TranscodeFailure::new(FailureCode::ProcessExit).with_internal_detail(secrets.join(" "));
 
         let serialized = serde_json::to_string(&failure).unwrap();
         let display = failure.to_string();
@@ -284,11 +252,9 @@ mod tests {
 
         for rendered in [serialized, display, debug] {
             assert!(rendered.contains("process_exit"));
-            assert!(rendered.contains("encode"));
-            assert!(!rendered.contains("C:\\Users"), "{rendered}");
-            assert!(!rendered.contains("secret"), "{rendered}");
-            assert!(!rendered.contains("token=abc"), "{rendered}");
-            assert!(!rendered.contains("raw stderr"), "{rendered}");
+            for secret in secrets {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
         }
     }
 }
