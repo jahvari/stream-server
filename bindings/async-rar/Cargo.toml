@@ -2,6 +2,7 @@
 name = "async-rar"
 version = "0.1.8"
 edition = "2024"
+rust-version.workspace = true
 description = "Async Rust bindings for UnRAR"
 license = "MIT"
 repository = "https://github.com/user/async-rar"

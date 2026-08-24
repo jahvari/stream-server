@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
@@ -61,8 +61,14 @@ jobs:
       - name: Restore Source Code
         run: git restore server enginefs bindings stremio-runtime-stub updater-helper settings-gui
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --features libtorrent --no-default-features -- -D warnings
+      - name: Check libtorrent and native FFI targets
+        run: cargo check --workspace --all-targets --features libtorrent --no-default-features
+
+      - name: Run Clippy for libtorrent and native FFI targets
+        run: cargo clippy --workspace --all-targets --features libtorrent --no-default-features -- -D warnings
+
+      - name: Check librqbit and native FFI targets
+        run: cargo check -p enginefs -p server --all-targets --features librqbit --no-default-features
 
       - name: Run Clippy for librqbit backend
         run: cargo clippy -p enginefs -p server --all-targets --features librqbit --no-default-features -- -D warnings
@@ -72,6 +78,29 @@ jobs:
 
       - name: Test librqbit backend
         run: cargo test -p enginefs -p server --features librqbit --no-default-features
+
+  check-windows:
+    name: Check Windows native FFI and shutdown
+    runs-on: windows-2022
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Check librqbit and native FFI targets
+        run: cargo check -p enginefs -p server --all-targets --features librqbit --no-default-features
+
+      - name: Run Clippy for librqbit and native FFI targets
+        run: cargo clippy -p enginefs -p server --all-targets --features librqbit --no-default-features -- -D warnings
+
+      - name: Test repeated Windows shutdown
+        run: cargo test -p server --test embed --features librqbit --no-default-features
 
   build-windows:
     name: Build Windows
@@ -83,10 +112,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-            toolchain: stable
-            target: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
 
       - name: Install cargo-chef and cargo-wix
         uses: taiki-e/install-action@v2
@@ -216,7 +244,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Install cargo-chef and cargo-deb
         uses: taiki-e/install-action@v2
@@ -319,7 +347,10 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm base-devel cmake curl rust git openssl pkg-config boost clang gtk3 libayatana-appindicator
+          pacman -S --needed --noconfirm base-devel cmake curl rustup git openssl pkg-config boost clang gtk3 libayatana-appindicator
+
+      - name: Install Rust 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Install libtorrent 2.1.1
         run: bash .github/scripts/install-libtorrent.sh
