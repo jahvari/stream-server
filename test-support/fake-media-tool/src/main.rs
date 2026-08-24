@@ -14,6 +14,7 @@ const SCENARIO_FILE: &str = "fake-media-tool.json";
 const DEFAULT_VERSION: &str = "ffmpeg version 7.1.4-Jellyfin";
 const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 20;
 const MAX_PROGRESS_INTERVAL_MS: u64 = 60_000;
+const MAX_SEGMENT_NUMBER_WIDTH: usize = 20;
 const OVERSIZED_LOG_LINES: usize = 4096;
 
 fn main() -> ExitCode {
@@ -109,6 +110,7 @@ impl Scenario {
         Self::load_from_candidate_dirs(&cwd, exe_dir.as_deref())
     }
 
+    #[cfg(test)]
     fn load_from_dir(dir: &Path) -> Result<Self, FakeError> {
         Self::load_from_candidate_dirs(dir, None)
     }
@@ -178,23 +180,21 @@ fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeErro
         wait_forever();
     }
 
-    if let Some(output) = query_output(args, scenario) {
-        io::stdout()
-            .write_all(output.as_bytes())
-            .map_err(|_| FakeError::Io)?;
-        return Ok(ExitCode::from(scenario.exit_code));
-    }
-
     match scenario.mode {
         Mode::Success => {
+            if write_query_output(args, scenario)? {
+                return Ok(ExitCode::from(scenario.exit_code));
+            }
             write_media_output(args, mpegts::valid_segment())?;
             write_progress(args, ProgressFinish::End, &mut io::stderr())?;
             Ok(ExitCode::from(scenario.exit_code))
         }
         Mode::StartupExit => Ok(ExitCode::from(nonzero_exit_code(scenario.exit_code))),
         Mode::ExitAfterOutput => {
-            write_media_output(args, mpegts::valid_segment())?;
-            write_progress(args, ProgressFinish::End, &mut io::stderr())?;
+            if !write_query_output(args, scenario)? {
+                write_media_output(args, mpegts::valid_segment())?;
+                write_progress(args, ProgressFinish::End, &mut io::stderr())?;
+            }
             Ok(ExitCode::from(nonzero_exit_code(scenario.exit_code)))
         }
         Mode::Hang => {
@@ -228,6 +228,17 @@ fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeErro
             wait_forever()
         }
     }
+}
+
+fn write_query_output(args: &[OsString], scenario: &Scenario) -> Result<bool, FakeError> {
+    let Some(output) = query_output(args, scenario) else {
+        return Ok(false);
+    };
+
+    io::stdout()
+        .write_all(output.as_bytes())
+        .map_err(|_| FakeError::Io)?;
+    Ok(true)
 }
 
 fn query_output(args: &[OsString], scenario: &Scenario) -> Option<String> {
@@ -545,6 +556,9 @@ fn render_segment_filename(pattern: &str, number: u64) -> Result<String, FakeErr
     let suffix_start = parse_number_placeholder(pattern, percent)?;
     let (head, placeholder_and_tail) = pattern.split_at(percent);
     let tail = &placeholder_and_tail[suffix_start - percent..];
+    if tail.contains('%') {
+        return Err(FakeError::UnsafeSegmentPattern);
+    }
     let placeholder = &pattern[percent..suffix_start];
     let number = if let Some(width) = placeholder
         .strip_prefix("%0")
@@ -554,6 +568,9 @@ fn render_segment_filename(pattern: &str, number: u64) -> Result<String, FakeErr
         let width = width
             .parse::<usize>()
             .map_err(|_| FakeError::UnsafeSegmentPattern)?;
+        if width > MAX_SEGMENT_NUMBER_WIDTH {
+            return Err(FakeError::UnsafeSegmentPattern);
+        }
         format!("{number:0width$}")
     } else {
         number.to_string()
@@ -806,6 +823,10 @@ mod tests {
             "nested/segment_%d.ts",
             "/tmp/segment_%d.ts",
             "segment.ts",
+            "segment_%03d_%d.ts",
+            "segment_%03d_%.ts",
+            "segment_%03d%",
+            "segment_%021d.ts",
         ] {
             let error = render_segment_filename(pattern, 0).expect_err("unsafe pattern rejected");
             assert_eq!(error, FakeError::UnsafeSegmentPattern);
