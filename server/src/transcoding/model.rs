@@ -757,7 +757,7 @@ mod tests {
     #[test]
     fn transcode_plan_deserialization_enforces_acceleration_invariant() {
         let json = concat!(
-            "{\"request\":{\"source\":\"media-source\",\"output\":{\"rateControl\":{",
+            "{\"request\":{\"source\":{\"completedFile\":{\"id\":\"media-source\"}},\"output\":{\"rateControl\":{",
             "\"intent\":\"constant\",\"targetVideoBps\":4000000,\"maxVideoBps\":4000000,",
             "\"bufferBits\":8000000,\"preset\":\"balanced\",\"outputFrameRate\":null,",
             "\"width\":1920,\"height\":1080,\"audioBps\":128000},",
@@ -766,7 +766,13 @@ mod tests {
             "\"accelerationClass\":\"hardwareResident\"}"
         );
 
-        assert!(serde_json::from_str::<TranscodePlan>(json).is_err());
+        let error = serde_json::from_str::<TranscodePlan>(json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("acceleration class does not match stages"),
+            "{error}"
+        );
     }
 
     #[test]
