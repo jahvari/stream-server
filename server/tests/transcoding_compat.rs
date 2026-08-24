@@ -7,10 +7,23 @@ use std::time::Duration;
 
 use enginefs::hls::{HlsEngine, TranscodeConfig};
 use enginefs::hwaccel::HwAccelConfig;
+use librqbit::{CreateTorrentOptions, create_torrent};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
 const SERVER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct StatusCase {
+    name: &'static str,
+    path: String,
+    status: reqwest::StatusCode,
+    body: &'static str,
+}
+
+struct PlaylistCase {
+    name: &'static str,
+    path: String,
+}
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -193,6 +206,12 @@ fn main() {
                 }
             }
         }
+        Ok("probe_ready") => {
+            eprintln!("Input #0, matroska,webm, from \"sample.mkv\":");
+            eprintln!("Duration: 00:00:10.00, start: 0.000000, bitrate: 1200 kb/s");
+            eprintln!("Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le(tv), 3840x2160, 23.98 fps, 24000/1001 tbr, 1k tbn");
+            eprintln!("Stream #0:1(jpn): Audio: aac (LC), 48000 Hz, stereo, fltp, 256 kb/s (default)");
+        }
         Ok(other) => panic!("unknown FAKE_FFMPEG_SCENARIO {other}"),
         Err(_) => panic!("FAKE_FFMPEG_SCENARIO not set"),
     }
@@ -282,6 +301,184 @@ fn assert_contains(log: &str, needle: &str) {
         log.contains(needle),
         "expected log to contain {needle:?}, got:\n{log}"
     );
+}
+
+fn valid_hls_id(info_hash: &str) -> String {
+    format!("{info_hash}-0")
+}
+
+fn accepted_playlist_cases(info_hash: &str) -> Vec<PlaylistCase> {
+    let hls_id = valid_hls_id(info_hash);
+    vec![
+        PlaylistCase {
+            name: "hlsv2 hls alias is accepted",
+            path: format!("/hlsv2/{hls_id}/hls.m3u8"),
+        },
+        PlaylistCase {
+            name: "hlsv2 stream playlist alias is accepted",
+            path: format!("/hlsv2/{hls_id}/stream-0.m3u8"),
+        },
+        PlaylistCase {
+            name: "legacy master playlist is accepted",
+            path: format!("/{info_hash}/0/master.m3u8"),
+        },
+        PlaylistCase {
+            name: "legacy hls playlist is accepted",
+            path: format!("/{info_hash}/0/hls.m3u8"),
+        },
+        PlaylistCase {
+            name: "legacy default stream playlist is accepted",
+            path: format!("/{info_hash}/0/stream.m3u8"),
+        },
+        PlaylistCase {
+            name: "legacy numbered stream playlist is accepted",
+            path: format!("/{info_hash}/0/stream-0.m3u8"),
+        },
+        PlaylistCase {
+            name: "legacy quality stream playlist is accepted",
+            path: format!("/{info_hash}/0/stream-q-360p.m3u8"),
+        },
+    ]
+}
+
+fn rejected_resource_cases(info_hash: &str) -> Vec<StatusCase> {
+    let hls_id = valid_hls_id(info_hash);
+    vec![
+        StatusCase {
+            name: "hlsv2 master alias stays owned by mediaURL route",
+            path: format!("/hlsv2/{hls_id}/master.m3u8"),
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "Missing mediaURL",
+        },
+        StatusCase {
+            name: "hlsv2 init segments stay unsupported",
+            path: format!("/hlsv2/{hls_id}/init.mp4"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"hlsv2 fMP4 media segments is not implemented"}"#,
+        },
+        StatusCase {
+            name: "hlsv2 nonnumeric segment aliases stay unsupported",
+            path: format!("/hlsv2/{hls_id}/segmentbogus.ts"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"hlsv2 fMP4 media segments is not implemented"}"#,
+        },
+        StatusCase {
+            name: "hlsv2 unknown track resources stay 404",
+            path: format!("/hlsv2/{hls_id}/captions.vtt"),
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "HLS resource not found",
+        },
+        StatusCase {
+            name: "legacy dlna route stays unsupported",
+            path: format!("/{info_hash}/0/dlna"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"legacy HLS DLNA discovery is not implemented"}"#,
+        },
+        StatusCase {
+            name: "legacy subtitle playlists stay unsupported",
+            path: format!("/{info_hash}/0/subs-0.m3u8"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"legacy HLS subtitle playlist is not implemented"}"#,
+        },
+        StatusCase {
+            name: "legacy mp4 resources stay unsupported",
+            path: format!("/{info_hash}/0/mp4stream0.ts"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"legacy HLS MP4 segments is not implemented"}"#,
+        },
+        StatusCase {
+            name: "legacy unknown resources stay 404",
+            path: format!("/{info_hash}/0/unknown.bin"),
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "legacy HLS resource not found",
+        },
+    ]
+}
+
+fn accepted_segment_variant_cases(info_hash: &str) -> Vec<StatusCase> {
+    vec![
+        StatusCase {
+            name: "legacy stream variant dispatches to segment parser",
+            path: format!("/{info_hash}/0/stream/not-a-segment.ts"),
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "Invalid segment",
+        },
+        StatusCase {
+            name: "legacy numbered stream variant dispatches to segment parser",
+            path: format!("/{info_hash}/0/stream-0/not-a-segment.ts"),
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "Invalid segment",
+        },
+        StatusCase {
+            name: "legacy quality stream variant dispatches to segment parser",
+            path: format!("/{info_hash}/0/stream-q-360p/not-a-segment.ts"),
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "Invalid segment",
+        },
+        StatusCase {
+            name: "legacy mp4 segment variants stay unsupported",
+            path: format!("/{info_hash}/0/mp4stream/0.ts"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"legacy HLS MP4 segments is not implemented"}"#,
+        },
+        StatusCase {
+            name: "legacy unknown segment variants stay unsupported",
+            path: format!("/{info_hash}/0/audio/0.ts"),
+            status: reqwest::StatusCode::NOT_IMPLEMENTED,
+            body: r#"{"error":"legacy HLS segment variant is not implemented"}"#,
+        },
+    ]
+}
+
+fn create_torrent_hex_fixture() -> (String, String) {
+    let fixture_dir = tempfile::tempdir().expect("torrent fixture tempdir");
+    let source_file = fixture_dir.path().join("compat-fixture.mkv");
+    fs::write(&source_file, b"transcoding compatibility fixture")
+        .expect("write torrent fixture file");
+    let torrent = run_async(async {
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        create_torrent(
+            &source_file,
+            CreateTorrentOptions {
+                piece_length: Some(16 * 1024),
+                ..Default::default()
+            },
+            &spawner,
+        )
+        .await
+    })
+    .expect("create torrent fixture");
+
+    (
+        hex::encode(
+            torrent
+                .as_bytes()
+                .expect("serialize torrent fixture metadata"),
+        ),
+        torrent.info_hash().as_string(),
+    )
+}
+
+fn ensure_cold_engine(client: &Client, base: &str) -> String {
+    let (torrent_hex, info_hash) = create_torrent_hex_fixture();
+    let response = client
+        .post(format!("{base}/create"))
+        .json(&json!({
+            "torrent": torrent_hex
+        }))
+        .send()
+        .expect("create cold engine request")
+        .error_for_status()
+        .expect("create cold engine status")
+        .json::<Value>()
+        .expect("create cold engine json");
+
+    assert!(
+        response.get("error").is_none(),
+        "cold engine creation failed: {response}"
+    );
+
+    info_hash
 }
 
 #[test]
@@ -587,4 +784,57 @@ fn gop_frames_is_four_seconds_only_at_24_fps() {
 fn hls_024a_gop_is_four_seconds_at_30_fps() {
     let config = TranscodeConfig::browser();
     assert_eq!(config.gop_frames as f64 / 30.0, 4.0);
+}
+
+#[test]
+fn hls_resource_parser_tables_cover_current_route_contracts() {
+    with_fake_ffmpeg("probe_ready", |log_path| {
+        with_embedded_server(|client, base| {
+            let info_hash = ensure_cold_engine(client, &base);
+
+            for case in accepted_playlist_cases(&info_hash) {
+                let response = client
+                    .get(format!("{base}{}", case.path))
+                    .send()
+                    .expect(case.name);
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::OK,
+                    "{} returned {}",
+                    case.name,
+                    response.status()
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/vnd.apple.mpegurl"),
+                    "{} content-type regressed",
+                    case.name
+                );
+            }
+
+            for case in rejected_resource_cases(&info_hash) {
+                let response = client
+                    .get(format!("{base}{}", case.path))
+                    .send()
+                    .expect(case.name);
+                assert_eq!(response.status(), case.status, "{}", case.name);
+                assert_eq!(response.text().expect(case.name), case.body, "{}", case.name);
+            }
+
+            for case in accepted_segment_variant_cases(&info_hash) {
+                let response = client
+                    .get(format!("{base}{}", case.path))
+                    .send()
+                    .expect(case.name);
+                assert_eq!(response.status(), case.status, "{}", case.name);
+                assert_eq!(response.text().expect(case.name), case.body, "{}", case.name);
+            }
+        });
+
+        let log = read_log(log_path);
+        assert_contains(&log, "[-analyzeduration][750000]");
+    });
 }
