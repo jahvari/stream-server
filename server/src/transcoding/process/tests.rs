@@ -12,6 +12,200 @@ fn retained_registry_sleep_helper() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
+async fn wait_for_hook(reached: fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !reached() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lifecycle hook reached");
+}
+
+fn remove_test_registry_entry(supervisor: &ProcessSupervisor, registration_id: u64) {
+    supervisor
+        .inner
+        .registry
+        .mark_cleanup_stopped(registration_id);
+    supervisor.inner.registry.complete(registration_id);
+}
+
+#[test]
+fn unix_group_identity_forbids_reap_before_final_signal_and_reuse_after_reap() {
+    let mut identity = super::UnixGroupIdentity::new(4_321);
+    assert_eq!(identity.final_signal_target(), Some(4_321));
+    assert_eq!(
+        identity
+            .mark_leader_reaped()
+            .expect_err("leader cannot be reaped before the final group signal")
+            .code(),
+        ProcessErrorCode::WaitFailed
+    );
+
+    identity.mark_final_signal_sent();
+    identity
+        .mark_leader_reaped()
+        .expect("leader can be reaped after the final group signal");
+
+    assert_eq!(
+        identity.final_signal_target(),
+        None,
+        "a reaped leader must never expose its numeric PGID as a kill target"
+    );
+}
+
+async fn abort_one_run_at_reader_handoff(
+    supervisor: &std::sync::Arc<ProcessSupervisor>,
+) -> Result<(), super::ProcessError> {
+    super::windows::set_reader_completion_pause(true);
+    super::set_reader_handoff_pause(true);
+    let running = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { supervisor.run_bounded(inert_spec()).await })
+    };
+    wait_for_hook(super::windows::reader_completion_reached).await;
+    wait_for_hook(super::reader_handoff_reached).await;
+    running.abort();
+    assert!(
+        running
+            .await
+            .expect_err("run future must be aborted")
+            .is_cancelled()
+    );
+    super::set_reader_handoff_pause(false);
+    let premature_drain = supervisor.wait_for_idle(Duration::from_millis(100)).await;
+    super::windows::set_reader_completion_pause(false);
+    supervisor
+        .wait_for_idle(Duration::from_secs(5))
+        .await
+        .expect("reader owner must converge after the barrier opens");
+    premature_drain
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_after_complete_send_keeps_owner_until_registry_and_permit_are_released() {
+    let supervisor = std::sync::Arc::new(ProcessSupervisor::with_max_concurrency(
+        CancellationToken::new(),
+        1,
+    ));
+    supervisor
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm owner resources");
+    let resources_before = super::windows::resource_snapshot();
+    let handles_before = super::windows::process_handle_count();
+    super::set_owner_complete_pause(true);
+    let running = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { supervisor.run_bounded(inert_spec()).await })
+    };
+    wait_for_hook(super::owner_complete_reached).await;
+    let registration_id = *supervisor
+        .inner
+        .registry
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .next()
+        .expect("registered process during owner completion");
+    assert_eq!(supervisor.active_processes(), 1);
+    assert_eq!(supervisor.inner.permits.available_permits(), 0);
+
+    running.abort();
+    assert!(
+        running
+            .await
+            .expect_err("run future must be aborted")
+            .is_cancelled()
+    );
+    super::set_owner_complete_pause(false);
+    let first_drain = supervisor.wait_for_idle(Duration::from_millis(100)).await;
+    if first_drain.is_err() {
+        remove_test_registry_entry(&supervisor, registration_id);
+    }
+
+    assert!(
+        first_drain.is_ok(),
+        "owner acknowledgment was not preceded by durable registry completion"
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+    assert_eq!(supervisor.inner.permits.available_permits(), 1);
+    assert_eq!(super::windows::resource_snapshot(), resources_before);
+    assert_eq!(super::windows::process_handle_count(), handles_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_after_reader_handoff_keeps_readers_registry_and_permit_owned_until_joined() {
+    let supervisor = std::sync::Arc::new(ProcessSupervisor::with_max_concurrency(
+        CancellationToken::new(),
+        1,
+    ));
+    let _ = abort_one_run_at_reader_handoff(&supervisor).await;
+    let resources_before = super::windows::resource_snapshot();
+    let handles_before = super::windows::process_handle_count();
+    let premature_drain = abort_one_run_at_reader_handoff(&supervisor).await;
+
+    assert!(
+        premature_drain.is_err(),
+        "reader handles left durable ownership before their tasks finished"
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+    assert_eq!(supervisor.inner.permits.available_permits(), 1);
+    assert_eq!(super::windows::resource_snapshot(), resources_before);
+    assert_eq!(super::windows::process_handle_count(), handles_before);
+}
+
+#[test]
+fn registration_drop_without_a_runtime_leaves_no_stuck_cleanup_state() {
+    let supervisor = ProcessSupervisor::with_max_concurrency(CancellationToken::new(), 1);
+    let permit = supervisor
+        .inner
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .expect("owned test permit");
+    let mut request = inert_spec();
+    request.args = vec![
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from("transcoding::process::tests::retained_registry_sleep_helper"),
+    ];
+    let spawned = super::windows::spawn(&request, supervisor.inner.registry.clone(), None)
+        .expect("spawn no-runtime cleanup helper");
+    let super::windows::SpawnedProcess {
+        process,
+        job,
+        stdout,
+        stderr,
+        registration,
+    } = spawned;
+    let pid = super::windows::process_id(&process);
+    let registration_id = registration.id;
+    registration.bind_permit(permit);
+    drop((process, job, stdout, stderr, registration));
+
+    let drain_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("drain runtime");
+    let first_drain = drain_runtime.block_on(supervisor.wait_for_idle(Duration::from_millis(100)));
+    if first_drain.is_err() {
+        supervisor
+            .force_terminate_registered()
+            .expect("test cleanup termination");
+        remove_test_registry_entry(&supervisor, registration_id);
+    }
+
+    assert!(
+        first_drain.is_ok(),
+        "cleanup_started remained set without a Tokio cleanup owner"
+    );
+    assert!(!super::windows::process_is_alive(pid));
+    assert_eq!(supervisor.active_processes(), 0);
+    assert_eq!(supervisor.inner.permits.available_permits(), 1);
+}
+
 #[test]
 fn never_polled_owner_is_killed_and_made_reapable_during_runtime_teardown() {
     let supervisor = ProcessSupervisor::new(CancellationToken::new());

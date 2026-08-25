@@ -23,6 +23,57 @@ const MAX_WALL_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 const CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
+#[cfg(all(test, windows))]
+static PAUSE_OWNER_COMPLETE: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, windows))]
+static OWNER_COMPLETE_REACHED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, windows))]
+static PAUSE_READER_HANDOFF: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, windows))]
+static READER_HANDOFF_REACHED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, windows))]
+fn set_owner_complete_pause(paused: bool) {
+    PAUSE_OWNER_COMPLETE.store(paused, Ordering::Release);
+    if paused {
+        OWNER_COMPLETE_REACHED.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, windows))]
+fn owner_complete_reached() -> bool {
+    OWNER_COMPLETE_REACHED.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, windows))]
+async fn pause_owner_complete() {
+    OWNER_COMPLETE_REACHED.store(true, Ordering::Release);
+    while PAUSE_OWNER_COMPLETE.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[cfg(all(test, windows))]
+fn set_reader_handoff_pause(paused: bool) {
+    PAUSE_READER_HANDOFF.store(paused, Ordering::Release);
+    if paused {
+        READER_HANDOFF_REACHED.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, windows))]
+fn reader_handoff_reached() -> bool {
+    READER_HANDOFF_REACHED.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, windows))]
+async fn pause_reader_handoff() {
+    READER_HANDOFF_REACHED.store(true, Ordering::Release);
+    while PAUSE_READER_HANDOFF.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StdoutPolicy {
     Null,
@@ -130,6 +181,8 @@ struct RegisteredEntry {
     #[cfg(unix)]
     unix_killable: bool,
     #[cfg(windows)]
+    readers_expected: bool,
+    #[cfg(windows)]
     cleanup_tasks: Vec<WindowsReaderTask>,
 }
 
@@ -144,18 +197,59 @@ enum RegisteredTarget {
     UnixProcessGroup(i32),
 }
 
+#[cfg(any(unix, test))]
+struct UnixGroupIdentity {
+    process_group: i32,
+    final_signal_sent: bool,
+    leader_reaped: bool,
+}
+
+#[cfg(any(unix, test))]
+impl UnixGroupIdentity {
+    fn new(process_group: i32) -> Self {
+        Self {
+            process_group,
+            final_signal_sent: false,
+            leader_reaped: false,
+        }
+    }
+
+    fn final_signal_target(&self) -> Option<i32> {
+        (!self.final_signal_sent && !self.leader_reaped).then_some(self.process_group)
+    }
+
+    fn mark_final_signal_sent(&mut self) {
+        self.final_signal_sent = true;
+    }
+
+    fn mark_leader_reaped(&mut self) -> Result<(), ProcessError> {
+        if !self.final_signal_sent {
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+        self.leader_reaped = true;
+        Ok(())
+    }
+}
+
 pub(super) struct Registration {
     registry: Arc<ProcessRegistry>,
     id: u64,
     completed: bool,
+    #[cfg(windows)]
+    owner_started: bool,
     #[cfg(windows)]
     owner_signal: Option<tokio::sync::oneshot::Sender<WindowsOwnerAction>>,
 }
 
 #[cfg(windows)]
 enum WindowsOwnerAction {
-    Complete(tokio::sync::oneshot::Sender<()>),
+    Complete(tokio::sync::oneshot::Sender<WindowsOwnerResult>),
 }
+
+#[cfg(windows)]
+type WindowsReaderResults = [Result<Vec<u8>, ProcessError>; 2];
+#[cfg(windows)]
+type WindowsOwnerResult = Result<WindowsReaderResults, ProcessError>;
 
 impl ProcessRegistry {
     fn new() -> Self {
@@ -202,6 +296,8 @@ impl ProcessRegistry {
                     #[cfg(unix)]
                     unix_killable: true,
                     #[cfg(windows)]
+                    readers_expected: false,
+                    #[cfg(windows)]
                     cleanup_tasks: Vec::new(),
                 },
             );
@@ -209,6 +305,8 @@ impl ProcessRegistry {
             registry: self.clone(),
             id,
             completed: false,
+            #[cfg(windows)]
+            owner_started: false,
             #[cfg(windows)]
             owner_signal: None,
         }
@@ -285,7 +383,22 @@ impl ProcessRegistry {
         if !should_start {
             return;
         }
-        spawn_abandoned_windows_cleanup(self.clone(), id);
+        if !spawn_abandoned_windows_cleanup(self.clone(), id) {
+            self.terminate_windows_fallback(id);
+            self.mark_cleanup_stopped(id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mark_unix_final_signal_sent(&self, id: u64) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = entries.get_mut(&id) else {
+            return;
+        };
+        entry.unix_killable = false;
     }
 
     #[cfg(unix)]
@@ -297,8 +410,6 @@ impl ProcessRegistry {
         let Some(entry) = entries.get_mut(&id) else {
             return;
         };
-        let RegisteredTarget::UnixProcessGroup(process_group) = &entry.target;
-        let _ = terminate_unix_group(*process_group);
         entry.unix_killable = false;
         entry.retained = true;
         entry.cleanup_started = false;
@@ -383,12 +494,10 @@ impl Drop for Registration {
         if !self.completed {
             #[cfg(windows)]
             {
-                let owner_started = self.owner_signal.is_some();
-                if owner_started {
+                if self.owner_started {
                     self.registry.mark_retained(self.id);
                 } else {
                     self.registry.begin_retained_cleanup(self.id);
-                    self.registry.terminate_windows_fallback(self.id);
                 }
             }
             #[cfg(unix)]
@@ -419,24 +528,31 @@ impl Registration {
     }
 
     #[cfg(windows)]
-    async fn finish_windows(mut self) {
+    async fn finish_windows(mut self) -> WindowsOwnerResult {
+        let signal = self
+            .owner_signal
+            .take()
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        signal
+            .send(WindowsOwnerAction::Complete(result))
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+        let output = receiver
+            .await
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
         self.completed = true;
-        if let Some(signal) = self.owner_signal.take() {
-            let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
-            if signal
-                .send(WindowsOwnerAction::Complete(acknowledge))
-                .is_ok()
-            {
-                let _ = acknowledged.await;
-            }
-        }
-        self.registry.complete(self.id);
+        output
     }
 
     #[cfg(all(windows, test))]
     fn retain(mut self) {
         self.registry.begin_retained_cleanup(self.id);
         self.completed = true;
+    }
+
+    #[cfg(unix)]
+    fn mark_unix_final_signal_sent(&self) {
+        self.registry.mark_unix_final_signal_sent(self.id);
     }
 
     #[cfg(unix)]
@@ -458,6 +574,7 @@ impl Registration {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&self.id)
         {
+            entry.readers_expected = true;
             entry.cleanup_tasks.extend([stdout, stderr]);
         }
     }
@@ -477,6 +594,7 @@ impl Registration {
         }
         let (signal, receiver) = tokio::sync::oneshot::channel();
         self.owner_signal = Some(signal);
+        self.owner_started = true;
         if let Some(entry) = self
             .registry
             .entries
@@ -488,19 +606,72 @@ impl Registration {
         }
         spawn_windows_owner(self.registry.clone(), self.id, receiver, runtime);
     }
+}
 
-    #[cfg(windows)]
-    fn take_windows_readers(&self) -> Option<[WindowsReaderTask; 2]> {
-        let mut entries = self
-            .registry
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tasks = &mut entries.get_mut(&self.id)?.cleanup_tasks;
-        if tasks.len() != 2 {
-            return None;
+#[cfg(unix)]
+struct UnixOwnedProcess {
+    child: Option<tokio::process::Child>,
+    registration: Option<Registration>,
+    identity: UnixGroupIdentity,
+}
+
+#[cfg(unix)]
+impl UnixOwnedProcess {
+    fn new(child: tokio::process::Child, process_group: i32, registration: Registration) -> Self {
+        Self {
+            child: Some(child),
+            registration: Some(registration),
+            identity: UnixGroupIdentity::new(process_group),
         }
-        Some([tasks.remove(0), tasks.remove(0)])
+    }
+
+    fn process_group(&self) -> i32 {
+        self.identity.process_group
+    }
+
+    fn child_mut(&mut self) -> Result<&mut tokio::process::Child, ProcessError> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))
+    }
+
+    fn send_final_signal(&mut self) -> Result<(), ProcessError> {
+        let Some(process_group) = self.identity.final_signal_target() else {
+            return Ok(());
+        };
+        let result = terminate_unix_group(process_group);
+        self.identity.mark_final_signal_sent();
+        if let Some(registration) = &self.registration {
+            registration.mark_unix_final_signal_sent();
+        }
+        result
+    }
+
+    fn mark_leader_reaped(&mut self) -> Result<(), ProcessError> {
+        self.identity.mark_leader_reaped()
+    }
+
+    fn complete(mut self) -> Result<(), ProcessError> {
+        if !self.identity.leader_reaped {
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+        self.registration
+            .take()
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))?
+            .complete();
+        drop(self.child.take());
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixOwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.send_final_signal();
+        if let Some(registration) = self.registration.take() {
+            registration.retain();
+        }
+        drop(self.child.take());
     }
 }
 
@@ -798,26 +969,14 @@ impl ProcessSupervisor {
         drop(job);
         drop(process);
 
-        let [stdout_reader, stderr_reader] = registration
-            .take_windows_readers()
-            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-        let stdout_result = stdout_reader
-            .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
-        let stderr_result = stderr_reader
-            .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
-
-        registration.finish_windows().await;
-        let stdout = stdout_result??;
-        let stderr = stderr_result??;
+        let [stdout, stderr] = registration.finish_windows().await?;
         if let Some(error) = terminal_error {
             return Err(error);
         }
         Ok(BoundedOutput {
             status: ExitStatus::from_raw(exit_code),
-            stdout,
-            stderr,
+            stdout: stdout?,
+            stderr: stderr?,
         })
     }
 
@@ -848,7 +1007,7 @@ impl ProcessSupervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
-        let (mut child, pid, registration) = {
+        let (child, pid, registration) = {
             let _gate = self
                 .inner
                 .admission_gate
@@ -870,12 +1029,13 @@ impl ProcessSupervisor {
             registration.bind_permit(permit);
             (child, pid, registration)
         };
-        let Some(stdout_pipe) = child.stdout.take() else {
-            cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
+        let mut owner = UnixOwnedProcess::new(child, pid, registration);
+        let Some(stdout_pipe) = owner.child_mut()?.stdout.take() else {
+            cleanup_failed_unix_spawn(owner).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
         };
-        let Some(stderr_pipe) = child.stderr.take() else {
-            cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
+        let Some(stderr_pipe) = owner.child_mut()?.stderr.take() else {
+            cleanup_failed_unix_spawn(owner).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
         };
         let (limit_tx, limit_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -905,9 +1065,7 @@ impl ProcessSupervisor {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let cancellation = self.inner.cancellation.clone();
         tokio::spawn(own_unix_process(
-            child,
-            pid,
-            registration,
+            owner,
             stdout_reader,
             stderr_reader,
             limit_rx,
@@ -924,9 +1082,7 @@ impl ProcessSupervisor {
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn own_unix_process(
-    mut child: tokio::process::Child,
-    process_group: i32,
-    registration: Registration,
+    mut owner: UnixOwnedProcess,
     mut stdout_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
     mut stderr_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
     mut limit_rx: tokio::sync::mpsc::UnboundedReceiver<ProcessErrorCode>,
@@ -935,81 +1091,76 @@ async fn own_unix_process(
     mut result_tx: tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>,
 ) {
     enum Completion {
-        Exited(Result<std::process::ExitStatus, std::io::Error>),
+        Exited(Result<(), ProcessError>),
         Stop(ProcessErrorCode),
     }
 
-    let mut registration = Some(registration);
-    let outcome = async {
-        let mut wait_child = Box::pin(child.wait());
+    let cleanup = async {
+        let process_group = owner.process_group();
+        let mut wait_leader = Box::pin(wait_for_unix_leader_unreaped(process_group));
         let deadline = tokio::time::sleep_until(wall_expires);
         tokio::pin!(deadline);
         let completion = tokio::select! {
-            result = &mut wait_child => Completion::Exited(result),
+            result = &mut wait_leader => Completion::Exited(result),
             _ = cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
             _ = result_tx.closed() => Completion::Stop(ProcessErrorCode::Cancelled),
             _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
             limit = limit_rx.recv() => match limit {
                 Some(code) => Completion::Stop(code),
-                None => Completion::Exited((&mut wait_child).await),
+                None => Completion::Exited((&mut wait_leader).await),
             },
         };
-        let (status, terminal_error) = match completion {
-            Completion::Exited(result) => (
-                result.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
-                None,
-            ),
+        let terminal_error = match completion {
+            Completion::Exited(result) => {
+                result?;
+                None
+            }
             Completion::Stop(ProcessErrorCode::Cancelled) => {
                 graceful_terminate_unix_group(process_group)?;
-                match tokio::time::timeout(CANCELLATION_GRACE, &mut wait_child).await {
-                    Ok(Ok(status)) => {
-                        (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
-                    }
-                    Ok(Err(_)) => return Err(ProcessError::new(ProcessErrorCode::WaitFailed)),
-                    Err(_) => {
-                        terminate_unix_group(process_group)?;
-                        let status = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
-                            .await
-                            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-                            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                        (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
-                    }
+                if let Ok(result) = tokio::time::timeout(CANCELLATION_GRACE, &mut wait_leader).await
+                {
+                    result?;
                 }
+                Some(ProcessError::new(ProcessErrorCode::Cancelled))
             }
-            Completion::Stop(code) => {
-                terminate_unix_group(process_group)?;
-                let status = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
-                    .await
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                (status, Some(ProcessError::new(code)))
-            }
+            Completion::Stop(code) => Some(ProcessError::new(code)),
         };
 
-        terminate_unix_group(process_group)?;
+        owner.send_final_signal()?;
+        let status = tokio::time::timeout(CLEANUP_DEADLINE, owner.child_mut()?.wait())
+            .await
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+        owner.mark_leader_reaped()?;
         wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE).await?;
-        let stdout = await_unix_reader(&mut stdout_reader).await?;
-        let stderr = await_unix_reader(&mut stderr_reader).await?;
-        if let Some(error) = terminal_error {
-            return Err(error);
-        }
-        Ok(BoundedOutput {
-            status,
-            stdout,
-            stderr,
-        })
+        let stdout = await_unix_reader(&mut stdout_reader).await;
+        let stderr = await_unix_reader(&mut stderr_reader).await;
+        Ok((status, stdout, stderr, terminal_error))
     }
     .await;
 
-    match &outcome {
-        Ok(_) => {
-            registration.take().expect("registration owner").complete();
+    let outcome = match cleanup {
+        Ok((status, stdout, stderr, terminal_error)) => {
+            let completed = owner.complete();
+            completed.and_then(|_| {
+                let stdout = stdout?;
+                let stderr = stderr?;
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+                Ok(BoundedOutput {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            })
         }
-        Err(_) => {
+        Err(error) => {
             abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-            registration.take().expect("registration owner").retain();
+            drop(owner);
+            Err(error)
         }
-    }
+    };
     let _ = result_tx.send(outcome);
 }
 
@@ -1041,12 +1192,13 @@ async fn wait_for_test_descendant_marker(spec: &ProcessSpec) -> Result<(), Proce
 }
 
 #[cfg(windows)]
-fn spawn_abandoned_windows_cleanup(registry: Arc<ProcessRegistry>, id: u64) {
+fn spawn_abandoned_windows_cleanup(registry: Arc<ProcessRegistry>, id: u64) -> bool {
     let (_signal, receiver) = tokio::sync::oneshot::channel();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
+        return false;
     };
     spawn_windows_owner(registry, id, receiver, &runtime);
+    true
 }
 
 #[cfg(windows)]
@@ -1085,12 +1237,26 @@ fn spawn_windows_owner(
     };
     runtime.spawn(async move {
         let mut fallback = fallback;
-        if let Ok(WindowsOwnerAction::Complete(acknowledge)) = receiver.await {
+        if let Ok(WindowsOwnerAction::Complete(result)) = receiver.await {
+            #[cfg(test)]
+            pause_owner_complete().await;
+            #[cfg(test)]
+            pause_reader_handoff().await;
+            let output = await_registered_windows_readers(&registry, id, true).await;
+            if output.is_err() {
+                registry.mark_retained(id);
+                drop(process);
+                drop(job);
+                drop(fallback);
+                let _ = result.send(output);
+                return;
+            }
             fallback.job = None;
             drop(fallback);
             drop(process);
             drop(job);
-            let _ = acknowledge.send(());
+            registry.complete(id);
+            let _ = result.send(output);
             return;
         }
         let mut wait_process = Box::pin(wait_windows_process(process.clone()));
@@ -1114,24 +1280,11 @@ fn spawn_windows_owner(
         {
             return;
         }
-        let readers = {
-            let mut entries = registry
-                .entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(entry) = entries.get_mut(&id) else {
-                return;
-            };
-            std::mem::take(&mut entry.cleanup_tasks)
-        };
-        for mut reader in readers {
-            if tokio::time::timeout(CLEANUP_DEADLINE, &mut reader)
-                .await
-                .is_err()
-            {
-                reader.abort();
-                let _ = reader.await;
-            }
+        if await_registered_windows_readers(&registry, id, false)
+            .await
+            .is_err()
+        {
+            return;
         }
         fallback.job = None;
         drop(wait_process);
@@ -1140,6 +1293,101 @@ fn spawn_windows_owner(
         drop(job);
         registry.complete(id);
     });
+}
+
+#[cfg(windows)]
+async fn await_registered_windows_readers(
+    registry: &ProcessRegistry,
+    id: u64,
+    require_output: bool,
+) -> WindowsOwnerResult {
+    let expires = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let finished = {
+            let entries = registry
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.get(&id) else {
+                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+            };
+            if !entry.readers_expected {
+                if require_output {
+                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                }
+                return Ok([Ok(Vec::new()), Ok(Vec::new())]);
+            }
+            entry.cleanup_tasks.len() == 2
+                && entry
+                    .cleanup_tasks
+                    .iter()
+                    .all(tokio::task::JoinHandle::is_finished)
+        };
+        if finished {
+            break;
+        }
+        if tokio::time::Instant::now() >= expires {
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let [stdout_reader, stderr_reader] = {
+        let mut entries = registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tasks = &mut entries
+            .get_mut(&id)
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))?
+            .cleanup_tasks;
+        if tasks.len() != 2 {
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+        [tasks.remove(0), tasks.remove(0)]
+    };
+    let stdout = stdout_reader
+        .await
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+    let stderr = stderr_reader
+        .await
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+    Ok([stdout, stderr])
+}
+
+#[cfg(unix)]
+async fn wait_for_unix_leader_unreaped(process_group: i32) -> Result<(), ProcessError> {
+    loop {
+        if unix_leader_is_waitable_without_reap(process_group)? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_leader_is_waitable_without_reap(process_group: i32) -> Result<bool, ProcessError> {
+    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            process_group as libc::id_t,
+            information.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            return Ok(false);
+        }
+        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(unsafe { information.si_pid() } == process_group)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn unix_leader_is_waitable_without_reap(_process_group: i32) -> Result<bool, ProcessError> {
+    Err(ProcessError::new(ProcessErrorCode::WaitFailed))
 }
 
 #[cfg(unix)]
@@ -1190,31 +1438,21 @@ async fn wait_for_unix_group_drain(
 }
 
 #[cfg(unix)]
-async fn cleanup_failed_unix_spawn(
-    child: &mut tokio::process::Child,
-    process_group: i32,
-    registration: Registration,
-) -> Result<(), ProcessError> {
-    if terminate_unix_group(process_group).is_err() {
-        registration.retain();
-        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-    }
-    match tokio::time::timeout(CLEANUP_DEADLINE, child.wait()).await {
-        Ok(Ok(_)) => {}
-        _ => {
-            registration.retain();
-            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-        }
-    }
+async fn cleanup_failed_unix_spawn(mut owner: UnixOwnedProcess) -> Result<(), ProcessError> {
+    let process_group = owner.process_group();
+    owner.send_final_signal()?;
+    tokio::time::timeout(CLEANUP_DEADLINE, owner.child_mut()?.wait())
+        .await
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+    owner.mark_leader_reaped()?;
     if wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE)
         .await
         .is_err()
     {
-        registration.retain();
         return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
     }
-    registration.complete();
-    Ok(())
+    owner.complete()
 }
 
 #[cfg(unix)]

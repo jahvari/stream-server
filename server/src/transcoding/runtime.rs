@@ -256,6 +256,14 @@ impl RuntimeKind {
     }
 }
 
+/// The service does not expose its raw process supervisor.
+///
+/// ```compile_fail
+/// use stream_server::transcoding::runtime::TranscodingService;
+/// fn bypass(service: &TranscodingService) {
+///     let _ = service.supervisor();
+/// }
+/// ```
 pub struct TranscodingService {
     supervisor: Arc<ProcessSupervisor>,
     state: tokio::sync::RwLock<ServiceState>,
@@ -286,10 +294,6 @@ impl TranscodingService {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Resolved { config, runtime }),
         }
-    }
-
-    pub fn supervisor(&self) -> &Arc<ProcessSupervisor> {
-        &self.supervisor
     }
 
     pub async fn current(&self) -> Option<RuntimeSnapshot> {
@@ -1018,7 +1022,13 @@ fn open_pair_lease_blocking_with_hook(
     mode: OpenMode,
     after_root_opened: impl FnOnce(),
 ) -> Result<OpenedPair, CandidateFailure> {
+    #[cfg(target_os = "linux")]
+    let root_file = open_local_root(root)?;
+    #[cfg(target_os = "linux")]
+    let root = final_linux_handle_path(&root_file)?;
+    #[cfg(not(target_os = "linux"))]
     let root = canonical_local_root(root)?;
+    #[cfg(not(target_os = "linux"))]
     let root_file = open_local_root(&root)?;
     let root_metadata = root_file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
     if !root_metadata.is_dir() || opened_handle_is_reparse(&root_file)? {
@@ -1032,7 +1042,7 @@ fn open_pair_lease_blocking_with_hook(
         }
     }
     #[cfg(target_os = "linux")]
-    if linux_file_is_remote(&root_file)? {
+    if !linux_file_is_local(&root_file)? {
         return Err(CandidateFailure::Unsafe);
     }
     after_root_opened();
@@ -1085,47 +1095,104 @@ fn open_pair_lease_blocking_with_hook(
 }
 
 fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File, CandidateFailure> {
-    #[cfg(target_os = "linux")]
+    #[cfg(windows)]
     {
-        use std::{
-            ffi::CString,
-            os::fd::{AsRawFd, FromRawFd},
+        use std::os::windows::{
+            ffi::OsStrExt,
+            io::{AsRawHandle, FromRawHandle},
         };
+        use windows::{
+            Wdk::{
+                Foundation::OBJECT_ATTRIBUTES,
+                Storage::FileSystem::{
+                    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+                    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+                },
+            },
+            Win32::{
+                Foundation::{
+                    HANDLE, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_NOT_FOUND,
+                    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+                },
+                Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ},
+                System::IO::IO_STATUS_BLOCK,
+            },
+            core::PWSTR,
+        };
+
         let _ = root;
-        let name = CString::new(name).map_err(|_| CandidateFailure::Unsafe)?;
-        let descriptor = unsafe {
-            libc::openat(
-                root_file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        if name.is_empty()
+            || Path::new(name).components().count() != 1
+            || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        let mut wide_name = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
+        let byte_length = wide_name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or(CandidateFailure::Unsafe)?;
+        let object_name = UNICODE_STRING {
+            Length: byte_length,
+            MaximumLength: byte_length,
+            Buffer: PWSTR(wide_name.as_mut_ptr()),
+        };
+        let object_attributes = OBJECT_ATTRIBUTES {
+            Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+                .map_err(|_| CandidateFailure::Unsafe)?,
+            RootDirectory: HANDLE(root_file.as_raw_handle()),
+            ObjectName: &raw const object_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle = HANDLE::default();
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                FILE_GENERIC_READ,
+                &raw const object_attributes,
+                &raw mut io_status,
+                None,
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                None,
+                0,
             )
         };
-        if descriptor < 0 {
+        if status.0 < 0 {
             return Err(
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
+                {
                     CandidateFailure::Missing
                 } else {
                     CandidateFailure::Unsafe
                 },
             );
         }
-        return Ok(unsafe { File::from_raw_fd(descriptor) });
+        Ok(unsafe { File::from_raw_handle(handle.0) })
     }
-    #[cfg(not(target_os = "linux"))]
-    let path = root.join(name);
-    #[cfg(not(target_os = "linux"))]
-    let mut options = fs::OpenOptions::new();
-    #[cfg(not(target_os = "linux"))]
-    options.read(true);
-    #[cfg(windows)]
+    #[cfg(target_os = "linux")]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-        let _ = root_file;
-        options
-            .share_mode(FILE_SHARE_READ.0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+        use std::os::fd::AsRawFd;
+        let _ = root;
+        return linux_openat2(
+            root_file.as_raw_fd(),
+            std::ffi::OsStr::new(name),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS,
+        );
     }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let path = root.join(name);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let mut options = fs::OpenOptions::new();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    options.read(true);
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         let _ = (root_file, path);
@@ -1133,7 +1200,7 @@ fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File,
     }
     #[cfg(not(any(windows, unix)))]
     let _ = root_file;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CandidateFailure::Missing
@@ -1144,7 +1211,34 @@ fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File,
 }
 
 fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        if !path.is_absolute() {
+            return Err(CandidateFailure::Unsafe);
+        }
+        let relative = path
+            .strip_prefix(Path::new("/"))
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        let filesystem_root = File::open("/").map_err(|_| CandidateFailure::Unsafe)?;
+        return linux_openat2(
+            filesystem_root.as_raw_fd(),
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     let mut options = fs::OpenOptions::new();
+    #[cfg(not(target_os = "linux"))]
     options.read(true);
     #[cfg(windows)]
     {
@@ -1156,12 +1250,79 @@ fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0);
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+    #[cfg(not(target_os = "linux"))]
     options.open(path).map_err(|_| CandidateFailure::Unsafe)
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+#[cfg(target_os = "linux")]
+const LINUX_RESOLVE_NO_SYMLINKS: u64 = 0x04;
+#[cfg(target_os = "linux")]
+const LINUX_RESOLVE_BENEATH: u64 = 0x08;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_openat2(
+    directory: std::os::fd::RawFd,
+    path: &std::ffi::OsStr,
+    flags: i32,
+    resolve: u64,
+) -> Result<File, CandidateFailure> {
+    use std::{
+        ffi::CString,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+
+    let path = CString::new(path.as_bytes()).map_err(|_| CandidateFailure::Unsafe)?;
+    let how = LinuxOpenHow {
+        flags: flags as u64,
+        mode: 0,
+        resolve,
+    };
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory,
+            path.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<LinuxOpenHow>(),
+        ) as i32
+    };
+    if descriptor < 0 {
+        return Err(
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                CandidateFailure::Missing
+            } else {
+                CandidateFailure::Unsafe
+            },
+        );
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(target_os = "linux")]
+fn final_linux_handle_path(file: &File) -> Result<PathBuf, CandidateFailure> {
+    use std::os::fd::AsRawFd;
+
+    let path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| CandidateFailure::Unsafe)?;
+    if !path.is_absolute() || path.as_os_str().to_string_lossy().ends_with(" (deleted)") {
+        return Err(CandidateFailure::Unsafe);
+    }
+    Ok(path)
 }
 
 fn opened_handle_is_reparse(file: &File) -> Result<bool, CandidateFailure> {
@@ -1246,29 +1407,38 @@ fn final_windows_handle_path(file: &File) -> Result<PathBuf, CandidateFailure> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_file_is_remote(file: &File) -> Result<bool, CandidateFailure> {
+fn linux_file_is_local(file: &File) -> Result<bool, CandidateFailure> {
     use std::os::fd::AsRawFd;
     let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
         return Err(CandidateFailure::Unsafe);
     }
     let statistics = unsafe { statistics.assume_init() };
-    Ok(linux_filesystem_type_is_remote(statistics.f_type as i64))
+    Ok(linux_filesystem_type_is_allowed_local(
+        statistics.f_type as i64,
+    ))
 }
 
-#[cfg(target_os = "linux")]
-fn linux_filesystem_type_is_remote(filesystem_type: i64) -> bool {
+#[cfg(any(test, target_os = "linux"))]
+fn linux_filesystem_type_is_allowed_local(filesystem_type: i64) -> bool {
     matches!(
         filesystem_type as u64,
-        0x0000_6969 // NFS
-            | 0x0000_517b // SMB
-            | 0xff53_4d42 // CIFS
-            | 0xfe53_4d42 // SMB2
-            | 0x0000_564c // NCP
-            | 0x7375_7245 // CODA
-            | 0x5346_414f // AFS
-            | 0x0102_1997 // 9P
-            | 0x00c3_6400 // Ceph
+        0x0000_ef53 // ext2/ext3/ext4
+            | 0x5846_5342 // XFS
+            | 0x9123_683e // Btrfs
+            | 0x0102_1994 // tmpfs
+            | 0x8584_58f6 // ramfs
+            | 0x794c_7630 // overlayfs
+            | 0x2fc1_2fc1 // ZFS
+            | 0xf2f5_2010 // F2FS
+            | 0x3153_464a // JFS
+            | 0x5265_4973 // ReiserFS
+            | 0x0000_3434 // NILFS
+            | 0x1501_3346 // UDF
+            | 0x0000_4d44 // FAT
+            | 0x2011_bab0 // exFAT
+            | 0x5346_544e // NTFS/NTFS3
+            | 0x6175_6673 // aufs
     )
 }
 
@@ -1505,13 +1675,50 @@ mod tests {
         assert!(!super::drive_type_is_remote(3));
     }
 
+    #[test]
+    fn linux_local_filesystem_policy_rejects_fuse_distributed_and_unknown_types() {
+        for filesystem_type in [0xef53, 0x5846_5342, 0x9123_683e, 0x0102_1994] {
+            assert!(super::linux_filesystem_type_is_allowed_local(
+                filesystem_type
+            ));
+        }
+        for filesystem_type in [
+            0x6573_5546, // FUSE, including sshfs and GlusterFS clients
+            0x0bd0_0bd0, // Lustre
+            0x4750_4653, // GPFS
+            0x6969,      // NFS
+            0x1357_9bdf, // unknown
+        ] {
+            assert!(!super::linux_filesystem_type_is_allowed_local(
+                filesystem_type
+            ));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_remote_filesystem_magic_values_are_rejected() {
-        for filesystem_type in [0x6969, 0xff53_4d42, 0xfe53_4d42, 0x0102_1997] {
-            assert!(super::linux_filesystem_type_is_remote(filesystem_type));
+    fn linux_root_open_rejects_a_symlinked_ancestor_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("linux ancestor root");
+        let real_namespace = directory.path().join("real-namespace");
+        let real_root = real_namespace.join("approved");
+        let linked_namespace = directory.path().join("linked-namespace");
+        fs::create_dir_all(&real_root).expect("create real root");
+        symlink(&real_namespace, &linked_namespace).expect("link ancestor namespace");
+        for role in ["ffmpeg", "ffprobe"] {
+            fs::copy(
+                std::env::current_exe().expect("test executable"),
+                real_root.join(role),
+            )
+            .expect("copy executable");
         }
-        assert!(!super::linux_filesystem_type_is_remote(0xef53));
+
+        let error =
+            super::open_pair_lease_blocking(&linked_namespace.join("approved"), OpenMode::Full)
+                .expect_err("openat2 must reject symlinked ancestor traversal");
+
+        assert!(matches!(error, CandidateFailure::Unsafe));
     }
 
     #[cfg(windows)]
@@ -1540,6 +1747,45 @@ mod tests {
         .expect_err("root-relative no-follow open must reject swapped link");
 
         assert!(matches!(error, CandidateFailure::Unsafe));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ancestor_namespace_swap_cannot_redirect_children_away_from_the_opened_root() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let directory = tempfile::tempdir().expect("ancestor-swap root");
+        let namespace = directory.path().join("namespace");
+        let root = namespace.join("approved");
+        let moved_root = namespace.join("moved-approved");
+        fs::create_dir_all(&root).expect("create approved root");
+        fs::write(root.join("ffmpeg.exe"), b"original-root")
+            .expect("write original executable marker");
+
+        let held_root = fs::OpenOptions::new()
+            .read(true)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(&root)
+            .expect("open rename-permissive root handle");
+        fs::rename(&root, &moved_root).expect("move the approved root");
+        fs::create_dir(&root).expect("replace the approved root");
+        fs::write(root.join("ffmpeg.exe"), b"replacement-root")
+            .expect("write replacement executable marker");
+
+        let mut opened = super::open_local_file_at(&held_root, &root, "ffmpeg.exe")
+            .expect("open child through the held root handle");
+        let mut contents = String::new();
+        opened
+            .read_to_string(&mut contents)
+            .expect("read opened child marker");
+
+        assert_eq!(contents, "original-root");
     }
 
     #[tokio::test]
@@ -1759,3 +2005,7 @@ mod tests {
         assert!(output.status.success());
     }
 }
+
+#[cfg(test)]
+#[path = "integration_tests.rs"]
+mod integration_tests;

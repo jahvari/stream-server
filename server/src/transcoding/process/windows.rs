@@ -67,6 +67,11 @@ static PAUSE_AFTER_RESUME: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static PAUSE_AFTER_RESUME_REACHED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static PAUSE_READER_COMPLETION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static READER_COMPLETION_REACHED: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +123,27 @@ pub(super) fn pause_after_resume_reached() -> bool {
 pub(super) fn pause_after_resume() {
     PAUSE_AFTER_RESUME_REACHED.store(true, AtomicOrdering::Release);
     while PAUSE_AFTER_RESUME.load(AtomicOrdering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_reader_completion_pause(paused: bool) {
+    PAUSE_READER_COMPLETION.store(paused, AtomicOrdering::Release);
+    if paused {
+        READER_COMPLETION_REACHED.store(0, AtomicOrdering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn reader_completion_reached() -> bool {
+    READER_COMPLETION_REACHED.load(AtomicOrdering::Acquire) >= 2
+}
+
+#[cfg(test)]
+fn pause_reader_completion() {
+    READER_COMPLETION_REACHED.fetch_add(1, AtomicOrdering::AcqRel);
+    while PAUSE_READER_COMPLETION.load(AtomicOrdering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
@@ -515,6 +541,8 @@ pub(super) fn read_pipe(
                 }
             }
         }
+        #[cfg(test)]
+        pause_reader_completion();
         if exceeded {
             Err(ProcessError::new(limit_code))
         } else if keep {

@@ -6,15 +6,15 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use stream_server::transcoding::process::{
+use crate::transcoding::process::{
     ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
 #[cfg(unix)]
-use stream_server::transcoding::runtime::verify_unchanged;
-use stream_server::transcoding::runtime::{
+use crate::transcoding::runtime::verify_unchanged;
+use crate::transcoding::runtime::{
     RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService, resolve_runtime,
 };
-use stream_server::transcoding::runtime_manifest::RuntimeError;
+use crate::transcoding::runtime_manifest::RuntimeError;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -174,12 +174,12 @@ async fn setup_ffmpeg_compatibility_adapter_returns_the_exact_explicit_pair_with
         .with_explicit_root(explicit.clone())
         .with_search_path(Some(std::env::join_paths([decoy]).expect("decoy path")));
 
-    let service = stream_server::setup_ffmpeg_with_config(config, supervisor)
+    let service = crate::setup_ffmpeg_with_config(config, supervisor)
         .await
         .expect("compatibility adapter resolves explicit pair");
     let expected = resolve_runtime(
         &isolated_config().with_explicit_root(explicit),
-        service.supervisor(),
+        &service.supervisor,
     )
     .await
     .expect("resolve expected explicit identity");
@@ -199,17 +199,17 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
     let managed_root = jellyfin_root(&config_dir.join("runtimes"), "current");
     let expected_managed_root = managed_root.clone();
 
-    let handle = stream_server::start(stream_server::ServerConfig {
+    let handle = crate::start(crate::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir),
         cache_dir: Some(cache_parent.path().join("cache")),
         setup_ffmpeg: true,
         enable_cache_cleaner: false,
-        ..stream_server::ServerConfig::embedded()
+        ..crate::ServerConfig::embedded()
     })?;
 
     let service = {
-        let state = stream_server::GLOBAL_STATE
+        let state = crate::GLOBAL_STATE
             .read()
             .map_err(|_| anyhow::anyhow!("global state lock was poisoned"))?;
         state
@@ -219,7 +219,7 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
             .clone()
     };
     let same_service = {
-        let state = stream_server::GLOBAL_STATE
+        let state = crate::GLOBAL_STATE
             .read()
             .map_err(|_| anyhow::anyhow!("global state lock was poisoned"))?;
         state
@@ -236,7 +236,7 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
         .block_on(async {
             let expected = resolve_runtime(
                 &isolated_config().with_explicit_root(expected_managed_root),
-                service.supervisor(),
+                &service.supervisor,
             )
             .await?;
             let actual = service.current().await.ok_or(RuntimeError::Unavailable)?;
@@ -246,15 +246,12 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
             );
             Ok::<_, anyhow::Error>(())
         })?;
-    assert_eq!(service.supervisor().active_processes(), 0);
+    assert_eq!(service.supervisor.active_processes(), 0);
 
     handle.shutdown()?;
-    assert_eq!(
-        handle.join()?,
-        Some(stream_server::ShutdownSource::External)
-    );
-    assert!(service.supervisor().cancellation_token().is_cancelled());
-    assert_eq!(service.supervisor().active_processes(), 0);
+    assert_eq!(handle.join()?, Some(crate::ShutdownSource::External));
+    assert!(service.supervisor.cancellation_token().is_cancelled());
+    assert_eq!(service.supervisor.active_processes(), 0);
 
     Ok(())
 }
@@ -1222,7 +1219,7 @@ async fn verified_session_keeps_the_pair_leased_and_publishes_only_safe_identity
         );
     }
     assert_eq!(session.id().install_digest, initial_digest);
-    assert!(Arc::ptr_eq(service.supervisor(), &supervisor));
+    assert!(Arc::ptr_eq(&service.supervisor, &supervisor));
 }
 
 #[cfg(unix)]
@@ -1266,7 +1263,7 @@ async fn unavailable_service_is_side_effect_free_and_exposes_disabled_status() {
         service.runtime_for_session().await,
         Err(RuntimeError::Unavailable)
     ));
-    assert!(Arc::ptr_eq(service.supervisor(), &supervisor));
+    assert!(Arc::ptr_eq(&service.supervisor, &supervisor));
     assert_eq!(supervisor.active_processes(), 0);
 }
 

@@ -1,6 +1,14 @@
 pub mod error;
 pub mod model;
-pub mod process;
+/// Raw process construction is internal to the transcoding runtime.
+///
+/// ```compile_fail
+/// use stream_server::transcoding::process::{ProcessSpec, ProcessSupervisor};
+/// fn bypass(supervisor: &ProcessSupervisor, spec: ProcessSpec) {
+///     let _ = supervisor.run_bounded(spec);
+/// }
+/// ```
+pub(crate) mod process;
 pub mod runtime;
 pub mod runtime_manifest;
 
