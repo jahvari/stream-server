@@ -56,12 +56,17 @@ const FAILURE_AFTER_ATTRIBUTE_LIST_SETUP: u8 = 2;
 const FAILURE_AFTER_SUSPENDED_CREATE: u8 = 3;
 const FAILURE_AFTER_JOB_ASSIGNMENT: u8 = 4;
 const FAILURE_AFTER_REGISTRY_INSERTION: u8 = 5;
-const FAILURE_AFTER_RESUME: u8 = 6;
 
 static TRACKED_HANDLES: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_ATTRIBUTE_LISTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static LAST_CREATED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static PAUSE_AFTER_RESUME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static PAUSE_AFTER_RESUME_REACHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +99,27 @@ pub(super) fn process_handle_count() -> u32 {
 #[cfg(test)]
 pub(super) fn last_created_pid() -> u32 {
     LAST_CREATED_PID.load(AtomicOrdering::Acquire)
+}
+
+#[cfg(test)]
+pub(super) fn set_pause_after_resume(paused: bool) {
+    PAUSE_AFTER_RESUME.store(paused, AtomicOrdering::Release);
+    if paused {
+        PAUSE_AFTER_RESUME_REACHED.store(false, AtomicOrdering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pause_after_resume_reached() -> bool {
+    PAUSE_AFTER_RESUME_REACHED.load(AtomicOrdering::Acquire)
+}
+
+#[cfg(test)]
+pub(super) fn pause_after_resume() {
+    PAUSE_AFTER_RESUME_REACHED.store(true, AtomicOrdering::Release);
+    while PAUSE_AFTER_RESUME.load(AtomicOrdering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[cfg(test)]
@@ -265,26 +291,28 @@ impl FailedSpawnCleanup {
         }
         let process = self.process.as_ref().ok_or_else(wait_error)?;
         let before = unsafe { WaitForSingleObject(process.raw(), 0) };
-        if before == WAIT_OBJECT_0 {
-            self.armed = false;
-            return Ok(());
-        }
-        if before != WAIT_TIMEOUT {
+        if before != WAIT_OBJECT_0 && before != WAIT_TIMEOUT {
             return Err(wait_error());
         }
-        let terminated = unsafe {
-            if let Some(job) = &self.job {
-                TerminateJobObject(job.raw(), FORCED_EXIT_CODE)
-            } else {
-                TerminateProcess(process.raw(), FORCED_EXIT_CODE)
+        if before == WAIT_TIMEOUT {
+            let terminated = unsafe {
+                if let Some(job) = &self.job {
+                    TerminateJobObject(job.raw(), FORCED_EXIT_CODE)
+                } else {
+                    TerminateProcess(process.raw(), FORCED_EXIT_CODE)
+                }
+            };
+            if terminated.is_err()
+                && unsafe { WaitForSingleObject(process.raw(), 0) } != WAIT_OBJECT_0
+            {
+                return Err(wait_error());
             }
-        };
-        if terminated.is_err() && unsafe { WaitForSingleObject(process.raw(), 0) } != WAIT_OBJECT_0
-        {
-            return Err(wait_error());
+            if unsafe { WaitForSingleObject(process.raw(), 5_000) } != WAIT_OBJECT_0 {
+                return Err(wait_error());
+            }
         }
-        if unsafe { WaitForSingleObject(process.raw(), 5_000) } != WAIT_OBJECT_0 {
-            return Err(wait_error());
+        if let Some(job) = &self.job {
+            terminate_and_wait(job, std::time::Duration::from_secs(5))?;
         }
         self.armed = false;
         Ok(())
@@ -412,16 +440,14 @@ pub(super) fn spawn(
     );
     if inject(failure_point, FAILURE_AFTER_REGISTRY_INSERTION).is_err() {
         cleanup.terminate_and_wait()?;
+        registration.complete();
         return Err(spawn_error());
     }
     let resume_result =
         unsafe { ResumeThread(cleanup.thread.as_ref().expect("thread handle").raw()) };
     if resume_result == u32::MAX {
         cleanup.terminate_and_wait()?;
-        return Err(spawn_error());
-    }
-    if inject(failure_point, FAILURE_AFTER_RESUME).is_err() {
-        cleanup.terminate_and_wait()?;
+        registration.complete();
         return Err(spawn_error());
     }
 

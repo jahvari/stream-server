@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 use stream_server::transcoding::process::{
     ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
-use stream_server::transcoding::runtime::{
-    RuntimeCommand, RuntimeConfig, RuntimeExecutable, RuntimeKind, RuntimeStatus,
-    TranscodingService, resolve_runtime,
-};
 #[cfg(unix)]
-use stream_server::transcoding::runtime::{RuntimeCommandError, verify_unchanged};
+use stream_server::transcoding::runtime::verify_unchanged;
+use stream_server::transcoding::runtime::{
+    RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService, resolve_runtime,
+};
 use stream_server::transcoding::runtime_manifest::RuntimeError;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -178,23 +177,15 @@ async fn setup_ffmpeg_compatibility_adapter_returns_the_exact_explicit_pair_with
     let service = stream_server::setup_ffmpeg_with_config(config, supervisor)
         .await
         .expect("compatibility adapter resolves explicit pair");
-    let session = service
-        .runtime_for_session()
-        .await
-        .expect("verified adapter session");
+    let expected = resolve_runtime(
+        &isolated_config().with_explicit_root(explicit),
+        service.supervisor(),
+    )
+    .await
+    .expect("resolve expected explicit identity");
+    let actual = service.current().await.expect("published adapter identity");
 
-    assert_eq!(
-        fs::canonicalize(session.executable_path(RuntimeExecutable::Ffmpeg))
-            .expect("canonical resolved ffmpeg"),
-        fs::canonicalize(explicit.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)))
-            .expect("canonical ffmpeg")
-    );
-    assert_eq!(
-        fs::canonicalize(session.executable_path(RuntimeExecutable::Ffprobe))
-            .expect("canonical resolved ffprobe"),
-        fs::canonicalize(explicit.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX)))
-            .expect("canonical ffprobe")
-    );
+    assert_eq!(actual.id(), expected.id());
     assert_eq!(std::env::var_os("PATH"), original_path);
 }
 
@@ -206,7 +197,7 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
     let cache_parent = tempfile::tempdir()?;
     let config_dir = config_parent.path().join("config");
     let managed_root = jellyfin_root(&config_dir.join("runtimes"), "current");
-    let expected_root = fs::canonicalize(managed_root)?;
+    let expected_managed_root = managed_root.clone();
 
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -239,28 +230,22 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
     };
     assert!(Arc::ptr_eq(&service, &same_service));
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(service.runtime_for_session())?;
-    assert_eq!(
-        fs::canonicalize(
-            runtime
-                .executable_path(RuntimeExecutable::Ffmpeg)
-                .parent()
-                .expect("ffmpeg parent"),
-        )?,
-        expected_root
-    );
-    assert_eq!(
-        fs::canonicalize(
-            runtime
-                .executable_path(RuntimeExecutable::Ffprobe)
-                .parent()
-                .expect("ffprobe parent"),
-        )?,
-        expected_root
-    );
+        .block_on(async {
+            let expected = resolve_runtime(
+                &isolated_config().with_explicit_root(expected_managed_root),
+                service.supervisor(),
+            )
+            .await?;
+            let actual = service.current().await.ok_or(RuntimeError::Unavailable)?;
+            anyhow::ensure!(
+                actual.id() == expected.id(),
+                "startup selected wrong runtime pair"
+            );
+            Ok::<_, anyhow::Error>(())
+        })?;
     assert_eq!(service.supervisor().active_processes(), 0);
 
     handle.shutdown()?;
@@ -350,6 +335,125 @@ async fn server_cancellation_kills_a_running_process_tree_and_reaps_registry_own
         0,
         "cancelled child remained registered"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_run_future_keeps_tree_readers_and_permit_owned_until_confirmed_reap() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let markers = tempfile::tempdir().expect("marker directory");
+    let queued_marker = markers.path().join("queued");
+    let supervisor = Arc::new(ProcessSupervisor::with_max_concurrency(
+        CancellationToken::new(),
+        1,
+    ));
+    let running = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--spawn-descendant"),
+            markers.path().as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    let parent_marker = markers.path().join("parent.pid");
+    let child_marker = markers.path().join("child.pid");
+    wait_for_file(&parent_marker, Duration::from_secs(2));
+    wait_for_file(&child_marker, Duration::from_secs(2));
+    let parent_pid = read_pid(&parent_marker);
+    let child_pid = read_pid(&child_marker);
+
+    running.abort();
+    assert!(
+        running
+            .await
+            .expect_err("run future must be aborted")
+            .is_cancelled()
+    );
+    let queued = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--touch"),
+            queued_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        supervisor.active_processes(),
+        1,
+        "caller abort released registry ownership before confirmed reap"
+    );
+    assert!(
+        !queued_marker.exists(),
+        "caller abort released the owned capacity permit before confirmed reap"
+    );
+
+    supervisor.cancel();
+    let _ = queued.await.expect("join queued process");
+    supervisor
+        .wait_for_idle(Duration::from_secs(8))
+        .await
+        .expect("supervisor-owned cleanup must drain");
+    assert!(
+        !process_is_alive(parent_pid),
+        "aborted parent survived cleanup"
+    );
+    assert!(
+        !process_is_alive(child_pid),
+        "aborted descendant survived cleanup"
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn repeated_runtime_teardown_uses_kill_fallback_then_allows_confirmed_registry_drain() {
+    let _guard = PROCESS_TEST_LOCK.blocking_lock();
+    for iteration in 0..3 {
+        let markers = tempfile::tempdir().expect("marker directory");
+        let supervisor = Arc::new(ProcessSupervisor::with_max_concurrency(
+            CancellationToken::new(),
+            1,
+        ));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.spawn({
+            let supervisor = supervisor.clone();
+            let request = spec([
+                OsString::from("--spawn-descendant"),
+                markers.path().as_os_str().to_os_string(),
+            ]);
+            async move { supervisor.run_bounded(request).await }
+        });
+        let parent_marker = markers.path().join("parent.pid");
+        let child_marker = markers.path().join("child.pid");
+        wait_for_file(&parent_marker, Duration::from_secs(2));
+        wait_for_file(&child_marker, Duration::from_secs(2));
+        let parent_pid = read_pid(&parent_marker);
+        let child_pid = read_pid(&child_marker);
+
+        runtime.shutdown_timeout(Duration::from_secs(3));
+        let drain_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("drain runtime");
+        drain_runtime
+            .block_on(supervisor.wait_for_idle(Duration::from_secs(5)))
+            .expect("registry drain after runtime teardown");
+
+        assert!(
+            !process_is_alive(parent_pid),
+            "iteration {iteration} left the parent alive"
+        );
+        assert!(
+            !process_is_alive(child_pid),
+            "iteration {iteration} left the descendant alive"
+        );
+        assert_eq!(supervisor.active_processes(), 0);
+    }
 }
 
 #[tokio::test]
@@ -698,11 +802,16 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
         let runtime = resolve_runtime(&config, &supervisor)
             .await
             .expect("resolve ordered runtime");
-        assert!(runtime.pair_root().is_absolute());
-        assert!(
-            runtime.pair_root().ends_with(expected_root),
-            "wrong resolution root: {}",
-            runtime.pair_root().display()
+        let expected = resolve_runtime(
+            &isolated_config().with_explicit_root(directory.path().join(expected_root)),
+            &supervisor,
+        )
+        .await
+        .expect("resolve expected candidate identity");
+        assert_eq!(
+            runtime.id().pair_root_identity,
+            expected.id().pair_root_identity,
+            "resolver selected the wrong candidate identity"
         );
     }
     assert_eq!(
@@ -710,6 +819,77 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
         original_path,
         "resolver mutated process PATH"
     );
+}
+
+#[tokio::test]
+async fn path_candidates_are_deduplicated_then_capped_before_probing() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let valid = jellyfin_root(directory.path(), "valid-after-duplicates");
+    let duplicate = directory.path().join("missing-duplicate");
+    let mut duplicated = std::iter::repeat_n(duplicate, 100).collect::<Vec<_>>();
+    duplicated.push(valid.clone());
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+
+    let runtime = resolve_runtime(
+        &isolated_config().with_search_path(Some(
+            std::env::join_paths(duplicated).expect("duplicated hostile PATH"),
+        )),
+        &supervisor,
+    )
+    .await
+    .expect("deduplication must leave room for the valid candidate");
+    let expected = resolve_runtime(&isolated_config().with_explicit_root(valid), &supervisor)
+        .await
+        .expect("expected valid identity");
+    assert_eq!(runtime.id(), expected.id());
+
+    let mut unique = (0..64)
+        .map(|index| directory.path().join(format!("missing-{index}")))
+        .collect::<Vec<_>>();
+    unique.push(jellyfin_root(directory.path(), "beyond-cap"));
+    let error = resolve_runtime(
+        &isolated_config().with_search_path(Some(
+            std::env::join_paths(unique).expect("unique hostile PATH"),
+        )),
+        &supervisor,
+    )
+    .await
+    .expect_err("candidate beyond the PATH cap must not be probed");
+    assert!(matches!(error, RuntimeError::Unavailable));
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_hanging_candidates_hit_the_overall_resolution_deadline() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let mut stalled = Vec::new();
+    for index in 0..4 {
+        let root = jellyfin_root(directory.path(), &format!("stalled-{index}"));
+        fs::write(root.join("stall-version"), b"stall").expect("write stall control");
+        stalled.push(root);
+    }
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let started = tokio::time::Instant::now();
+    let resolving = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            resolve_runtime(&isolated_config().with_system_roots(stalled), &supervisor).await
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    let error = resolving
+        .await
+        .expect("join bounded resolver")
+        .expect_err("repeated hangs must reach the overall deadline");
+
+    assert!(matches!(error, RuntimeError::ProbeDeadline));
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    tokio::time::advance(Duration::from_secs(7)).await;
+    supervisor
+        .wait_for_idle(Duration::from_secs(1))
+        .await
+        .expect("deadline-abandoned probe must remain owned through reap");
 }
 
 #[tokio::test]
@@ -806,7 +986,7 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
 }
 
 #[tokio::test]
-async fn upstream_runtime_is_degraded_only_when_no_jellyfin_pair_exists() {
+async fn explicit_upstream_runtime_is_authoritative_and_software_degraded() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let upstream = runtime_root(
         directory.path(),
@@ -823,18 +1003,56 @@ async fn upstream_runtime_is_degraded_only_when_no_jellyfin_pair_exists() {
 
     let runtime = resolve_runtime(&preferred, &supervisor)
         .await
-        .expect("resolve Jellyfin over upstream fallback");
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    assert_eq!(runtime.kind(), RuntimeKind::Jellyfin);
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
+        .expect("resolve authoritative explicit upstream pair");
     assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
-    assert!(runtime.pair_root().ends_with("jellyfin"));
+    let expected_explicit = resolve_runtime(
+        &isolated_config().with_explicit_root(upstream.clone()),
+        &supervisor,
+    )
+    .await
+    .expect("resolve expected explicit identity");
+    assert_eq!(
+        runtime.id().pair_root_identity,
+        expected_explicit.id().pair_root_identity
+    );
 
     let degraded = resolve_runtime(&isolated_config().with_explicit_root(upstream), &supervisor)
         .await
         .expect("resolve upstream degraded fallback");
     assert_eq!(degraded.kind(), RuntimeKind::SoftwareCompatible);
     assert!(!degraded.kind().hardware_allowed());
+}
+
+#[tokio::test]
+async fn valid_explicit_software_pair_is_authoritative_over_lower_jellyfin_candidates() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let explicit = runtime_root(
+        directory.path(),
+        "explicit-upstream",
+        "7.1.4",
+        "7.1.4",
+        "--enable-gpl\n--enable-libx264",
+    );
+    let lower = jellyfin_root(directory.path(), "lower-jellyfin");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let expected = resolve_runtime(
+        &isolated_config().with_explicit_root(explicit.clone()),
+        &supervisor,
+    )
+    .await
+    .expect("resolve explicit identity alone");
+
+    let actual = resolve_runtime(
+        &isolated_config()
+            .with_explicit_root(explicit)
+            .with_managed_current_root(lower),
+        &supervisor,
+    )
+    .await
+    .expect("valid explicit software runtime");
+
+    assert_eq!(actual.id(), expected.id());
+    assert_eq!(actual.kind(), RuntimeKind::SoftwareCompatible);
 }
 
 #[tokio::test]
@@ -861,7 +1079,7 @@ async fn arbitrary_explicit_system_and_path_jellyfin_pairs_are_not_hardware_qual
 }
 
 #[tokio::test]
-async fn only_host_specific_app_managed_manifest_provenance_enables_hardware() {
+async fn managed_candidate_without_authenticated_activation_proof_stays_software_only() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let managed = jellyfin_root(directory.path(), "managed-provenance");
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
@@ -873,18 +1091,9 @@ async fn only_host_specific_app_managed_manifest_provenance_enables_hardware() {
     .await
     .expect("resolve app-managed pair");
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    {
-        assert_eq!(runtime.kind(), RuntimeKind::Jellyfin);
-        assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("3"));
-        assert!(runtime.kind().hardware_allowed());
-    }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    {
-        assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
-        assert_eq!(runtime.id().jellyfin_revision, None);
-        assert!(!runtime.kind().hardware_allowed());
-    }
+    assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
+    assert_eq!(runtime.id().jellyfin_revision, None);
+    assert!(!runtime.kind().hardware_allowed());
 }
 
 #[tokio::test]
@@ -958,12 +1167,13 @@ async fn changed_runtime_file_fails_closed_before_a_session_can_use_it() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let root = jellyfin_root(directory.path(), "mutable");
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
-    let runtime = resolve_runtime(&isolated_config().with_explicit_root(root), &supervisor)
-        .await
-        .expect("resolve runtime");
-    let ffmpeg = runtime
-        .pair_root()
-        .join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
+    let runtime = resolve_runtime(
+        &isolated_config().with_explicit_root(root.clone()),
+        &supervisor,
+    )
+    .await
+    .expect("resolve runtime");
+    let ffmpeg = root.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
     let original_len = fs::metadata(&ffmpeg).unwrap().len();
     use std::io::Write;
     fs::OpenOptions::new()
@@ -982,10 +1192,10 @@ async fn changed_runtime_file_fails_closed_before_a_session_can_use_it() {
 }
 
 #[tokio::test]
-async fn verified_session_keeps_the_pair_leased_and_executes_through_the_shared_supervisor() {
+async fn verified_session_keeps_the_pair_leased_and_publishes_only_safe_identity() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let root = jellyfin_root(directory.path(), "service");
-    let config = isolated_config().with_explicit_root(root);
+    let config = isolated_config().with_explicit_root(root.clone());
     let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
     let initial = resolve_runtime(&config, &supervisor)
         .await
@@ -1004,78 +1214,46 @@ async fn verified_session_keeps_the_pair_leased_and_executes_through_the_shared_
 
     #[cfg(windows)]
     {
-        let ffmpeg = session.executable_path(RuntimeExecutable::Ffmpeg);
+        let ffmpeg = root.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
         let backup = ffmpeg.with_extension("replacement-race-backup");
         assert!(
-            fs::rename(ffmpeg, &backup).is_err(),
+            fs::rename(&ffmpeg, &backup).is_err(),
             "the validated executable was replaceable while its session lease was live"
         );
     }
-
-    let marker_dir = tempfile::tempdir().expect("session marker directory");
-    let marker = marker_dir.path().join("spawned");
-    let output = session
-        .run_bounded(
-            RuntimeExecutable::Ffmpeg,
-            RuntimeCommand {
-                args: vec![OsString::from("--touch"), marker.as_os_str().to_os_string()],
-                stdout: StdoutPolicy::Null,
-                stderr_byte_limit: 8_192,
-                wall_deadline: Duration::from_secs(2),
-            },
-        )
-        .await
-        .expect("run through verified session");
-
-    assert!(output.status.success());
-    assert!(marker.is_file());
     assert_eq!(session.id().install_digest, initial_digest);
     assert!(Arc::ptr_eq(service.supervisor(), &supervisor));
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn final_spawn_boundary_rejects_a_path_replaced_after_session_validation() {
+async fn session_revalidation_detects_a_path_replaced_after_validation() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let root = jellyfin_root(directory.path(), "replaceable");
-    let config = isolated_config().with_explicit_root(root);
+    let config = isolated_config().with_explicit_root(root.clone());
     let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
     let initial = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve initial runtime");
     let service = TranscodingService::resolved(config, supervisor, initial);
-    let session = service
+    let original_session = service
         .runtime_for_session()
         .await
         .expect("verified runtime session");
-    let ffmpeg = session
-        .executable_path(RuntimeExecutable::Ffmpeg)
-        .to_path_buf();
+    let ffmpeg = root.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
     let original = ffmpeg.with_extension("original");
     fs::rename(&ffmpeg, &original).expect("replace executable path after validation");
     fs::copy(&fake_process().executable, &ffmpeg).expect("install byte-identical replacement");
 
-    let error = session
-        .run_bounded(
-            RuntimeExecutable::Ffmpeg,
-            RuntimeCommand {
-                args: vec![
-                    OsString::from("--emit"),
-                    OsString::from("0"),
-                    OsString::from("0"),
-                ],
-                stdout: StdoutPolicy::Null,
-                stderr_byte_limit: 8_192,
-                wall_deadline: Duration::from_secs(2),
-            },
-        )
+    let replacement_session = service
+        .runtime_for_session()
         .await
-        .expect_err("changed executable path must fail at the final spawn boundary");
+        .expect("service must resolve and verify the replacement before returning it");
 
-    assert!(matches!(
-        error,
-        RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged)
-    ));
+    assert_eq!(
+        replacement_session.id().install_digest,
+        original_session.id().install_digest
+    );
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
@@ -105,7 +105,7 @@ pub struct ProcessSupervisor {
 
 struct SupervisorInner {
     cancellation: CancellationToken,
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     accepting: AtomicBool,
     admission_gate: Mutex<()>,
     registry: Arc<ProcessRegistry>,
@@ -119,11 +119,18 @@ struct ProcessRegistry {
     idle: Notify,
 }
 
+#[cfg(windows)]
+type WindowsReaderTask = tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>;
+
 struct RegisteredEntry {
     target: RegisteredTarget,
     retained: bool,
+    cleanup_started: bool,
+    permit: Option<OwnedSemaphorePermit>,
+    #[cfg(unix)]
+    unix_killable: bool,
     #[cfg(windows)]
-    cleanup_tasks: Vec<tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>>,
+    cleanup_tasks: Vec<WindowsReaderTask>,
 }
 
 #[derive(Clone)]
@@ -140,6 +147,14 @@ enum RegisteredTarget {
 pub(super) struct Registration {
     registry: Arc<ProcessRegistry>,
     id: u64,
+    completed: bool,
+    #[cfg(windows)]
+    owner_signal: Option<tokio::sync::oneshot::Sender<WindowsOwnerAction>>,
+}
+
+#[cfg(windows)]
+enum WindowsOwnerAction {
+    Complete(tokio::sync::oneshot::Sender<()>),
 }
 
 impl ProcessRegistry {
@@ -182,6 +197,10 @@ impl ProcessRegistry {
                 RegisteredEntry {
                     target,
                     retained: false,
+                    cleanup_started: false,
+                    permit: None,
+                    #[cfg(unix)]
+                    unix_killable: true,
                     #[cfg(windows)]
                     cleanup_tasks: Vec::new(),
                 },
@@ -189,26 +208,118 @@ impl ProcessRegistry {
         Registration {
             registry: self.clone(),
             id,
+            completed: false,
+            #[cfg(windows)]
+            owner_signal: None,
         }
     }
 
-    fn force_terminate_all(&self) -> Result<(), ProcessError> {
-        let targets = self
+    fn complete(&self, id: u64) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let became_idle = entries.remove(&id).is_some() && entries.is_empty();
+        drop(entries);
+        if became_idle {
+            self.idle.notify_waiters();
+        }
+    }
+
+    #[cfg(windows)]
+    fn mark_cleanup_stopped(&self, id: u64) {
+        if let Some(entry) = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .map(|entry| entry.target.clone())
-            .collect::<Vec<_>>();
+            .get_mut(&id)
+        {
+            entry.cleanup_started = false;
+        }
+        self.idle.notify_waiters();
+    }
+
+    #[cfg(windows)]
+    fn mark_retained(&self, id: u64) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&id)
+        {
+            entry.retained = true;
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate_windows_fallback(&self, id: u64) {
+        let target = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&id)
+            .map(|entry| entry.target.clone());
+        if let Some(RegisteredTarget::WindowsProcessTree { job, .. }) = target {
+            let _ = windows::terminate(&job);
+        }
+    }
+
+    #[cfg(windows)]
+    fn begin_retained_cleanup(self: &Arc<Self>, id: u64) {
+        let should_start = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.get_mut(&id) else {
+                return;
+            };
+            entry.retained = true;
+            if entry.cleanup_started {
+                false
+            } else {
+                entry.cleanup_started = true;
+                true
+            }
+        };
+        if !should_start {
+            return;
+        }
+        spawn_abandoned_windows_cleanup(self.clone(), id);
+    }
+
+    #[cfg(unix)]
+    fn retain_unix_after_final_signal(&self, id: u64) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = entries.get_mut(&id) else {
+            return;
+        };
+        let RegisteredTarget::UnixProcessGroup(process_group) = &entry.target;
+        let _ = terminate_unix_group(*process_group);
+        entry.unix_killable = false;
+        entry.retained = true;
+        entry.cleanup_started = false;
+    }
+
+    fn force_terminate_all(&self) -> Result<(), ProcessError> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut failed = false;
-        for target in targets {
-            let result = match target {
+        for entry in entries.values() {
+            let result = match &entry.target {
                 #[cfg(windows)]
-                RegisteredTarget::WindowsProcessTree { job, .. } => windows::terminate(&job),
+                RegisteredTarget::WindowsProcessTree { job, .. } => windows::terminate(job),
                 #[cfg(unix)]
-                RegisteredTarget::UnixProcessGroup(process_group) => {
-                    terminate_unix_group(process_group)
+                RegisteredTarget::UnixProcessGroup(process_group) if entry.unix_killable => {
+                    terminate_unix_group(*process_group)
                 }
+                #[cfg(unix)]
+                RegisteredTarget::UnixProcessGroup(_) => Ok(()),
             };
             failed |= result.is_err();
         }
@@ -227,6 +338,9 @@ impl ProcessRegistry {
         let mut failed = false;
         entries.retain(|_, entry| {
             if !entry.retained {
+                return true;
+            }
+            if entry.cleanup_started {
                 return true;
             }
             #[cfg(windows)]
@@ -266,22 +380,28 @@ impl ProcessRegistry {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut entries = self
-            .registry
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let became_idle = entries.remove(&self.id).is_some() && entries.is_empty();
-        drop(entries);
-        if became_idle {
-            self.registry.idle.notify_waiters();
+        if !self.completed {
+            #[cfg(windows)]
+            {
+                let owner_started = self.owner_signal.is_some();
+                if owner_started {
+                    self.registry.mark_retained(self.id);
+                } else {
+                    self.registry.begin_retained_cleanup(self.id);
+                    self.registry.terminate_windows_fallback(self.id);
+                }
+            }
+            #[cfg(unix)]
+            self.registry.retain_unix_after_final_signal(self.id);
+            #[cfg(windows)]
+            drop(self.owner_signal.take());
         }
     }
 }
 
 impl Registration {
-    #[cfg(any(unix, test))]
-    fn retain(self) {
+    fn bind_permit(&self, permit: OwnedSemaphorePermit) {
+        let mut permit = Some(permit);
         if let Some(entry) = self
             .registry
             .entries
@@ -289,14 +409,45 @@ impl Registration {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&self.id)
         {
-            entry.retained = true;
+            entry.permit = permit.take();
         }
-        std::mem::forget(self);
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+        self.registry.complete(self.id);
     }
 
     #[cfg(windows)]
-    fn retain_with_windows_readers(
-        self,
+    async fn finish_windows(mut self) {
+        self.completed = true;
+        if let Some(signal) = self.owner_signal.take() {
+            let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+            if signal
+                .send(WindowsOwnerAction::Complete(acknowledge))
+                .is_ok()
+            {
+                let _ = acknowledged.await;
+            }
+        }
+        self.registry.complete(self.id);
+    }
+
+    #[cfg(all(windows, test))]
+    fn retain(mut self) {
+        self.registry.begin_retained_cleanup(self.id);
+        self.completed = true;
+    }
+
+    #[cfg(unix)]
+    fn retain(mut self) {
+        self.registry.retain_unix_after_final_signal(self.id);
+        self.completed = true;
+    }
+
+    #[cfg(windows)]
+    fn set_windows_readers(
+        &self,
         stdout: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
         stderr: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
     ) {
@@ -307,10 +458,49 @@ impl Registration {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&self.id)
         {
-            entry.retained = true;
             entry.cleanup_tasks.extend([stdout, stderr]);
         }
-        std::mem::forget(self);
+    }
+
+    #[cfg(windows)]
+    fn start_windows_owner(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.start_windows_owner_on(&runtime);
+    }
+
+    #[cfg(windows)]
+    fn start_windows_owner_on(&mut self, runtime: &tokio::runtime::Handle) {
+        if self.owner_signal.is_some() {
+            return;
+        }
+        let (signal, receiver) = tokio::sync::oneshot::channel();
+        self.owner_signal = Some(signal);
+        if let Some(entry) = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&self.id)
+        {
+            entry.cleanup_started = true;
+        }
+        spawn_windows_owner(self.registry.clone(), self.id, receiver, runtime);
+    }
+
+    #[cfg(windows)]
+    fn take_windows_readers(&self) -> Option<[WindowsReaderTask; 2]> {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tasks = &mut entries.get_mut(&self.id)?.cleanup_tasks;
+        if tasks.len() != 2 {
+            return None;
+        }
+        Some([tasks.remove(0), tasks.remove(0)])
     }
 }
 
@@ -323,7 +513,7 @@ impl ProcessSupervisor {
         Self {
             inner: Arc::new(SupervisorInner {
                 cancellation,
-                permits: Semaphore::new(maximum.max(1)),
+                permits: Arc::new(Semaphore::new(maximum.max(1))),
                 accepting: AtomicBool::new(true),
                 admission_gate: Mutex::new(()),
                 registry: Arc::new(ProcessRegistry::new()),
@@ -396,7 +586,7 @@ impl ProcessSupervisor {
                 self.cancel();
                 return Err(ProcessError::new(ProcessErrorCode::Cancelled));
             },
-            permit = self.inner.permits.acquire() => permit.map_err(|_| ProcessError::new(ProcessErrorCode::Cancelled))?,
+            permit = self.inner.permits.clone().acquire_owned() => permit.map_err(|_| ProcessError::new(ProcessErrorCode::Cancelled))?,
         };
         if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
             self.cancel();
@@ -404,13 +594,12 @@ impl ProcessSupervisor {
         }
 
         #[cfg(windows)]
-        let result = self.run_windows(spec).await;
+        let result = self.run_windows(spec, permit).await;
         #[cfg(unix)]
-        let result = self.run_unix(spec).await;
+        let result = self.run_unix(spec, permit).await;
         #[cfg(not(any(windows, unix)))]
         let result = Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
 
-        drop(permit);
         result
     }
 
@@ -419,7 +608,7 @@ impl ProcessSupervisor {
         Self {
             inner: Arc::new(SupervisorInner {
                 cancellation,
-                permits: Semaphore::new(DEFAULT_MAX_CONCURRENT_PROCESSES),
+                permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_PROCESSES)),
                 accepting: AtomicBool::new(true),
                 admission_gate: Mutex::new(()),
                 registry: Arc::new(ProcessRegistry::new()),
@@ -429,8 +618,13 @@ impl ProcessSupervisor {
     }
 
     #[cfg(windows)]
-    async fn run_windows(&self, spec: ProcessSpec) -> Result<BoundedOutput, ProcessError> {
+    async fn run_windows(
+        &self,
+        spec: ProcessSpec,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<BoundedOutput, ProcessError> {
         use std::os::windows::process::ExitStatusExt;
+        let wall_expires = tokio::time::Instant::now() + spec.wall_deadline;
 
         let failure_point = {
             #[cfg(test)]
@@ -442,27 +636,37 @@ impl ProcessSupervisor {
                 None
             }
         };
-        let spawned = {
-            let _gate = self
-                .inner
+        let inner = self.inner.clone();
+        let owner_runtime = tokio::runtime::Handle::current();
+        let (spec, spawned) = tokio::task::spawn_blocking(move || {
+            let _gate = inner
                 .admission_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.inner.cancellation.is_cancelled()
-                || !self.inner.accepting.load(Ordering::Acquire)
-            {
-                return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+            if inner.cancellation.is_cancelled() || !inner.accepting.load(Ordering::Acquire) {
+                return (spec, Err(ProcessError::new(ProcessErrorCode::Cancelled)));
             }
-            windows::spawn(&spec, self.inner.registry.clone(), failure_point)?
-        };
+            let mut spawned = windows::spawn(&spec, inner.registry.clone(), failure_point);
+            if let Ok(spawned) = &mut spawned {
+                spawned.registration.bind_permit(permit);
+                spawned.registration.start_windows_owner_on(&owner_runtime);
+                #[cfg(test)]
+                if failure_point == Some(FailurePoint::PauseAfterResume) {
+                    windows::pause_after_resume();
+                }
+            }
+            (spec, spawned)
+        })
+        .await
+        .map_err(|_| ProcessError::new(ProcessErrorCode::SpawnFailed))?;
+        let spawned = spawned?;
         let windows::SpawnedProcess {
             process,
             job,
             stdout,
             stderr,
-            registration,
+            mut registration,
         } = spawned;
-
         let (limit_tx, mut limit_rx) = tokio::sync::mpsc::unbounded_channel();
         let stdout_limit = match spec.stdout {
             StdoutPolicy::Null => None,
@@ -484,36 +688,52 @@ impl ProcessSupervisor {
             ProcessErrorCode::StderrLimitExceeded,
             limit_tx,
         );
+        registration.set_windows_readers(stdout_reader, stderr_reader);
+        registration.start_windows_owner();
+
+        #[cfg(test)]
+        let injected_stop = match failure_point {
+            Some(FailurePoint::Resume) => Some(ProcessErrorCode::SpawnFailed),
+            Some(FailurePoint::ResumeAfterDescendant) => {
+                wait_for_test_descendant_marker(&spec).await?;
+                Some(ProcessErrorCode::SpawnFailed)
+            }
+            _ => None,
+        };
+        #[cfg(not(test))]
+        let injected_stop = None;
 
         #[cfg(test)]
         if failure_point == Some(FailurePoint::WaitAfterReaders) {
-            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
             return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
         }
 
         let mut wait_process = Box::pin(wait_windows_process(process.clone()));
-        let deadline = tokio::time::sleep(spec.wall_deadline);
+        let deadline = tokio::time::sleep_until(wall_expires);
         tokio::pin!(deadline);
 
         enum Completion {
             Exited(Result<u32, ProcessError>),
             Stop(ProcessErrorCode),
         }
-        let completion = tokio::select! {
-            wait = &mut wait_process => Completion::Exited(wait),
-            _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
-            _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
-            limit = limit_rx.recv() => match limit {
-                Some(code) => Completion::Stop(code),
-                None => Completion::Exited((&mut wait_process).await),
-            },
+        let completion = if let Some(code) = injected_stop {
+            Completion::Stop(code)
+        } else {
+            tokio::select! {
+                wait = &mut wait_process => Completion::Exited(wait),
+                _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
+                _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
+                limit = limit_rx.recv() => match limit {
+                    Some(code) => Completion::Stop(code),
+                    None => Completion::Exited((&mut wait_process).await),
+                },
+            }
         };
 
         let (exit_code, terminal_error) = match completion {
             Completion::Exited(result) => match result {
                 Ok(exit_code) => (exit_code, None),
                 Err(_) => {
-                    registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                     return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                 }
             },
@@ -523,25 +743,19 @@ impl ProcessSupervisor {
                         (waited, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
                     }
                     Ok(Err(_)) => {
-                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                         return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                     }
                     Err(_) => {
                         if windows::terminate(&job).is_err() {
-                            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                             return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                         }
                         let waited =
                             match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_process).await {
                                 Ok(Ok(waited)) => waited,
                                 Ok(Err(_)) => {
-                                    registration
-                                        .retain_with_windows_readers(stdout_reader, stderr_reader);
                                     return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                                 }
                                 Err(_) => {
-                                    registration
-                                        .retain_with_windows_readers(stdout_reader, stderr_reader);
                                     return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                                 }
                             };
@@ -551,17 +765,14 @@ impl ProcessSupervisor {
             }
             Completion::Stop(code) => {
                 if windows::terminate(&job).is_err() {
-                    registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                     return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                 }
                 let waited = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_process).await {
                     Ok(Ok(waited)) => waited,
                     Ok(Err(_)) => {
-                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                         return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                     }
                     Err(_) => {
-                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                         return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
                     }
                 };
@@ -577,18 +788,19 @@ impl ProcessSupervisor {
         {
             Ok(result) => result,
             Err(_) => {
-                registration.retain_with_windows_readers(stdout_reader, stderr_reader);
                 return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
             }
         };
         if cleanup_result.is_err() {
-            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
             return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
         }
 
         drop(job);
         drop(process);
 
+        let [stdout_reader, stderr_reader] = registration
+            .take_windows_readers()
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::WaitFailed))?;
         let stdout_result = stdout_reader
             .await
             .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
@@ -596,7 +808,7 @@ impl ProcessSupervisor {
             .await
             .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
 
-        drop(registration);
+        registration.finish_windows().await;
         let stdout = stdout_result??;
         let stderr = stderr_result??;
         if let Some(error) = terminal_error {
@@ -610,9 +822,14 @@ impl ProcessSupervisor {
     }
 
     #[cfg(unix)]
-    async fn run_unix(&self, spec: ProcessSpec) -> Result<BoundedOutput, ProcessError> {
+    async fn run_unix(
+        &self,
+        spec: ProcessSpec,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<BoundedOutput, ProcessError> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
+        let wall_expires = tokio::time::Instant::now() + spec.wall_deadline;
 
         let stdout_limit = match spec.stdout {
             StdoutPolicy::Null => None,
@@ -631,7 +848,7 @@ impl ProcessSupervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
-        let mut child = {
+        let (mut child, pid, registration) = {
             let _gate = self
                 .inner
                 .admission_gate
@@ -642,15 +859,17 @@ impl ProcessSupervisor {
             {
                 return Err(ProcessError::new(ProcessErrorCode::Cancelled));
             }
-            command
+            let child = command
                 .spawn()
-                .map_err(|_| ProcessError::new(ProcessErrorCode::SpawnFailed))?
+                .map_err(|_| ProcessError::new(ProcessErrorCode::SpawnFailed))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| ProcessError::new(ProcessErrorCode::SpawnFailed))?
+                as i32;
+            let registration = self.inner.registry.register_unix(pid);
+            registration.bind_permit(permit);
+            (child, pid, registration)
         };
-        let pid = child
-            .id()
-            .ok_or_else(|| ProcessError::new(ProcessErrorCode::SpawnFailed))?
-            as i32;
-        let registration = self.inner.registry.register_unix(pid);
         let Some(stdout_pipe) = child.stdout.take() else {
             cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
@@ -659,8 +878,8 @@ impl ProcessSupervisor {
             cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
         };
-        let (limit_tx, mut limit_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut stdout_reader = tokio::spawn({
+        let (limit_tx, limit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stdout_reader = tokio::spawn({
             let limit_tx = limit_tx.clone();
             async move {
                 read_async_pipe(
@@ -673,7 +892,7 @@ impl ProcessSupervisor {
                 .await
             }
         });
-        let mut stderr_reader = tokio::spawn(async move {
+        let stderr_reader = tokio::spawn(async move {
             read_async_pipe(
                 stderr_pipe,
                 Some(spec.stderr_byte_limit),
@@ -683,16 +902,52 @@ impl ProcessSupervisor {
             )
             .await
         });
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let cancellation = self.inner.cancellation.clone();
+        tokio::spawn(own_unix_process(
+            child,
+            pid,
+            registration,
+            stdout_reader,
+            stderr_reader,
+            limit_rx,
+            cancellation,
+            wall_expires,
+            result_tx,
+        ));
+        result_rx
+            .await
+            .unwrap_or_else(|_| Err(ProcessError::new(ProcessErrorCode::WaitFailed)))
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn own_unix_process(
+    mut child: tokio::process::Child,
+    process_group: i32,
+    registration: Registration,
+    mut stdout_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+    mut stderr_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+    mut limit_rx: tokio::sync::mpsc::UnboundedReceiver<ProcessErrorCode>,
+    cancellation: CancellationToken,
+    wall_expires: tokio::time::Instant,
+    mut result_tx: tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>,
+) {
+    enum Completion {
+        Exited(Result<std::process::ExitStatus, std::io::Error>),
+        Stop(ProcessErrorCode),
+    }
+
+    let mut registration = Some(registration);
+    let outcome = async {
         let mut wait_child = Box::pin(child.wait());
-        let deadline = tokio::time::sleep(spec.wall_deadline);
+        let deadline = tokio::time::sleep_until(wall_expires);
         tokio::pin!(deadline);
-        enum Completion {
-            Exited(Result<std::process::ExitStatus, std::io::Error>),
-            Stop(ProcessErrorCode),
-        }
         let completion = tokio::select! {
             result = &mut wait_child => Completion::Exited(result),
-            _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
+            _ = cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
+            _ = result_tx.closed() => Completion::Stop(ProcessErrorCode::Cancelled),
             _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
             limit = limit_rx.recv() => match limit {
                 Some(code) => Completion::Stop(code),
@@ -700,93 +955,41 @@ impl ProcessSupervisor {
             },
         };
         let (status, terminal_error) = match completion {
-            Completion::Exited(result) => match result {
-                Ok(status) => (status, None),
-                Err(_) => {
-                    abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                    registration.retain();
-                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                }
-            },
+            Completion::Exited(result) => (
+                result.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
+                None,
+            ),
             Completion::Stop(ProcessErrorCode::Cancelled) => {
+                graceful_terminate_unix_group(process_group)?;
                 match tokio::time::timeout(CANCELLATION_GRACE, &mut wait_child).await {
                     Ok(Ok(status)) => {
                         (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
                     }
-                    Ok(Err(_)) => {
-                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                        registration.retain();
-                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                    }
+                    Ok(Err(_)) => return Err(ProcessError::new(ProcessErrorCode::WaitFailed)),
                     Err(_) => {
-                        if terminate_unix_group(pid).is_err() {
-                            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                            registration.retain();
-                            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                        }
-                        let status = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
+                        terminate_unix_group(process_group)?;
+                        let status = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
                             .await
-                        {
-                            Ok(Ok(status)) => status,
-                            Ok(Err(_)) => {
-                                abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                                registration.retain();
-                                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                            }
-                            Err(_) => {
-                                abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                                registration.retain();
-                                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                            }
-                        };
+                            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
+                            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
                         (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
                     }
                 }
             }
             Completion::Stop(code) => {
-                if terminate_unix_group(pid).is_err() {
-                    abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                    registration.retain();
-                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                }
-                let status = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(_)) => {
-                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                        registration.retain();
-                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                    }
-                    Err(_) => {
-                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-                        registration.retain();
-                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-                    }
-                };
+                terminate_unix_group(process_group)?;
+                let status = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
+                    .await
+                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
+                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
                 (status, Some(ProcessError::new(code)))
             }
         };
 
-        if terminate_unix_group(pid).is_err()
-            || wait_for_unix_group_drain(pid, CLEANUP_DEADLINE)
-                .await
-                .is_err()
-        {
-            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-            registration.retain();
-            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-        }
-
-        let stdout = match await_unix_reader(&mut stdout_reader).await {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                stderr_reader.abort();
-                let _ = stderr_reader.await;
-                drop(registration);
-                return Err(error);
-            }
-        };
+        terminate_unix_group(process_group)?;
+        wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE).await?;
+        let stdout = await_unix_reader(&mut stdout_reader).await?;
         let stderr = await_unix_reader(&mut stderr_reader).await?;
-        drop(registration);
         if let Some(error) = terminal_error {
             return Err(error);
         }
@@ -796,6 +999,18 @@ impl ProcessSupervisor {
             stderr,
         })
     }
+    .await;
+
+    match &outcome {
+        Ok(_) => {
+            registration.take().expect("registration owner").complete();
+        }
+        Err(_) => {
+            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+            registration.take().expect("registration owner").retain();
+        }
+    }
+    let _ = result_tx.send(outcome);
 }
 
 #[cfg(windows)]
@@ -808,9 +1023,138 @@ async fn wait_windows_process(process: Arc<windows::TrackedHandle>) -> Result<u3
     }
 }
 
+#[cfg(all(test, windows))]
+async fn wait_for_test_descendant_marker(spec: &ProcessSpec) -> Result<(), ProcessError> {
+    let marker = spec
+        .environment
+        .get(&OsString::from("STREAM_SERVER_TEST_DESCENDANT_MARKER"))
+        .map(PathBuf::from)
+        .ok_or_else(|| ProcessError::new(ProcessErrorCode::SpawnFailed))?;
+    let expires = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !marker.is_file() {
+        if tokio::time::Instant::now() >= expires {
+            return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_abandoned_windows_cleanup(registry: Arc<ProcessRegistry>, id: u64) {
+    let (_signal, receiver) = tokio::sync::oneshot::channel();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    spawn_windows_owner(registry, id, receiver, &runtime);
+}
+
+#[cfg(windows)]
+fn spawn_windows_owner(
+    registry: Arc<ProcessRegistry>,
+    id: u64,
+    receiver: tokio::sync::oneshot::Receiver<WindowsOwnerAction>,
+    runtime: &tokio::runtime::Handle,
+) {
+    let target = registry
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .map(|entry| entry.target.clone());
+    let Some(RegisteredTarget::WindowsProcessTree { job, process }) = target else {
+        return;
+    };
+    struct RuntimeDropFallback {
+        job: Option<Arc<windows::TrackedHandle>>,
+        registry: Arc<ProcessRegistry>,
+        id: u64,
+    }
+    impl Drop for RuntimeDropFallback {
+        fn drop(&mut self) {
+            if let Some(job) = self.job.take() {
+                let _ = windows::terminate(&job);
+                self.registry.mark_cleanup_stopped(self.id);
+            }
+        }
+    }
+    let fallback = RuntimeDropFallback {
+        job: Some(job.clone()),
+        registry: registry.clone(),
+        id,
+    };
+    runtime.spawn(async move {
+        let mut fallback = fallback;
+        if let Ok(WindowsOwnerAction::Complete(acknowledge)) = receiver.await {
+            fallback.job = None;
+            drop(fallback);
+            drop(process);
+            drop(job);
+            let _ = acknowledge.send(());
+            return;
+        }
+        let mut wait_process = Box::pin(wait_windows_process(process.clone()));
+        let primary_exited = matches!(
+            tokio::time::timeout(CANCELLATION_GRACE, &mut wait_process).await,
+            Ok(Ok(_))
+        );
+        let cleanup_job = job.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            windows::terminate_and_wait(&cleanup_job, CLEANUP_DEADLINE)
+        });
+        let Ok(Ok(())) = cleanup.await else {
+            return;
+        };
+        if !primary_exited
+            && tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_process)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_none()
+        {
+            return;
+        }
+        let readers = {
+            let mut entries = registry
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.get_mut(&id) else {
+                return;
+            };
+            std::mem::take(&mut entry.cleanup_tasks)
+        };
+        for mut reader in readers {
+            if tokio::time::timeout(CLEANUP_DEADLINE, &mut reader)
+                .await
+                .is_err()
+            {
+                reader.abort();
+                let _ = reader.await;
+            }
+        }
+        fallback.job = None;
+        drop(wait_process);
+        drop(fallback);
+        drop(process);
+        drop(job);
+        registry.complete(id);
+    });
+}
+
 #[cfg(unix)]
 fn terminate_unix_group(process_group: i32) -> Result<(), ProcessError> {
-    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    signal_unix_group(process_group, libc::SIGKILL)
+}
+
+#[cfg(unix)]
+fn graceful_terminate_unix_group(process_group: i32) -> Result<(), ProcessError> {
+    signal_unix_group(process_group, libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn signal_unix_group(process_group: i32, signal: i32) -> Result<(), ProcessError> {
+    let result = unsafe { libc::kill(-process_group, signal) };
     if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         Ok(())
     } else {
@@ -869,7 +1213,7 @@ async fn cleanup_failed_unix_spawn(
         registration.retain();
         return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
     }
-    drop(registration);
+    registration.complete();
     Ok(())
 }
 
@@ -977,6 +1321,8 @@ enum FailurePoint {
     JobAssignment,
     RegistryInsertion,
     Resume,
+    ResumeAfterDescendant,
+    PauseAfterResume,
     WaitAfterReaders,
 }
 

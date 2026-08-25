@@ -3,13 +3,87 @@
 use super::{
     FailurePoint, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
-use std::{collections::BTreeMap, ffi::OsString, time::Duration};
+use std::{collections::BTreeMap, ffi::OsString, fs, process::Command, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 #[test]
 #[ignore = "spawned only by retained_registry_entry_can_be_retried_until_confirmed_drained"]
 fn retained_registry_sleep_helper() {
     std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn never_polled_owner_is_killed_and_made_reapable_during_runtime_teardown() {
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let mut request = inert_spec();
+    request.args = vec![
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from("transcoding::process::tests::retained_registry_sleep_helper"),
+    ];
+    let spawned = super::windows::spawn(&request, supervisor.inner.registry.clone(), None)
+        .expect("spawn never-polled-owner helper");
+    let super::windows::SpawnedProcess {
+        process,
+        job,
+        stdout,
+        stderr,
+        mut registration,
+    } = spawned;
+    let pid = super::windows::process_id(&process);
+    let registration_id = registration.id;
+    let owner_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("owner runtime");
+    registration.start_windows_owner_on(owner_runtime.handle());
+    drop((process, job, stdout, stderr, registration));
+    owner_runtime.shutdown_timeout(Duration::ZERO);
+
+    let drain_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("drain runtime");
+    let first_drain = drain_runtime.block_on(supervisor.wait_for_idle(Duration::from_millis(50)));
+    if first_drain.is_err() {
+        supervisor
+            .force_terminate_registered()
+            .expect("test cleanup termination");
+        supervisor
+            .inner
+            .registry
+            .mark_cleanup_stopped(registration_id);
+        drain_runtime
+            .block_on(supervisor.wait_for_idle(Duration::from_secs(5)))
+            .expect("test cleanup registry drain");
+    }
+
+    assert!(
+        first_drain.is_ok(),
+        "a queued but never-polled owner left retained cleanup permanently active"
+    );
+    assert!(!super::windows::process_is_alive(pid));
+}
+
+#[test]
+#[ignore = "spawned only by post_resume_failure_drains_descendant_job_before_return"]
+fn post_resume_descendant_helper() {
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "transcoding::process::tests::retained_registry_sleep_helper",
+        ])
+        .spawn()
+        .expect("spawn descendant helper");
+    fs::write(
+        std::env::var_os("STREAM_SERVER_TEST_DESCENDANT_MARKER")
+            .expect("descendant marker environment"),
+        child.id().to_string(),
+    )
+    .expect("write descendant pid");
+    std::thread::sleep(Duration::from_secs(60));
+    let _ = child.wait();
 }
 
 fn inert_spec() -> ProcessSpec {
@@ -77,6 +151,10 @@ async fn every_injected_native_spawn_failure_releases_all_resources_and_registry
 
 #[tokio::test]
 async fn update_attribute_failure_creates_no_child_and_releases_initialized_storage() {
+    ProcessSupervisor::new(CancellationToken::new())
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm owner and blocking spawn resources");
     let supervisor = ProcessSupervisor::with_failure_point(
         CancellationToken::new(),
         FailurePoint::AttributeListUpdate,
@@ -122,8 +200,125 @@ async fn every_post_create_injected_failure_waits_until_the_actual_pid_is_dead()
 }
 
 #[tokio::test]
+async fn post_resume_failure_drains_descendant_job_before_return() {
+    ProcessSupervisor::new(CancellationToken::new())
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm owner and blocking cleanup resources");
+    let marker_directory = tempfile::tempdir().expect("descendant marker directory");
+    let marker = marker_directory.path().join("child.pid");
+    let supervisor = ProcessSupervisor::with_failure_point(
+        CancellationToken::new(),
+        FailurePoint::ResumeAfterDescendant,
+    );
+    let resources_before = super::windows::resource_snapshot();
+    let handles_before = super::windows::process_handle_count();
+    let mut request = inert_spec();
+    request.args = vec![
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from("transcoding::process::tests::post_resume_descendant_helper"),
+    ];
+    request.environment.insert(
+        OsString::from("STREAM_SERVER_TEST_DESCENDANT_MARKER"),
+        marker.as_os_str().to_os_string(),
+    );
+
+    let error = supervisor
+        .run_bounded(request)
+        .await
+        .expect_err("post-resume injection must fail");
+    let parent_pid = super::windows::last_created_pid();
+    let child_pid = fs::read_to_string(&marker)
+        .expect("read descendant pid")
+        .parse::<u32>()
+        .expect("parse descendant pid");
+
+    assert_eq!(error.code(), ProcessErrorCode::SpawnFailed);
+    assert!(!super::windows::process_is_alive(parent_pid));
+    assert!(!super::windows::process_is_alive(child_pid));
+    assert_eq!(supervisor.active_processes(), 0);
+    assert_eq!(super::windows::resource_snapshot(), resources_before);
+    assert_eq!(super::windows::process_handle_count(), handles_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned() {
+    ProcessSupervisor::new(CancellationToken::new())
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm owner and blocking cleanup resources");
+    let marker_directory = tempfile::tempdir().expect("handoff marker directory");
+    let marker = marker_directory.path().join("child.pid");
+    let supervisor = std::sync::Arc::new(ProcessSupervisor::with_failure_point(
+        CancellationToken::new(),
+        FailurePoint::PauseAfterResume,
+    ));
+    let resources_before = super::windows::resource_snapshot();
+    let handles_before = super::windows::process_handle_count();
+    let mut request = inert_spec();
+    request.args = vec![
+        OsString::from("--ignored"),
+        OsString::from("--exact"),
+        OsString::from("transcoding::process::tests::post_resume_descendant_helper"),
+    ];
+    request.environment.insert(
+        OsString::from("STREAM_SERVER_TEST_DESCENDANT_MARKER"),
+        marker.as_os_str().to_os_string(),
+    );
+    super::windows::set_pause_after_resume(true);
+    let running = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.run_bounded(request).await }
+    });
+    while !super::windows::pause_after_resume_reached() {
+        tokio::task::yield_now().await;
+    }
+    while !marker.is_file() {
+        tokio::task::yield_now().await;
+    }
+    let parent_pid = super::windows::last_created_pid();
+    let child_pid = fs::read_to_string(&marker)
+        .expect("read descendant pid")
+        .parse::<u32>()
+        .expect("parse descendant pid");
+
+    running.abort();
+    assert_eq!(supervisor.active_processes(), 1);
+    assert_eq!(
+        supervisor.inner.permits.available_permits(),
+        super::DEFAULT_MAX_CONCURRENT_PROCESSES - 1
+    );
+    super::windows::set_pause_after_resume(false);
+    assert!(
+        running
+            .await
+            .expect_err("outer run future must abort")
+            .is_cancelled()
+    );
+    supervisor
+        .wait_for_idle(Duration::from_secs(8))
+        .await
+        .expect("blocking-worker handoff cleanup must drain");
+
+    assert!(!super::windows::process_is_alive(parent_pid));
+    assert!(!super::windows::process_is_alive(child_pid));
+    assert_eq!(supervisor.active_processes(), 0);
+    assert_eq!(
+        supervisor.inner.permits.available_permits(),
+        super::DEFAULT_MAX_CONCURRENT_PROCESSES
+    );
+    assert_eq!(super::windows::resource_snapshot(), resources_before);
+    assert_eq!(super::windows::process_handle_count(), handles_before);
+}
+
+#[tokio::test]
 async fn retained_registry_entry_can_be_retried_until_confirmed_drained() {
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    supervisor
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm owner and blocking cleanup resources");
     let resources_before = super::windows::resource_snapshot();
     let handles_before = super::windows::process_handle_count();
     let mut request = inert_spec();
@@ -153,7 +348,6 @@ async fn retained_registry_entry_can_be_retried_until_confirmed_drained() {
     assert_eq!(error.code(), ProcessErrorCode::WaitFailed);
     assert_eq!(error.to_string(), "process wait failed");
     assert_eq!(supervisor.active_processes(), 1);
-    assert!(super::windows::process_is_alive(pid));
 
     supervisor
         .force_terminate_registered()
