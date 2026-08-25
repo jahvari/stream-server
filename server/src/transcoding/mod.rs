@@ -1,5 +1,6 @@
 pub mod error;
 pub mod model;
+pub mod runtime_manifest;
 
 pub use error::{FailureCode, TranscodeFailure};
 pub use model::{

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "entries": [{
+    "platform": "windows",
+    "arch": "x86_64",
+    "ffmpegVersion": "7.1.4",
+    "jellyfinRevision": "3",
+    "url": "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.4-3/jellyfin-ffmpeg_7.1.4-3_portable_win64-clang-gpl.zip",
+    "sha256": "113adeb702683c38be40a65d859f8ef7ffb07bae9df16dfb6c3df5ac3d95ef3c",
+    "maxBytes": 60257737,
+    "requiredPaths": ["ffmpeg.exe", "ffprobe.exe"],
+    "versionMatchers": { "ffmpeg": "-Jellyfin", "ffprobe": "-Jellyfin" },
+    "licenseUrl": "https://github.com/jellyfin/jellyfin-ffmpeg/blob/v7.1.4-3/LICENSE",
+    "sourceUrl": "https://github.com/jellyfin/jellyfin-ffmpeg/tree/v7.1.4-3",
+    "sourceTag": "v7.1.4-3",
+    "minimumPlatform": {
+      "windows": {
+        "minimumOperatingSystemVersion": { "major": 6, "minor": 0 },
+        "minimumSubsystemVersion": { "major": 6, "minor": 0 }
+      }
+    }
+  }]
+}
