@@ -56,7 +56,7 @@ mod tui;
 mod updater;
 pub mod ytdlp;
 
-pub use ffmpeg_setup::MissingFfmpegError;
+pub use ffmpeg_setup::{MissingFfmpegError, setup_ffmpeg_with_config};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {

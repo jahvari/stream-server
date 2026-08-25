@@ -1,17 +1,17 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsString,
     fmt,
     path::PathBuf,
     process::ExitStatus,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
@@ -20,6 +20,7 @@ mod windows;
 const DEFAULT_MAX_CONCURRENT_PROCESSES: usize = 8;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WALL_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+const CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +57,7 @@ pub struct BoundedOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessErrorCode {
     InvalidSpec,
+    UnsupportedPolicy,
     SpawnFailed,
     Cancelled,
     DeadlineExceeded,
@@ -83,6 +85,7 @@ impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self.code {
             ProcessErrorCode::InvalidSpec => "invalid process specification",
+            ProcessErrorCode::UnsupportedPolicy => "process policy is not supported",
             ProcessErrorCode::SpawnFailed => "process could not be started",
             ProcessErrorCode::Cancelled => "process cancelled",
             ProcessErrorCode::DeadlineExceeded => "process deadline exceeded",
@@ -103,9 +106,212 @@ pub struct ProcessSupervisor {
 struct SupervisorInner {
     cancellation: CancellationToken,
     permits: Semaphore,
-    active: Arc<AtomicUsize>,
+    accepting: AtomicBool,
+    admission_gate: Mutex<()>,
+    registry: Arc<ProcessRegistry>,
     #[cfg(all(test, windows))]
     failure_point: Option<FailurePoint>,
+}
+
+struct ProcessRegistry {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, RegisteredEntry>>,
+    idle: Notify,
+}
+
+struct RegisteredEntry {
+    target: RegisteredTarget,
+    retained: bool,
+    #[cfg(windows)]
+    cleanup_tasks: Vec<tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>>,
+}
+
+#[derive(Clone)]
+enum RegisteredTarget {
+    #[cfg(windows)]
+    WindowsProcessTree {
+        job: Arc<windows::TrackedHandle>,
+        process: Arc<windows::TrackedHandle>,
+    },
+    #[cfg(unix)]
+    UnixProcessGroup(i32),
+}
+
+pub(super) struct Registration {
+    registry: Arc<ProcessRegistry>,
+    id: u64,
+}
+
+impl ProcessRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            entries: Mutex::new(HashMap::new()),
+            idle: Notify::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[cfg(windows)]
+    fn register_windows(
+        self: &Arc<Self>,
+        job: Arc<windows::TrackedHandle>,
+        process: Arc<windows::TrackedHandle>,
+    ) -> Registration {
+        self.register(RegisteredTarget::WindowsProcessTree { job, process })
+    }
+
+    #[cfg(unix)]
+    fn register_unix(self: &Arc<Self>, process_group: i32) -> Registration {
+        self.register(RegisteredTarget::UnixProcessGroup(process_group))
+    }
+
+    fn register(self: &Arc<Self>, target: RegisteredTarget) -> Registration {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                id,
+                RegisteredEntry {
+                    target,
+                    retained: false,
+                    #[cfg(windows)]
+                    cleanup_tasks: Vec::new(),
+                },
+            );
+        Registration {
+            registry: self.clone(),
+            id,
+        }
+    }
+
+    fn force_terminate_all(&self) -> Result<(), ProcessError> {
+        let targets = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>();
+        let mut failed = false;
+        for target in targets {
+            let result = match target {
+                #[cfg(windows)]
+                RegisteredTarget::WindowsProcessTree { job, .. } => windows::terminate(&job),
+                #[cfg(unix)]
+                RegisteredTarget::UnixProcessGroup(process_group) => {
+                    terminate_unix_group(process_group)
+                }
+            };
+            failed |= result.is_err();
+        }
+        if failed {
+            Err(ProcessError::new(ProcessErrorCode::WaitFailed))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reap_retained(&self) -> Result<(), ProcessError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut failed = false;
+        entries.retain(|_, entry| {
+            if !entry.retained {
+                return true;
+            }
+            #[cfg(windows)]
+            let cleanup_finished = entry.cleanup_tasks.iter().all(|task| task.is_finished());
+            #[cfg(not(windows))]
+            let cleanup_finished = true;
+            let drained = match &entry.target {
+                #[cfg(windows)]
+                RegisteredTarget::WindowsProcessTree { job, process } => {
+                    windows::is_process_tree_drained(job, process)
+                }
+                #[cfg(unix)]
+                RegisteredTarget::UnixProcessGroup(process_group) => {
+                    unix_group_is_empty(*process_group)
+                }
+            };
+            match drained {
+                Ok(drained) => !(drained && cleanup_finished),
+                Err(_) => {
+                    failed = true;
+                    true
+                }
+            }
+        });
+        let idle = entries.is_empty();
+        drop(entries);
+        if idle {
+            self.idle.notify_waiters();
+        }
+        if failed {
+            Err(ProcessError::new(ProcessErrorCode::WaitFailed))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let became_idle = entries.remove(&self.id).is_some() && entries.is_empty();
+        drop(entries);
+        if became_idle {
+            self.registry.idle.notify_waiters();
+        }
+    }
+}
+
+impl Registration {
+    #[cfg(any(unix, test))]
+    fn retain(self) {
+        if let Some(entry) = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&self.id)
+        {
+            entry.retained = true;
+        }
+        std::mem::forget(self);
+    }
+
+    #[cfg(windows)]
+    fn retain_with_windows_readers(
+        self,
+        stdout: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+        stderr: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+    ) {
+        if let Some(entry) = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&self.id)
+        {
+            entry.retained = true;
+            entry.cleanup_tasks.extend([stdout, stderr]);
+        }
+        std::mem::forget(self);
+    }
 }
 
 impl ProcessSupervisor {
@@ -118,7 +324,9 @@ impl ProcessSupervisor {
             inner: Arc::new(SupervisorInner {
                 cancellation,
                 permits: Semaphore::new(maximum.max(1)),
-                active: Arc::new(AtomicUsize::new(0)),
+                accepting: AtomicBool::new(true),
+                admission_gate: Mutex::new(()),
+                registry: Arc::new(ProcessRegistry::new()),
                 #[cfg(all(test, windows))]
                 failure_point: None,
             }),
@@ -130,15 +338,70 @@ impl ProcessSupervisor {
     }
 
     pub fn active_processes(&self) -> usize {
-        self.inner.active.load(Ordering::Acquire)
+        self.inner.registry.len()
+    }
+
+    pub fn cancel(&self) {
+        let _gate = self
+            .inner
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.inner.accepting.store(false, Ordering::Release);
+        self.inner.cancellation.cancel();
+    }
+
+    pub fn force_terminate_registered(&self) -> Result<(), ProcessError> {
+        self.inner.registry.force_terminate_all()
+    }
+
+    pub async fn wait_for_idle(&self, deadline: Duration) -> Result<(), ProcessError> {
+        let expires = tokio::time::Instant::now() + deadline;
+        loop {
+            let notified = self.inner.registry.idle.notified();
+            self.inner.registry.reap_retained()?;
+            if self.active_processes() == 0 {
+                return Ok(());
+            }
+            let tick = tokio::time::sleep(Duration::from_millis(5));
+            tokio::pin!(tick);
+            if tokio::time::timeout_at(expires, async {
+                tokio::select! {
+                    _ = notified => {},
+                    _ = &mut tick => {},
+                }
+            })
+            .await
+            .is_err()
+            {
+                self.inner.registry.reap_retained()?;
+                return if self.active_processes() == 0 {
+                    Ok(())
+                } else {
+                    Err(ProcessError::new(ProcessErrorCode::WaitFailed))
+                };
+            }
+        }
     }
 
     pub async fn run_bounded(&self, spec: ProcessSpec) -> Result<BoundedOutput, ProcessError> {
         validate_common_spec(&spec)?;
+        if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
+            self.cancel();
+            return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+        }
         let permit = tokio::select! {
+            biased;
+            _ = self.inner.cancellation.cancelled() => {
+                self.cancel();
+                return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+            },
             permit = self.inner.permits.acquire() => permit.map_err(|_| ProcessError::new(ProcessErrorCode::Cancelled))?,
-            _ = self.inner.cancellation.cancelled() => return Err(ProcessError::new(ProcessErrorCode::Cancelled)),
         };
+        if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
+            self.cancel();
+            return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+        }
 
         #[cfg(windows)]
         let result = self.run_windows(spec).await;
@@ -157,7 +420,9 @@ impl ProcessSupervisor {
             inner: Arc::new(SupervisorInner {
                 cancellation,
                 permits: Semaphore::new(DEFAULT_MAX_CONCURRENT_PROCESSES),
-                active: Arc::new(AtomicUsize::new(0)),
+                accepting: AtomicBool::new(true),
+                admission_gate: Mutex::new(()),
+                registry: Arc::new(ProcessRegistry::new()),
                 failure_point: Some(point),
             }),
         }
@@ -177,7 +442,19 @@ impl ProcessSupervisor {
                 None
             }
         };
-        let spawned = windows::spawn(&spec, self.inner.active.clone(), failure_point)?;
+        let spawned = {
+            let _gate = self
+                .inner
+                .admission_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.inner.cancellation.is_cancelled()
+                || !self.inner.accepting.load(Ordering::Acquire)
+            {
+                return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+            }
+            windows::spawn(&spec, self.inner.registry.clone(), failure_point)?
+        };
         let windows::SpawnedProcess {
             process,
             job,
@@ -208,75 +485,120 @@ impl ProcessSupervisor {
             limit_tx,
         );
 
-        let wait_process = process.clone();
-        let mut wait_task =
-            tokio::task::spawn_blocking(move || (windows::wait(&wait_process), registration));
+        #[cfg(test)]
+        if failure_point == Some(FailurePoint::WaitAfterReaders) {
+            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+
+        let mut wait_process = Box::pin(wait_windows_process(process.clone()));
         let deadline = tokio::time::sleep(spec.wall_deadline);
         tokio::pin!(deadline);
 
         enum Completion {
-            Exited(Result<u32, ProcessError>, windows::Registration),
+            Exited(Result<u32, ProcessError>),
             Stop(ProcessErrorCode),
         }
         let completion = tokio::select! {
-            wait = &mut wait_task => {
-                let (result, registration) = wait
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                Completion::Exited(result, registration)
-            },
+            wait = &mut wait_process => Completion::Exited(wait),
             _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
             _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
             limit = limit_rx.recv() => match limit {
                 Some(code) => Completion::Stop(code),
-                None => {
-                    let (result, registration) = (&mut wait_task)
-                        .await
-                        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                    Completion::Exited(result, registration)
-                },
+                None => Completion::Exited((&mut wait_process).await),
             },
         };
 
-        let (exit_code, registration, terminal_error) = match completion {
-            Completion::Exited(result, registration) => (result?, registration, None),
+        let (exit_code, terminal_error) = match completion {
+            Completion::Exited(result) => match result {
+                Ok(exit_code) => (exit_code, None),
+                Err(_) => {
+                    registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                }
+            },
+            Completion::Stop(ProcessErrorCode::Cancelled) => {
+                match tokio::time::timeout(CANCELLATION_GRACE, &mut wait_process).await {
+                    Ok(Ok(waited)) => {
+                        (waited, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
+                    }
+                    Ok(Err(_)) => {
+                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                    Err(_) => {
+                        if windows::terminate(&job).is_err() {
+                            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                        }
+                        let waited =
+                            match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_process).await {
+                                Ok(Ok(waited)) => waited,
+                                Ok(Err(_)) => {
+                                    registration
+                                        .retain_with_windows_readers(stdout_reader, stderr_reader);
+                                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                                }
+                                Err(_) => {
+                                    registration
+                                        .retain_with_windows_readers(stdout_reader, stderr_reader);
+                                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                                }
+                            };
+                        (waited, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
+                    }
+                }
+            }
             Completion::Stop(code) => {
-                windows::terminate(&job);
-                let (waited, registration) = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_task)
-                    .await
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                (waited?, registration, Some(ProcessError::new(code)))
+                if windows::terminate(&job).is_err() {
+                    registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                }
+                let waited = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_process).await {
+                    Ok(Ok(waited)) => waited,
+                    Ok(Err(_)) => {
+                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                    Err(_) => {
+                        registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                };
+                (waited, Some(ProcessError::new(code)))
             }
         };
 
         let cleanup_job = job.clone();
-        let (cleanup_result, registration) = tokio::time::timeout(
-            CLEANUP_DEADLINE,
-            tokio::task::spawn_blocking(move || {
-                (
-                    windows::terminate_and_wait(&cleanup_job, CLEANUP_DEADLINE),
-                    registration,
-                )
-            }),
-        )
+        let cleanup_result = match tokio::task::spawn_blocking(move || {
+            windows::terminate_and_wait(&cleanup_job, CLEANUP_DEADLINE)
+        })
         .await
-        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-        cleanup_result?;
+        {
+            Ok(result) => result,
+            Err(_) => {
+                registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+            }
+        };
+        if cleanup_result.is_err() {
+            registration.retain_with_windows_readers(stdout_reader, stderr_reader);
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
 
         drop(job);
         drop(process);
 
-        let stdout = tokio::time::timeout(CLEANUP_DEADLINE, stdout_reader)
+        let stdout_result = stdout_reader
             .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))??;
-        let stderr = tokio::time::timeout(CLEANUP_DEADLINE, stderr_reader)
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
+        let stderr_result = stderr_reader
             .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))??;
+            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed));
 
         drop(registration);
+        let stdout = stdout_result??;
+        let stderr = stderr_result??;
         if let Some(error) = terminal_error {
             return Err(error);
         }
@@ -298,7 +620,7 @@ impl ProcessSupervisor {
             StdoutPolicy::Stream { queue_bytes } => Some(queue_bytes),
         };
         let keep_stdout = !matches!(spec.stdout, StdoutPolicy::Null);
-        let mut command = std::process::Command::new(&spec.executable);
+        let mut command = tokio::process::Command::new(&spec.executable);
         command
             .args(&spec.args)
             .current_dir(&spec.current_dir)
@@ -307,103 +629,163 @@ impl ProcessSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|_| ProcessError::new(ProcessErrorCode::SpawnFailed))?;
-        let pid = child.id();
-        let group = UnixProcessGroup(pid);
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut child = {
+            let _gate = self
+                .inner
+                .admission_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.inner.cancellation.is_cancelled()
+                || !self.inner.accepting.load(Ordering::Acquire)
+            {
+                return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+            }
+            command
+                .spawn()
+                .map_err(|_| ProcessError::new(ProcessErrorCode::SpawnFailed))?
+        };
+        let pid = child
+            .id()
+            .ok_or_else(|| ProcessError::new(ProcessErrorCode::SpawnFailed))?
+            as i32;
+        let registration = self.inner.registry.register_unix(pid);
         let Some(stdout_pipe) = child.stdout.take() else {
-            group.terminate();
-            let _ = child.wait();
+            cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
         };
         let Some(stderr_pipe) = child.stderr.take() else {
-            group.terminate();
-            let _ = child.wait();
+            cleanup_failed_unix_spawn(&mut child, pid, registration).await?;
             return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
         };
-        let registration = ActiveRegistration::new(self.inner.active.clone());
         let (limit_tx, mut limit_rx) = tokio::sync::mpsc::unbounded_channel();
-        let stdout_reader = tokio::task::spawn_blocking({
+        let mut stdout_reader = tokio::spawn({
             let limit_tx = limit_tx.clone();
-            move || {
-                read_sync_pipe(
+            async move {
+                read_async_pipe(
                     stdout_pipe,
                     stdout_limit,
                     keep_stdout,
                     ProcessErrorCode::StdoutLimitExceeded,
                     limit_tx,
                 )
+                .await
             }
         });
-        let stderr_reader = tokio::task::spawn_blocking(move || {
-            read_sync_pipe(
+        let mut stderr_reader = tokio::spawn(async move {
+            read_async_pipe(
                 stderr_pipe,
                 Some(spec.stderr_byte_limit),
                 true,
                 ProcessErrorCode::StderrLimitExceeded,
                 limit_tx,
             )
+            .await
         });
-        let mut wait_task = tokio::task::spawn_blocking(move || (child.wait(), registration));
+        let mut wait_child = Box::pin(child.wait());
         let deadline = tokio::time::sleep(spec.wall_deadline);
         tokio::pin!(deadline);
         enum Completion {
-            Exited(
-                Result<std::process::ExitStatus, std::io::Error>,
-                ActiveRegistration,
-            ),
+            Exited(Result<std::process::ExitStatus, std::io::Error>),
             Stop(ProcessErrorCode),
         }
         let completion = tokio::select! {
-            result = &mut wait_task => {
-                let (result, registration) = result
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                Completion::Exited(result, registration)
-            },
+            result = &mut wait_child => Completion::Exited(result),
             _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
             _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
             limit = limit_rx.recv() => match limit {
                 Some(code) => Completion::Stop(code),
-                None => {
-                    let (result, registration) = (&mut wait_task)
-                        .await
-                        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                    Completion::Exited(result, registration)
-                },
+                None => Completion::Exited((&mut wait_child).await),
             },
         };
-        let (status, registration, terminal_error) = match completion {
-            Completion::Exited(result, registration) => {
-                group.terminate();
-                (
-                    result.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
-                    registration,
-                    None,
-                )
+        let (status, terminal_error) = match completion {
+            Completion::Exited(result) => match result {
+                Ok(status) => (status, None),
+                Err(_) => {
+                    abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                    registration.retain();
+                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                }
+            },
+            Completion::Stop(ProcessErrorCode::Cancelled) => {
+                match tokio::time::timeout(CANCELLATION_GRACE, &mut wait_child).await {
+                    Ok(Ok(status)) => {
+                        (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
+                    }
+                    Ok(Err(_)) => {
+                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                        registration.retain();
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                    Err(_) => {
+                        if terminate_unix_group(pid).is_err() {
+                            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                            registration.retain();
+                            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                        }
+                        let status = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child)
+                            .await
+                        {
+                            Ok(Ok(status)) => status,
+                            Ok(Err(_)) => {
+                                abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                                registration.retain();
+                                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                            }
+                            Err(_) => {
+                                abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                                registration.retain();
+                                return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                            }
+                        };
+                        (status, Some(ProcessError::new(ProcessErrorCode::Cancelled)))
+                    }
+                }
             }
             Completion::Stop(code) => {
-                group.terminate();
-                let (status, registration) = tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_task)
-                    .await
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-                    .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-                (
-                    status.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
-                    registration,
-                    Some(ProcessError::new(code)),
-                )
+                if terminate_unix_group(pid).is_err() {
+                    abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                    registration.retain();
+                    return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                }
+                let status = match tokio::time::timeout(CLEANUP_DEADLINE, &mut wait_child).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(_)) => {
+                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                        registration.retain();
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                    Err(_) => {
+                        abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+                        registration.retain();
+                        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+                    }
+                };
+                (status, Some(ProcessError::new(code)))
             }
         };
-        let stdout = tokio::time::timeout(CLEANUP_DEADLINE, stdout_reader)
-            .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))??;
-        let stderr = tokio::time::timeout(CLEANUP_DEADLINE, stderr_reader)
-            .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))??;
+
+        if terminate_unix_group(pid).is_err()
+            || wait_for_unix_group_drain(pid, CLEANUP_DEADLINE)
+                .await
+                .is_err()
+        {
+            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
+            registration.retain();
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+
+        let stdout = match await_unix_reader(&mut stdout_reader).await {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                stderr_reader.abort();
+                let _ = stderr_reader.await;
+                drop(registration);
+                return Err(error);
+            }
+        };
+        let stderr = await_unix_reader(&mut stderr_reader).await?;
         drop(registration);
         if let Some(error) = terminal_error {
             return Err(error);
@@ -416,47 +798,108 @@ impl ProcessSupervisor {
     }
 }
 
-#[cfg(unix)]
-struct UnixProcessGroup(u32);
+#[cfg(windows)]
+async fn wait_windows_process(process: Arc<windows::TrackedHandle>) -> Result<u32, ProcessError> {
+    loop {
+        if let Some(exit_code) = windows::poll_exit(&process)? {
+            return Ok(exit_code);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 #[cfg(unix)]
-impl UnixProcessGroup {
-    fn terminate(&self) {
-        unsafe {
-            let _ = libc::kill(-(self.0 as i32), libc::SIGKILL);
+fn terminate_unix_group(process_group: i32) -> Result<(), ProcessError> {
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(ProcessError::new(ProcessErrorCode::WaitFailed))
+    }
+}
+
+#[cfg(unix)]
+fn unix_group_is_empty(process_group: i32) -> Result<bool, ProcessError> {
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        Ok(false)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(ProcessError::new(ProcessErrorCode::WaitFailed))
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_unix_group_drain(
+    process_group: i32,
+    deadline: Duration,
+) -> Result<(), ProcessError> {
+    let expires = tokio::time::Instant::now() + deadline;
+    while !unix_group_is_empty(process_group)? {
+        if tokio::time::Instant::now() >= expires {
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn cleanup_failed_unix_spawn(
+    child: &mut tokio::process::Child,
+    process_group: i32,
+    registration: Registration,
+) -> Result<(), ProcessError> {
+    if terminate_unix_group(process_group).is_err() {
+        registration.retain();
+        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+    }
+    match tokio::time::timeout(CLEANUP_DEADLINE, child.wait()).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            registration.retain();
+            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        }
+    }
+    if wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE)
+        .await
+        .is_err()
+    {
+        registration.retain();
+        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+    }
+    drop(registration);
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn abort_unix_readers(
+    stdout: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+    stderr: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+) {
+    stdout.abort();
+    stderr.abort();
+    let _ = stdout.await;
+    let _ = stderr.await;
+}
+
+#[cfg(unix)]
+async fn await_unix_reader(
+    reader: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
+) -> Result<Vec<u8>, ProcessError> {
+    match tokio::time::timeout(CLEANUP_DEADLINE, &mut *reader).await {
+        Ok(result) => result.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            Err(ProcessError::new(ProcessErrorCode::WaitFailed))
         }
     }
 }
 
 #[cfg(unix)]
-impl Drop for UnixProcessGroup {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-#[cfg(unix)]
-struct ActiveRegistration {
-    active: Arc<AtomicUsize>,
-}
-
-#[cfg(unix)]
-impl ActiveRegistration {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::AcqRel);
-        Self { active }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ActiveRegistration {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(unix)]
-fn read_sync_pipe<R>(
+async fn read_async_pipe<R>(
     mut pipe: R,
     limit: Option<usize>,
     keep: bool,
@@ -464,8 +907,10 @@ fn read_sync_pipe<R>(
     limit_tx: tokio::sync::mpsc::UnboundedSender<ProcessErrorCode>,
 ) -> Result<Vec<u8>, ProcessError>
 where
-    R: std::io::Read,
+    R: tokio::io::AsyncRead + Unpin,
 {
+    use tokio::io::AsyncReadExt;
+
     let mut output = Vec::with_capacity(limit.unwrap_or(0).min(8_192));
     let mut buffer = [0_u8; 8_192];
     let mut total = 0_usize;
@@ -473,6 +918,7 @@ where
     loop {
         let count = pipe
             .read(&mut buffer)
+            .await
             .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
         if count == 0 {
             break;
@@ -502,7 +948,9 @@ fn validate_common_spec(spec: &ProcessSpec) -> Result<(), ProcessError> {
     let valid_stdout = match spec.stdout {
         StdoutPolicy::Null => true,
         StdoutPolicy::Capture { byte_limit } => (1..=MAX_CAPTURE_BYTES).contains(&byte_limit),
-        StdoutPolicy::Stream { queue_bytes } => (1..=MAX_CAPTURE_BYTES).contains(&queue_bytes),
+        StdoutPolicy::Stream { .. } => {
+            return Err(ProcessError::new(ProcessErrorCode::UnsupportedPolicy));
+        }
     };
     if !spec.executable.is_absolute()
         || !spec.executable.is_file()
@@ -523,11 +971,13 @@ fn validate_common_spec(spec: &ProcessSpec) -> Result<(), ProcessError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FailurePoint {
     PipeSetup,
+    AttributeListUpdate,
     AttributeListSetup,
     SuspendedCreate,
     JobAssignment,
     RegistryInsertion,
     Resume,
+    WaitAfterReaders,
 }
 
 #[cfg(windows)]

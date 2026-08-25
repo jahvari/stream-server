@@ -37,6 +37,15 @@ pub async fn setup_ffmpeg(
     supervisor: Arc<ProcessSupervisor>,
 ) -> Result<Arc<TranscodingService>> {
     let config = RuntimeConfig::for_server(config_dir);
+    setup_ffmpeg_with_config(config, supervisor).await
+}
+
+/// Compatibility adapter for callers that already own resolution policy.
+/// It resolves one adjacent pair and does not alter process-global search state.
+pub async fn setup_ffmpeg_with_config(
+    config: RuntimeConfig,
+    supervisor: Arc<ProcessSupervisor>,
+) -> Result<Arc<TranscodingService>> {
     let runtime = resolve_runtime(&config, &supervisor)
         .await
         .map_err(|_| MissingFfmpegError::unavailable())?;

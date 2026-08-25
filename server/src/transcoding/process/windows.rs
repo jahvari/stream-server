@@ -1,4 +1,6 @@
-use super::{NativeFailurePoint, ProcessError, ProcessErrorCode, ProcessSpec};
+use super::{
+    NativeFailurePoint, ProcessError, ProcessErrorCode, ProcessRegistry, ProcessSpec, Registration,
+};
 use std::{
     cmp::Ordering,
     ffi::{OsStr, OsString},
@@ -18,7 +20,7 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
-            WAIT_OBJECT_0,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal},
         Security::SECURITY_ATTRIBUTES,
@@ -33,7 +35,7 @@ use windows::{
             Threading::{
                 CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
                 DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-                INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
                 STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
                 WaitForSingleObject,
@@ -43,17 +45,23 @@ use windows::{
     core::{BOOL, PCWSTR, PWSTR},
 };
 
+#[cfg(test)]
+use windows::Win32::System::Threading::GetProcessId;
+
 const WINDOWS_STRING_LIMIT: usize = 32_767;
 const FORCED_EXIT_CODE: u32 = 0xC000_013A;
 const FAILURE_AFTER_PIPE_SETUP: u8 = 0;
-const FAILURE_AFTER_ATTRIBUTE_LIST_SETUP: u8 = 1;
-const FAILURE_AFTER_SUSPENDED_CREATE: u8 = 2;
-const FAILURE_AFTER_JOB_ASSIGNMENT: u8 = 3;
-const FAILURE_AFTER_REGISTRY_INSERTION: u8 = 4;
-const FAILURE_AFTER_RESUME: u8 = 5;
+const FAILURE_DURING_ATTRIBUTE_LIST_UPDATE: u8 = 1;
+const FAILURE_AFTER_ATTRIBUTE_LIST_SETUP: u8 = 2;
+const FAILURE_AFTER_SUSPENDED_CREATE: u8 = 3;
+const FAILURE_AFTER_JOB_ASSIGNMENT: u8 = 4;
+const FAILURE_AFTER_REGISTRY_INSERTION: u8 = 5;
+const FAILURE_AFTER_RESUME: u8 = 6;
 
 static TRACKED_HANDLES: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_ATTRIBUTE_LISTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static LAST_CREATED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,29 +91,37 @@ pub(super) fn process_handle_count() -> u32 {
     count
 }
 
+#[cfg(test)]
+pub(super) fn last_created_pid() -> u32 {
+    LAST_CREATED_PID.load(AtomicOrdering::Acquire)
+}
+
+#[cfg(test)]
+pub(super) fn process_is_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    unsafe {
+        let Ok(handle) = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) else {
+            return false;
+        };
+        let result = WaitForSingleObject(handle, 0) == windows::Win32::Foundation::WAIT_TIMEOUT;
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
 pub(super) struct SpawnedProcess {
     pub(super) process: Arc<TrackedHandle>,
     pub(super) job: Arc<TrackedHandle>,
     pub(super) stdout: TrackedHandle,
     pub(super) stderr: TrackedHandle,
     pub(super) registration: Registration,
-}
-
-pub(super) struct Registration {
-    active: Arc<AtomicUsize>,
-}
-
-impl Registration {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, AtomicOrdering::AcqRel);
-        Self { active }
-    }
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, AtomicOrdering::AcqRel);
-    }
 }
 
 pub(super) struct TrackedHandle {
@@ -154,7 +170,7 @@ struct AttributeList {
 }
 
 impl AttributeList {
-    fn new(handles: &[HANDLE]) -> Result<Self, ProcessError> {
+    fn new(handles: &[HANDLE], failure_point: NativeFailurePoint) -> Result<Self, ProcessError> {
         let mut bytes = 0_usize;
         unsafe {
             let _ = InitializeProcThreadAttributeList(None, 1, None, &mut bytes);
@@ -168,8 +184,13 @@ impl AttributeList {
         unsafe {
             InitializeProcThreadAttributeList(Some(pointer), 1, None, &mut bytes)
                 .map_err(|_| spawn_error())?;
+        }
+        TRACKED_ATTRIBUTE_LISTS.fetch_add(1, AtomicOrdering::AcqRel);
+        let list = Self { storage, pointer };
+        inject(failure_point, FAILURE_DURING_ATTRIBUTE_LIST_UPDATE)?;
+        unsafe {
             UpdateProcThreadAttribute(
-                pointer,
+                list.pointer,
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 Some(handles.as_ptr().cast()),
@@ -179,8 +200,7 @@ impl AttributeList {
             )
             .map_err(|_| spawn_error())?;
         }
-        TRACKED_ATTRIBUTE_LISTS.fetch_add(1, AtomicOrdering::AcqRel);
-        Ok(Self { storage, pointer })
+        Ok(list)
     }
 }
 
@@ -224,19 +244,50 @@ impl PipeSet {
 
 struct FailedSpawnCleanup {
     armed: bool,
-    process: Option<TrackedHandle>,
+    process: Option<Arc<TrackedHandle>>,
     thread: Option<TrackedHandle>,
-    job: Option<TrackedHandle>,
+    job: Option<Arc<TrackedHandle>>,
 }
 
 impl FailedSpawnCleanup {
     fn new(process: TrackedHandle, thread: TrackedHandle) -> Self {
         Self {
             armed: true,
-            process: Some(process),
+            process: Some(Arc::new(process)),
             thread: Some(thread),
             job: None,
         }
+    }
+
+    fn terminate_and_wait(&mut self) -> Result<(), ProcessError> {
+        if !self.armed {
+            return Ok(());
+        }
+        let process = self.process.as_ref().ok_or_else(wait_error)?;
+        let before = unsafe { WaitForSingleObject(process.raw(), 0) };
+        if before == WAIT_OBJECT_0 {
+            self.armed = false;
+            return Ok(());
+        }
+        if before != WAIT_TIMEOUT {
+            return Err(wait_error());
+        }
+        let terminated = unsafe {
+            if let Some(job) = &self.job {
+                TerminateJobObject(job.raw(), FORCED_EXIT_CODE)
+            } else {
+                TerminateProcess(process.raw(), FORCED_EXIT_CODE)
+            }
+        };
+        if terminated.is_err() && unsafe { WaitForSingleObject(process.raw(), 0) } != WAIT_OBJECT_0
+        {
+            return Err(wait_error());
+        }
+        if unsafe { WaitForSingleObject(process.raw(), 5_000) } != WAIT_OBJECT_0 {
+            return Err(wait_error());
+        }
+        self.armed = false;
+        Ok(())
     }
 }
 
@@ -245,24 +296,17 @@ impl Drop for FailedSpawnCleanup {
         if !self.armed {
             return;
         }
-        unsafe {
-            if let Some(job) = &self.job {
-                let _ = TerminateJobObject(job.raw(), FORCED_EXIT_CODE);
-            } else if let Some(process) = &self.process {
-                let _ = TerminateProcess(process.raw(), FORCED_EXIT_CODE);
-            }
-            if let Some(process) = &self.process {
-                let _ = WaitForSingleObject(process.raw(), 5_000);
-            }
-        }
+        let _ = self.terminate_and_wait();
     }
 }
 
 pub(super) fn spawn(
     spec: &ProcessSpec,
-    active: Arc<AtomicUsize>,
+    registry: Arc<ProcessRegistry>,
     failure_point: NativeFailurePoint,
 ) -> Result<SpawnedProcess, ProcessError> {
+    #[cfg(test)]
+    LAST_CREATED_PID.store(0, AtomicOrdering::Release);
     let executable = nul_terminated(spec.executable.as_os_str())?;
     let current_dir = nul_terminated(spec.current_dir.as_os_str())?;
     let mut command_line = build_command_line(spec.executable.as_os_str(), &spec.args)?;
@@ -275,7 +319,7 @@ pub(super) fn spawn(
         pipes.stdout_child.raw(),
         pipes.stderr_child.raw(),
     ];
-    let attributes = AttributeList::new(&inheritable)?;
+    let attributes = AttributeList::new(&inheritable, failure_point)?;
     inject(failure_point, FAILURE_AFTER_ATTRIBUTE_LIST_SETUP)?;
 
     let mut startup = STARTUPINFOEXW::default();
@@ -305,40 +349,81 @@ pub(super) fn spawn(
         )
         .map_err(|_| spawn_error())?;
     }
+    #[cfg(test)]
+    LAST_CREATED_PID.store(process_info.dwProcessId, AtomicOrdering::Release);
     let process = TrackedHandle::new(process_info.hProcess)?;
     let thread = TrackedHandle::new(process_info.hThread)?;
     let mut cleanup = FailedSpawnCleanup::new(process, thread);
-    inject(failure_point, FAILURE_AFTER_SUSPENDED_CREATE)?;
+    if inject(failure_point, FAILURE_AFTER_SUSPENDED_CREATE).is_err() {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
 
-    let raw_job = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(|_| spawn_error())? };
-    let job = TrackedHandle::new(raw_job)?;
+    let raw_job = match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
+        Ok(job) => job,
+        Err(_) => {
+            cleanup.terminate_and_wait()?;
+            return Err(spawn_error());
+        }
+    };
+    let job = match TrackedHandle::new(raw_job) {
+        Ok(job) => job,
+        Err(error) => {
+            cleanup.terminate_and_wait()?;
+            return Err(error);
+        }
+    };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    unsafe {
+    if unsafe {
         SetInformationJobObject(
             job.raw(),
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
-        .map_err(|_| spawn_error())?;
+    }
+    .is_err()
+    {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
+    if unsafe {
         AssignProcessToJobObject(
             job.raw(),
             cleanup.process.as_ref().expect("process handle").raw(),
         )
-        .map_err(|_| spawn_error())?;
     }
-    cleanup.job = Some(job);
-    inject(failure_point, FAILURE_AFTER_JOB_ASSIGNMENT)?;
+    .is_err()
+    {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
+    cleanup.job = Some(Arc::new(job));
+    if inject(failure_point, FAILURE_AFTER_JOB_ASSIGNMENT).is_err() {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
 
-    let registration = Registration::new(active);
-    inject(failure_point, FAILURE_AFTER_REGISTRY_INSERTION)?;
+    let job = cleanup.job.as_ref().expect("job handle").clone();
+    let registration = registry.register_windows(
+        job.clone(),
+        cleanup.process.as_ref().expect("process handle").clone(),
+    );
+    if inject(failure_point, FAILURE_AFTER_REGISTRY_INSERTION).is_err() {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
     let resume_result =
         unsafe { ResumeThread(cleanup.thread.as_ref().expect("thread handle").raw()) };
     if resume_result == u32::MAX {
+        cleanup.terminate_and_wait()?;
         return Err(spawn_error());
     }
-    inject(failure_point, FAILURE_AFTER_RESUME)?;
+    if inject(failure_point, FAILURE_AFTER_RESUME).is_err() {
+        cleanup.terminate_and_wait()?;
+        return Err(spawn_error());
+    }
 
     drop(attributes);
     drop(pipes.stdin_child);
@@ -347,8 +432,8 @@ pub(super) fn spawn(
     drop(pipes.stderr_child);
     drop(cleanup.thread.take());
     cleanup.armed = false;
-    let process = Arc::new(cleanup.process.take().expect("process handle"));
-    let job = Arc::new(cleanup.job.take().expect("job handle"));
+    let process = cleanup.process.take().expect("process handle");
+    let job = cleanup.job.take().expect("job handle");
     let stdout = std::mem::replace(
         &mut pipes.stdout_parent,
         TrackedHandle {
@@ -414,22 +499,22 @@ pub(super) fn read_pipe(
     })
 }
 
-pub(super) fn wait(process: &TrackedHandle) -> Result<u32, ProcessError> {
+pub(super) fn poll_exit(process: &TrackedHandle) -> Result<Option<u32>, ProcessError> {
     unsafe {
-        if WaitForSingleObject(process.raw(), INFINITE) != WAIT_OBJECT_0 {
-            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+        match WaitForSingleObject(process.raw(), 0) {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(None),
+            _ => return Err(ProcessError::new(ProcessErrorCode::WaitFailed)),
         }
         let mut exit_code = 0_u32;
         GetExitCodeProcess(process.raw(), &mut exit_code)
             .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-        Ok(exit_code)
+        Ok(Some(exit_code))
     }
 }
 
-pub(super) fn terminate(job: &TrackedHandle) {
-    unsafe {
-        let _ = TerminateJobObject(job.raw(), FORCED_EXIT_CODE);
-    }
+pub(super) fn terminate(job: &TrackedHandle) -> Result<(), ProcessError> {
+    unsafe { TerminateJobObject(job.raw(), FORCED_EXIT_CODE).map_err(|_| spawn_error()) }
 }
 
 pub(super) fn terminate_and_wait(
@@ -454,7 +539,7 @@ pub(super) fn terminate_and_wait(
             return Ok(());
         }
         if !terminated {
-            terminate(job);
+            terminate(job)?;
             terminated = true;
         }
         if std::time::Instant::now() >= expires {
@@ -462,6 +547,32 @@ pub(super) fn terminate_and_wait(
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+pub(super) fn is_process_tree_drained(
+    job: &TrackedHandle,
+    process: &TrackedHandle,
+) -> Result<bool, ProcessError> {
+    if poll_exit(process)?.is_none() {
+        return Ok(false);
+    }
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    unsafe {
+        QueryInformationJobObject(
+            Some(job.raw()),
+            JobObjectBasicAccountingInformation,
+            (&raw mut accounting).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            None,
+        )
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+    }
+    Ok(accounting.ActiveProcesses == 0)
+}
+
+#[cfg(test)]
+pub(super) fn process_id(process: &TrackedHandle) -> u32 {
+    unsafe { GetProcessId(process.raw()) }
 }
 
 fn create_pipe() -> Result<(TrackedHandle, TrackedHandle), ProcessError> {
@@ -612,4 +723,8 @@ fn invalid_spec() -> ProcessError {
 
 fn spawn_error() -> ProcessError {
     ProcessError::new(ProcessErrorCode::SpawnFailed)
+}
+
+fn wait_error() -> ProcessError {
+    ProcessError::new(ProcessErrorCode::WaitFailed)
 }

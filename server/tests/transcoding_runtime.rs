@@ -10,9 +10,11 @@ use stream_server::transcoding::process::{
     ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
 use stream_server::transcoding::runtime::{
-    RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService, resolve_runtime,
-    verify_unchanged,
+    RuntimeCommand, RuntimeConfig, RuntimeExecutable, RuntimeKind, RuntimeStatus,
+    TranscodingService, resolve_runtime,
 };
+#[cfg(unix)]
+use stream_server::transcoding::runtime::{RuntimeCommandError, verify_unchanged};
 use stream_server::transcoding::runtime_manifest::RuntimeError;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -161,6 +163,41 @@ fn isolated_config() -> RuntimeConfig {
     RuntimeConfig::isolated()
 }
 
+#[tokio::test]
+async fn setup_ffmpeg_compatibility_adapter_returns_the_exact_explicit_pair_without_path_mutation()
+{
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let explicit = jellyfin_root(directory.path(), "explicit-adapter");
+    let decoy = jellyfin_root(directory.path(), "path-decoy");
+    let original_path = std::env::var_os("PATH");
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let config = isolated_config()
+        .with_explicit_root(explicit.clone())
+        .with_search_path(Some(std::env::join_paths([decoy]).expect("decoy path")));
+
+    let service = stream_server::setup_ffmpeg_with_config(config, supervisor)
+        .await
+        .expect("compatibility adapter resolves explicit pair");
+    let session = service
+        .runtime_for_session()
+        .await
+        .expect("verified adapter session");
+
+    assert_eq!(
+        fs::canonicalize(session.executable_path(RuntimeExecutable::Ffmpeg))
+            .expect("canonical resolved ffmpeg"),
+        fs::canonicalize(explicit.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)))
+            .expect("canonical ffmpeg")
+    );
+    assert_eq!(
+        fs::canonicalize(session.executable_path(RuntimeExecutable::Ffprobe))
+            .expect("canonical resolved ffprobe"),
+        fs::canonicalize(explicit.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX)))
+            .expect("canonical ffprobe")
+    );
+    assert_eq!(std::env::var_os("PATH"), original_path);
+}
+
 #[test]
 fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutdown()
 -> anyhow::Result<()> {
@@ -207,11 +244,21 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
         .build()?
         .block_on(service.runtime_for_session())?;
     assert_eq!(
-        fs::canonicalize(runtime.ffmpeg.parent().expect("ffmpeg parent"))?,
+        fs::canonicalize(
+            runtime
+                .executable_path(RuntimeExecutable::Ffmpeg)
+                .parent()
+                .expect("ffmpeg parent"),
+        )?,
         expected_root
     );
     assert_eq!(
-        fs::canonicalize(runtime.ffprobe.parent().expect("ffprobe parent"))?,
+        fs::canonicalize(
+            runtime
+                .executable_path(RuntimeExecutable::Ffprobe)
+                .parent()
+                .expect("ffprobe parent"),
+        )?,
         expected_root
     );
     assert_eq!(service.supervisor().active_processes(), 0);
@@ -351,6 +398,161 @@ async fn completed_process_returns_bounded_output_and_is_reaped_before_return() 
         0,
         "completed child returned before reap"
     );
+}
+
+#[tokio::test]
+async fn stream_policy_is_rejected_as_unsupported_before_the_executable_can_start() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let marker = marker_dir.path().join("spawned");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let mut request = spec([OsString::from("--touch"), marker.as_os_str().to_os_string()]);
+    request.stdout = StdoutPolicy::Stream { queue_bytes: 1024 };
+
+    let error = supervisor
+        .run_bounded(request)
+        .await
+        .expect_err("Task 5 bounded commands must reject live streaming");
+
+    assert_eq!(error.code(), ProcessErrorCode::UnsupportedPolicy);
+    assert!(!marker.exists(), "unsupported policy still spawned a child");
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_closes_admission_before_a_queued_process_can_spawn() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let running_marker = marker_dir.path().join("running");
+    let queued_marker = marker_dir.path().join("queued");
+    let supervisor = Arc::new(ProcessSupervisor::with_max_concurrency(
+        CancellationToken::new(),
+        1,
+    ));
+    let running = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--stall-with-marker"),
+            running_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    wait_for_file(&running_marker, Duration::from_secs(2));
+    let queued = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--touch"),
+            queued_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    tokio::task::yield_now().await;
+
+    supervisor.cancel();
+    let running_error = running.await.expect("join running child").unwrap_err();
+    let queued_error = queued.await.expect("join queued child").unwrap_err();
+
+    assert_eq!(running_error.code(), ProcessErrorCode::Cancelled);
+    assert_eq!(queued_error.code(), ProcessErrorCode::Cancelled);
+    assert!(
+        !queued_marker.exists(),
+        "queued child crossed closed admission"
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_registry_can_kill_and_reap_the_registered_process_tree() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let pid_marker = marker_dir.path().join("registered.pid");
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let running = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--stall-with-marker"),
+            pid_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    wait_for_file(&pid_marker, Duration::from_secs(2));
+    let pid = read_pid(&pid_marker);
+    assert_eq!(supervisor.active_processes(), 1);
+
+    supervisor
+        .force_terminate_registered()
+        .expect("registry force termination");
+    let output = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("registered process reap deadline")
+        .expect("join registered process")
+        .expect("forced process is still a confirmed process result");
+
+    assert!(!output.status.success());
+    assert!(
+        !process_is_alive(pid),
+        "registry-owned process survived force"
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_allows_a_process_two_seconds_to_exit_before_force() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let pid_marker = marker_dir.path().join("graceful.pid");
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let running = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--sleep-ms-with-marker"),
+            OsString::from("350"),
+            pid_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    wait_for_file(&pid_marker, Duration::from_secs(2));
+    let started = Instant::now();
+
+    supervisor.cancel();
+    let error = running
+        .await
+        .expect("join gracefully exiting child")
+        .expect_err("cancellation remains the stable terminal surface");
+
+    assert_eq!(error.code(), ProcessErrorCode::Cancelled);
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "cancellation forced the child without its grace period"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_forces_a_stalled_tree_after_two_seconds_then_confirms_reap() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let pid_marker = marker_dir.path().join("forced.pid");
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let running = {
+        let supervisor = supervisor.clone();
+        let request = spec([
+            OsString::from("--stall-with-marker"),
+            pid_marker.as_os_str().to_os_string(),
+        ]);
+        tokio::spawn(async move { supervisor.run_bounded(request).await })
+    };
+    wait_for_file(&pid_marker, Duration::from_secs(2));
+    let pid = read_pid(&pid_marker);
+    let started = Instant::now();
+
+    supervisor.cancel();
+    let error = running
+        .await
+        .expect("join forcibly stopped child")
+        .expect_err("cancelled stalled child must fail");
+
+    assert_eq!(error.code(), ProcessErrorCode::Cancelled);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!process_is_alive(pid), "forced child was not reaped");
+    assert_eq!(supervisor.active_processes(), 0);
 }
 
 #[tokio::test]
@@ -496,17 +698,11 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
         let runtime = resolve_runtime(&config, &supervisor)
             .await
             .expect("resolve ordered runtime");
-        assert!(runtime.ffmpeg.is_absolute());
-        assert!(runtime.ffprobe.is_absolute());
-        assert_eq!(runtime.ffmpeg.parent(), runtime.ffprobe.parent());
+        assert!(runtime.pair_root().is_absolute());
         assert!(
-            runtime
-                .ffmpeg
-                .parent()
-                .expect("runtime root")
-                .ends_with(expected_root),
+            runtime.pair_root().ends_with(expected_root),
             "wrong resolution root: {}",
-            runtime.ffmpeg.display()
+            runtime.pair_root().display()
         );
     }
     assert_eq!(
@@ -517,7 +713,7 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
 }
 
 #[tokio::test]
-async fn resolver_never_pairs_ffmpeg_with_ffprobe_from_another_root() {
+async fn incomplete_explicit_pair_fails_closed_without_using_a_valid_path_pair() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let incomplete = jellyfin_root(directory.path(), "incomplete");
     fs::remove_file(incomplete.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX)))
@@ -529,21 +725,65 @@ async fn resolver_never_pairs_ffmpeg_with_ffprobe_from_another_root() {
         .with_explicit_root(incomplete)
         .with_search_path(Some(search_path));
 
-    let runtime = resolve_runtime(&config, &supervisor)
+    let error = resolve_runtime(&config, &supervisor)
         .await
-        .expect("resolve complete adjacent pair");
+        .expect_err("an incomplete explicit pair must stop fallback");
 
-    assert_eq!(runtime.ffmpeg.parent(), runtime.ffprobe.parent());
-    assert!(runtime.ffmpeg.parent().unwrap().ends_with("complete"));
+    assert!(matches!(error, RuntimeError::Unavailable));
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test]
+async fn explicit_probe_error_fails_closed_without_using_a_valid_managed_pair() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let broken = jellyfin_root(directory.path(), "broken");
+    fs::remove_file(broken.join("ffmpeg.version")).expect("remove probe response");
+    let managed = jellyfin_root(directory.path(), "managed");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let config = isolated_config()
+        .with_explicit_root(broken)
+        .with_managed_current_root(managed);
+
+    let error = resolve_runtime(&config, &supervisor)
+        .await
+        .expect_err("a failed explicit probe must stop fallback");
+
+    assert!(matches!(error, RuntimeError::ProbeFailed));
+}
+
+#[tokio::test]
+async fn incompatible_explicit_pair_fails_closed_without_using_a_valid_managed_pair() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let incompatible = runtime_root(
+        directory.path(),
+        "incompatible",
+        "7.1.4-Jellyfin",
+        "7.1.4",
+        "--enable-gpl",
+    );
+    let managed = jellyfin_root(directory.path(), "managed");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let config = isolated_config()
+        .with_explicit_root(incompatible)
+        .with_managed_current_root(managed);
+
+    let error = resolve_runtime(&config, &supervisor)
+        .await
+        .expect_err("an incompatible explicit pair must stop fallback");
+
+    assert!(matches!(error, RuntimeError::IncompatiblePair));
 }
 
 #[tokio::test(start_paused = true)]
 async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let stalled = jellyfin_root(directory.path(), "stalled");
+    let managed = jellyfin_root(directory.path(), "managed");
     fs::write(stalled.join("stall-version"), b"stall").expect("write stall control");
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
-    let config = isolated_config().with_explicit_root(stalled);
+    let config = isolated_config()
+        .with_explicit_root(stalled)
+        .with_managed_current_root(managed);
     let started = tokio::time::Instant::now();
     let resolving = {
         let supervisor = supervisor.clone();
@@ -560,7 +800,8 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
         .expect_err("stalled version probe must fail");
 
     assert!(matches!(error, RuntimeError::ProbeDeadline));
-    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    assert!(started.elapsed() <= Duration::from_millis(10_100));
     assert_eq!(supervisor.active_processes(), 0);
 }
 
@@ -578,20 +819,72 @@ async fn upstream_runtime_is_degraded_only_when_no_jellyfin_pair_exists() {
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
     let preferred = isolated_config()
         .with_explicit_root(upstream.clone())
-        .with_system_roots(vec![jellyfin]);
+        .with_managed_current_root(jellyfin);
 
     let runtime = resolve_runtime(&preferred, &supervisor)
         .await
         .expect("resolve Jellyfin over upstream fallback");
-    assert_eq!(runtime.kind, RuntimeKind::Jellyfin);
-    assert!(runtime.ffmpeg.parent().unwrap().ends_with("jellyfin"));
-    assert!(runtime.kind.hardware_allowed());
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    assert_eq!(runtime.kind(), RuntimeKind::Jellyfin);
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
+    assert!(runtime.pair_root().ends_with("jellyfin"));
 
     let degraded = resolve_runtime(&isolated_config().with_explicit_root(upstream), &supervisor)
         .await
         .expect("resolve upstream degraded fallback");
-    assert_eq!(degraded.kind, RuntimeKind::SoftwareCompatible);
-    assert!(!degraded.kind.hardware_allowed());
+    assert_eq!(degraded.kind(), RuntimeKind::SoftwareCompatible);
+    assert!(!degraded.kind().hardware_allowed());
+}
+
+#[tokio::test]
+async fn arbitrary_explicit_system_and_path_jellyfin_pairs_are_not_hardware_qualified() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let explicit = jellyfin_root(directory.path(), "explicit-unproven");
+    let system = jellyfin_root(directory.path(), "system-unproven");
+    let path = jellyfin_root(directory.path(), "path-unproven");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    let configs = [
+        isolated_config().with_explicit_root(explicit),
+        isolated_config().with_system_roots(vec![system]),
+        isolated_config().with_search_path(Some(std::env::join_paths([path]).expect("fake path"))),
+    ];
+
+    for config in configs {
+        let runtime = resolve_runtime(&config, &supervisor)
+            .await
+            .expect("resolve unproven Jellyfin pair in software mode");
+        assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
+        assert_eq!(runtime.id().jellyfin_revision, None);
+        assert!(!runtime.kind().hardware_allowed());
+    }
+}
+
+#[tokio::test]
+async fn only_host_specific_app_managed_manifest_provenance_enables_hardware() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let managed = jellyfin_root(directory.path(), "managed-provenance");
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+
+    let runtime = resolve_runtime(
+        &isolated_config().with_managed_current_root(managed),
+        &supervisor,
+    )
+    .await
+    .expect("resolve app-managed pair");
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        assert_eq!(runtime.kind(), RuntimeKind::Jellyfin);
+        assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("3"));
+        assert!(runtime.kind().hardware_allowed());
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
+        assert_eq!(runtime.id().jellyfin_revision, None);
+        assert!(!runtime.kind().hardware_allowed());
+    }
 }
 
 #[tokio::test]
@@ -624,8 +917,8 @@ async fn real_buildconf_banner_and_library_footer_do_not_hide_the_configuration_
         .await
         .expect("real Jellyfin -buildconf layout must resolve");
 
-    assert_eq!(runtime.kind, RuntimeKind::Jellyfin);
-    assert_eq!(runtime.id.build_configuration_digest.len(), 64);
+    assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
+    assert_eq!(runtime.id().build_configuration_digest.len(), 64);
 }
 
 #[tokio::test]
@@ -642,21 +935,24 @@ async fn runtime_identity_binds_files_versions_revision_build_configuration_and_
             .await
             .expect("resolve second runtime");
 
-    assert_eq!(first_runtime.id.ffmpeg_version, "7.1.4");
-    assert_eq!(first_runtime.id.jellyfin_revision.as_deref(), Some("3"));
-    assert_eq!(first_runtime.id.install_digest.len(), 64);
-    assert_eq!(first_runtime.id.build_configuration_digest.len(), 64);
-    assert_eq!(first_runtime.id.pair_root_identity.len(), 64);
+    assert_eq!(first_runtime.id().ffmpeg_version, "7.1.4");
+    assert_eq!(first_runtime.id().jellyfin_revision, None);
+    assert_eq!(first_runtime.id().install_digest.len(), 64);
+    assert_eq!(first_runtime.id().build_configuration_digest.len(), 64);
+    assert_eq!(first_runtime.id().pair_root_identity.len(), 64);
     assert_eq!(
-        first_runtime.id.install_digest, second_runtime.id.install_digest,
+        first_runtime.id().install_digest,
+        second_runtime.id().install_digest,
         "same executable pair bytes must have the same install digest"
     );
     assert_ne!(
-        first_runtime.id.pair_root_identity, second_runtime.id.pair_root_identity,
+        first_runtime.id().pair_root_identity,
+        second_runtime.id().pair_root_identity,
         "distinct install roots must not alias one pair identity"
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn changed_runtime_file_fails_closed_before_a_session_can_use_it() {
     let directory = tempfile::tempdir().expect("runtime candidates");
@@ -665,15 +961,18 @@ async fn changed_runtime_file_fails_closed_before_a_session_can_use_it() {
     let runtime = resolve_runtime(&isolated_config().with_explicit_root(root), &supervisor)
         .await
         .expect("resolve runtime");
-    let original_len = fs::metadata(&runtime.ffmpeg).unwrap().len();
+    let ffmpeg = runtime
+        .pair_root()
+        .join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
+    let original_len = fs::metadata(&ffmpeg).unwrap().len();
     use std::io::Write;
     fs::OpenOptions::new()
         .append(true)
-        .open(&runtime.ffmpeg)
+        .open(&ffmpeg)
         .expect("open runtime for mutation")
         .write_all(b"changed")
         .expect("mutate runtime");
-    assert!(fs::metadata(&runtime.ffmpeg).unwrap().len() > original_len);
+    assert!(fs::metadata(&ffmpeg).unwrap().len() > original_len);
 
     let error = verify_unchanged(&runtime)
         .await
@@ -683,7 +982,7 @@ async fn changed_runtime_file_fails_closed_before_a_session_can_use_it() {
 }
 
 #[tokio::test]
-async fn first_session_re_resolves_changed_files_through_the_same_shared_supervisor() {
+async fn verified_session_keeps_the_pair_leased_and_executes_through_the_shared_supervisor() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let root = jellyfin_root(directory.path(), "service");
     let config = isolated_config().with_explicit_root(root);
@@ -691,24 +990,92 @@ async fn first_session_re_resolves_changed_files_through_the_same_shared_supervi
     let initial = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve initial runtime");
-    let initial_digest = initial.id.install_digest.clone();
+    let initial_digest = initial.id().install_digest.clone();
     let service = TranscodingService::resolved(config, supervisor.clone(), initial);
-    use std::io::Write;
-    fs::OpenOptions::new()
-        .append(true)
-        .open(service.current().await.unwrap().ffmpeg.clone())
-        .expect("open runtime for mutation")
-        .write_all(b"replacement")
-        .expect("mutate runtime");
-
-    let refreshed = service
+    let snapshot = service
+        .current()
+        .await
+        .expect("published identity snapshot");
+    assert_eq!(snapshot.id().install_digest, initial_digest);
+    let session = service
         .runtime_for_session()
         .await
-        .expect("re-resolve changed runtime before session");
+        .expect("verified runtime session");
 
-    assert_ne!(refreshed.id.install_digest, initial_digest);
+    #[cfg(windows)]
+    {
+        let ffmpeg = session.executable_path(RuntimeExecutable::Ffmpeg);
+        let backup = ffmpeg.with_extension("replacement-race-backup");
+        assert!(
+            fs::rename(ffmpeg, &backup).is_err(),
+            "the validated executable was replaceable while its session lease was live"
+        );
+    }
+
+    let marker_dir = tempfile::tempdir().expect("session marker directory");
+    let marker = marker_dir.path().join("spawned");
+    let output = session
+        .run_bounded(
+            RuntimeExecutable::Ffmpeg,
+            RuntimeCommand {
+                args: vec![OsString::from("--touch"), marker.as_os_str().to_os_string()],
+                stdout: StdoutPolicy::Null,
+                stderr_byte_limit: 8_192,
+                wall_deadline: Duration::from_secs(2),
+            },
+        )
+        .await
+        .expect("run through verified session");
+
+    assert!(output.status.success());
+    assert!(marker.is_file());
+    assert_eq!(session.id().install_digest, initial_digest);
     assert!(Arc::ptr_eq(service.supervisor(), &supervisor));
-    assert_eq!(service.status().await, RuntimeStatus::Jellyfin);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn final_spawn_boundary_rejects_a_path_replaced_after_session_validation() {
+    let directory = tempfile::tempdir().expect("runtime candidates");
+    let root = jellyfin_root(directory.path(), "replaceable");
+    let config = isolated_config().with_explicit_root(root);
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let initial = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve initial runtime");
+    let service = TranscodingService::resolved(config, supervisor, initial);
+    let session = service
+        .runtime_for_session()
+        .await
+        .expect("verified runtime session");
+    let ffmpeg = session
+        .executable_path(RuntimeExecutable::Ffmpeg)
+        .to_path_buf();
+    let original = ffmpeg.with_extension("original");
+    fs::rename(&ffmpeg, &original).expect("replace executable path after validation");
+    fs::copy(&fake_process().executable, &ffmpeg).expect("install byte-identical replacement");
+
+    let error = session
+        .run_bounded(
+            RuntimeExecutable::Ffmpeg,
+            RuntimeCommand {
+                args: vec![
+                    OsString::from("--emit"),
+                    OsString::from("0"),
+                    OsString::from("0"),
+                ],
+                stdout: StdoutPolicy::Null,
+                stderr_byte_limit: 8_192,
+                wall_deadline: Duration::from_secs(2),
+            },
+        )
+        .await
+        .expect_err("changed executable path must fail at the final spawn boundary");
+
+    assert!(matches!(
+        error,
+        RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged)
+    ));
 }
 
 #[tokio::test]
@@ -791,6 +1158,9 @@ fn main() {
                 output.write_all(text.as_bytes()).unwrap();
             }
         }
+        Some("--touch") => {
+            fs::write(PathBuf::from(args.get(1).expect("marker path")), b"spawned").unwrap();
+        }
         Some("--spawn-descendant") => {
             let directory = PathBuf::from(args.get(1).expect("marker directory"));
             let child = Command::new(env::current_exe().unwrap())
@@ -816,6 +1186,23 @@ fn main() {
         }
         Some("--descendant-child") => loop { thread::sleep(Duration::from_secs(1)); },
         Some("--stall") => loop { thread::sleep(Duration::from_secs(1)); },
+        Some("--stall-with-marker") => {
+            fs::write(
+                PathBuf::from(args.get(1).expect("marker path")),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            loop { thread::sleep(Duration::from_secs(1)); }
+        }
+        Some("--sleep-ms-with-marker") => {
+            let milliseconds = parse_size(args.get(1));
+            fs::write(
+                PathBuf::from(args.get(2).expect("marker path")),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(milliseconds as u64));
+        }
         _ => std::process::exit(2),
     }
 }

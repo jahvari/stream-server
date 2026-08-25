@@ -1,13 +1,17 @@
 use super::{
-    process::{ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy},
-    runtime_manifest::{RuntimeError, RuntimeManifest},
+    process::{
+        BoundedOutput, ProcessError, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy,
+        StdoutPolicy,
+    },
+    runtime_manifest::{RuntimeError, RuntimeHost, RuntimeManifest},
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fs,
-    io::Read,
+    fmt,
+    fs::{self, File},
+    io::{Read, Seek},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
@@ -16,6 +20,8 @@ use std::{
 const IDENTITY_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const IDENTITY_STDOUT_LIMIT: usize = 128 * 1024;
 const IDENTITY_STDERR_LIMIT: usize = 32 * 1024;
+const SUPPORTED_FFMPEG_VERSION: &str = "7.1.4";
+const SUPPORTED_JELLYFIN_MATCHER: &str = "7.1.4-Jellyfin";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -87,6 +93,120 @@ pub enum RuntimeStatus {
     SoftwareCompatible,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeExecutable {
+    Ffmpeg,
+    Ffprobe,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeCommand {
+    pub args: Vec<OsString>,
+    pub stdout: StdoutPolicy,
+    pub stderr_byte_limit: usize,
+    pub wall_deadline: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeCommandError {
+    Runtime(RuntimeError),
+    Process(ProcessError),
+}
+
+impl fmt::Display for RuntimeCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(error) => error.fmt(formatter),
+            Self::Process(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCommandError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSnapshot {
+    id: RuntimeId,
+    kind: RuntimeKind,
+}
+
+impl RuntimeSnapshot {
+    pub fn id(&self) -> &RuntimeId {
+        &self.id
+    }
+
+    pub fn kind(&self) -> RuntimeKind {
+        self.kind
+    }
+}
+
+pub struct VerifiedRuntimeSession {
+    runtime: Arc<FfmpegRuntime>,
+    supervisor: Arc<ProcessSupervisor>,
+}
+
+impl VerifiedRuntimeSession {
+    pub fn id(&self) -> &RuntimeId {
+        &self.runtime.id
+    }
+
+    pub fn kind(&self) -> RuntimeKind {
+        self.runtime.kind
+    }
+
+    pub fn executable_path(&self, executable: RuntimeExecutable) -> &Path {
+        match executable {
+            RuntimeExecutable::Ffmpeg => &self.runtime.ffmpeg,
+            RuntimeExecutable::Ffprobe => &self.runtime.ffprobe,
+        }
+    }
+
+    pub async fn run_bounded(
+        &self,
+        executable: RuntimeExecutable,
+        command: RuntimeCommand,
+    ) -> Result<BoundedOutput, RuntimeCommandError> {
+        let execution_lease = open_pair_lease(self.runtime.lease.root.clone())
+            .await
+            .map_err(|_| RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged))?;
+        if execution_lease.root != self.runtime.lease.root
+            || execution_lease.ffmpeg != self.runtime.ffmpeg
+            || execution_lease.ffprobe != self.runtime.ffprobe
+            || execution_lease.lease.root_identity != self.runtime.lease.root_identity
+            || execution_lease.lease.ffmpeg.seal != self.runtime.lease.ffmpeg.seal
+            || execution_lease.lease.ffprobe.seal != self.runtime.lease.ffprobe.seal
+        {
+            return Err(RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged));
+        }
+        let executable_path = match executable {
+            RuntimeExecutable::Ffmpeg => {
+                bound_execution_path(&execution_lease.lease.ffmpeg.file, &execution_lease.ffmpeg)
+            }
+            RuntimeExecutable::Ffprobe => bound_execution_path(
+                &execution_lease.lease.ffprobe.file,
+                &execution_lease.ffprobe,
+            ),
+        }
+        .map_err(|_| RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged))?;
+        let current_dir =
+            bound_execution_path(&execution_lease.lease._root_file, &execution_lease.root)
+                .map_err(|_| RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged))?;
+        self.supervisor
+            .run_bounded(ProcessSpec {
+                executable: executable_path,
+                args: command.args,
+                current_dir,
+                environment: BTreeMap::new(),
+                stdin: StdinPolicy::Null,
+                stdout: command.stdout,
+                stderr_byte_limit: command.stderr_byte_limit,
+                wall_deadline: command.wall_deadline,
+            })
+            .await
+            .map_err(RuntimeCommandError::Process)
+    }
+}
+
 impl RuntimeKind {
     pub fn hardware_allowed(self) -> bool {
         matches!(self, Self::Jellyfin)
@@ -129,10 +249,13 @@ impl TranscodingService {
         &self.supervisor
     }
 
-    pub async fn current(&self) -> Option<Arc<FfmpegRuntime>> {
+    pub async fn current(&self) -> Option<RuntimeSnapshot> {
         match &*self.state.read().await {
             ServiceState::Unavailable => None,
-            ServiceState::Resolved { runtime, .. } => Some(runtime.clone()),
+            ServiceState::Resolved { runtime, .. } => Some(RuntimeSnapshot {
+                id: runtime.id.clone(),
+                kind: runtime.kind,
+            }),
         }
     }
 
@@ -146,34 +269,62 @@ impl TranscodingService {
         }
     }
 
-    pub async fn runtime_for_session(&self) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
+    pub async fn runtime_for_session(&self) -> Result<VerifiedRuntimeSession, RuntimeError> {
         let mut state = self.state.write().await;
         let ServiceState::Resolved { config, runtime } = &mut *state else {
             return Err(RuntimeError::Unavailable);
         };
         if verify_unchanged(runtime).await.is_ok() {
-            return Ok(runtime.clone());
+            return Ok(VerifiedRuntimeSession {
+                runtime: runtime.clone(),
+                supervisor: self.supervisor.clone(),
+            });
         }
         let replacement = resolve_runtime(config, &self.supervisor).await?;
         *runtime = replacement.clone();
-        Ok(replacement)
+        Ok(VerifiedRuntimeSession {
+            runtime: replacement,
+            supervisor: self.supervisor.clone(),
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct FfmpegRuntime {
-    pub id: RuntimeId,
-    pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
-    pub kind: RuntimeKind,
+    id: RuntimeId,
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+    kind: RuntimeKind,
     lease: Arc<RuntimeLease>,
+}
+
+impl FfmpegRuntime {
+    pub fn id(&self) -> &RuntimeId {
+        &self.id
+    }
+
+    pub fn kind(&self) -> RuntimeKind {
+        self.kind
+    }
+
+    pub fn pair_root(&self) -> &Path {
+        &self.lease.root
+    }
 }
 
 #[derive(Debug)]
 struct RuntimeLease {
     root: PathBuf,
-    ffmpeg: FileSeal,
-    ffprobe: FileSeal,
+    _root_file: Arc<File>,
+    root_identity: FileIdentity,
+    ffmpeg: FileLease,
+    ffprobe: FileLease,
+}
+
+#[derive(Debug)]
+struct FileLease {
+    file: Arc<File>,
+    seal: FileSeal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,17 +332,30 @@ struct FileSeal {
     length: u64,
     modified: Option<SystemTime>,
     digest: [u8; 32],
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
 }
 
 struct ProbedPair {
     root: PathBuf,
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
-    ffmpeg_seal: FileSeal,
-    ffprobe_seal: FileSeal,
+    lease: RuntimeLease,
     version: String,
     jellyfin: bool,
     build_configuration_digest: String,
+}
+
+struct OpenedPair {
+    root: PathBuf,
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+    lease: RuntimeLease,
 }
 
 enum CandidateFailure {
@@ -202,43 +366,79 @@ enum CandidateFailure {
     Incompatible,
 }
 
+#[derive(Clone, Copy)]
+enum CandidateSource {
+    ManagedManifest,
+    SystemPackage,
+    SearchPath,
+}
+
 pub async fn resolve_runtime(
     config: &RuntimeConfig,
     supervisor: &ProcessSupervisor,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     let manifest = RuntimeManifest::embedded()?;
-    let artifact = manifest
-        .artifacts()
-        .first()
-        .ok_or(RuntimeError::Unavailable)?;
-    let required_version = artifact.ffmpeg_version();
-    let ffmpeg_jellyfin_matcher = artifact.version_matchers().ffmpeg();
-    let ffprobe_jellyfin_matcher = artifact.version_matchers().ffprobe();
-    let revision = artifact.jellyfin_revision();
+    let host_artifact = current_runtime_host().and_then(|host| manifest.artifact_for_host(host));
+    let required_version = host_artifact
+        .map(|artifact| artifact.ffmpeg_version())
+        .unwrap_or(SUPPORTED_FFMPEG_VERSION);
+    let ffmpeg_jellyfin_matcher = host_artifact
+        .map(|artifact| artifact.version_matchers().ffmpeg())
+        .unwrap_or(SUPPORTED_JELLYFIN_MATCHER);
+    let ffprobe_jellyfin_matcher = host_artifact
+        .map(|artifact| artifact.version_matchers().ffprobe())
+        .unwrap_or(SUPPORTED_JELLYFIN_MATCHER);
     let mut candidates = Vec::new();
-    if let Some(root) = &config.explicit_root {
-        if is_remote_or_device_path(root) || !root.is_absolute() {
-            return Err(RuntimeError::UnsafePath);
-        }
-        candidates.push(root.clone());
+    if let Some(root) = &config.explicit_root
+        && (is_remote_or_device_path(root) || !root.is_absolute())
+    {
+        return Err(RuntimeError::UnsafePath);
     }
     if let Some(root) = &config.managed_current_root {
-        candidates.push(root.clone());
+        candidates.push((root.clone(), CandidateSource::ManagedManifest));
     }
-    candidates.extend(config.system_roots.iter().cloned());
+    candidates.extend(
+        config
+            .system_roots
+            .iter()
+            .cloned()
+            .map(|root| (root, CandidateSource::SystemPackage)),
+    );
     if let Some(search_path) = &config.search_path {
         candidates.extend(
             std::env::split_paths(search_path)
-                .filter(|root| root.is_absolute() && !is_remote_or_device_path(root)),
+                .filter(|root| root.is_absolute() && !is_remote_or_device_path(root))
+                .map(|root| (root, CandidateSource::SearchPath)),
         );
     }
 
     let mut seen = Vec::<PathBuf>::new();
     let mut degraded = None;
+    if let Some(root) = &config.explicit_root {
+        let canonical_key = canonical_local_root(root).map_err(candidate_failure_error)?;
+        seen.push(canonical_key);
+        match probe_pair(
+            root,
+            required_version,
+            ffmpeg_jellyfin_matcher,
+            ffprobe_jellyfin_matcher,
+            supervisor,
+        )
+        .await
+        .map_err(candidate_failure_error)?
+        {
+            pair if pair.jellyfin => {
+                return Ok(Arc::new(
+                    pair.into_runtime(RuntimeKind::SoftwareCompatible, None),
+                ));
+            }
+            pair => retain_best_software_candidate(&mut degraded, pair),
+        }
+    }
     let mut saw_deadline = false;
     let mut saw_probe_failure = false;
     let mut saw_incompatible = false;
-    for root in candidates {
+    for (root, source) in candidates {
         let canonical_key = match canonical_local_root(&root) {
             Ok(root) => root,
             Err(CandidateFailure::Missing) => continue,
@@ -260,13 +460,17 @@ pub async fn resolve_runtime(
         )
         .await
         {
-            Ok(pair) if pair.jellyfin => {
-                return Ok(Arc::new(
-                    pair.into_runtime(RuntimeKind::Jellyfin, Some(revision)),
-                ));
+            Ok(pair)
+                if pair.jellyfin
+                    && matches!(source, CandidateSource::ManagedManifest)
+                    && host_artifact.is_some() =>
+            {
+                return Ok(Arc::new(pair.into_runtime(
+                    RuntimeKind::Jellyfin,
+                    host_artifact.map(|artifact| artifact.jellyfin_revision()),
+                )));
             }
-            Ok(pair) if degraded.is_none() => degraded = Some(pair),
-            Ok(_) => {}
+            Ok(pair) => retain_best_software_candidate(&mut degraded, pair),
             Err(CandidateFailure::Deadline) => saw_deadline = true,
             Err(CandidateFailure::Probe) => saw_probe_failure = true,
             Err(CandidateFailure::Incompatible) => saw_incompatible = true,
@@ -292,19 +496,59 @@ pub async fn resolve_runtime(
     }
 }
 
-pub async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
-    let (root, ffmpeg, ffprobe) =
-        validate_pair_paths(&runtime.lease.root).map_err(|_| RuntimeError::RuntimeChanged)?;
-    if root != runtime.lease.root || ffmpeg != runtime.ffmpeg || ffprobe != runtime.ffprobe {
-        return Err(RuntimeError::RuntimeChanged);
+fn retain_best_software_candidate(slot: &mut Option<ProbedPair>, candidate: ProbedPair) {
+    if slot
+        .as_ref()
+        .is_none_or(|selected| candidate.jellyfin && !selected.jellyfin)
+    {
+        *slot = Some(candidate);
     }
-    let ffmpeg_seal = seal_file(ffmpeg)
+}
+
+fn current_runtime_host() -> Option<RuntimeHost> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        Some(RuntimeHost::WindowsX64)
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(RuntimeHost::LinuxX64)
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some(RuntimeHost::MacOsArm64)
+    }
+    #[cfg(not(any(
+        all(windows, target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    {
+        None
+    }
+}
+
+fn candidate_failure_error(failure: CandidateFailure) -> RuntimeError {
+    match failure {
+        CandidateFailure::Missing => RuntimeError::Unavailable,
+        CandidateFailure::Unsafe => RuntimeError::UnsafePath,
+        CandidateFailure::Probe => RuntimeError::ProbeFailed,
+        CandidateFailure::Deadline => RuntimeError::ProbeDeadline,
+        CandidateFailure::Incompatible => RuntimeError::IncompatiblePair,
+    }
+}
+
+pub async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
+    let opened = open_pair_lease(runtime.lease.root.clone())
         .await
         .map_err(|_| RuntimeError::RuntimeChanged)?;
-    let ffprobe_seal = seal_file(ffprobe)
-        .await
-        .map_err(|_| RuntimeError::RuntimeChanged)?;
-    if ffmpeg_seal != runtime.lease.ffmpeg || ffprobe_seal != runtime.lease.ffprobe {
+    if opened.root != runtime.lease.root
+        || opened.ffmpeg != runtime.ffmpeg
+        || opened.ffprobe != runtime.ffprobe
+        || opened.lease.root_identity != runtime.lease.root_identity
+        || opened.lease.ffmpeg.seal != runtime.lease.ffmpeg.seal
+        || opened.lease.ffprobe.seal != runtime.lease.ffprobe.seal
+    {
         return Err(RuntimeError::RuntimeChanged);
     }
     Ok(())
@@ -312,8 +556,8 @@ pub async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeErro
 
 impl ProbedPair {
     fn into_runtime(self, kind: RuntimeKind, jellyfin_revision: Option<&str>) -> FfmpegRuntime {
-        let install_digest = pair_install_digest(&self.ffmpeg_seal, &self.ffprobe_seal);
-        let pair_root_identity = digest_os_str(self.root.as_os_str());
+        let install_digest = pair_install_digest(&self.lease.ffmpeg.seal, &self.lease.ffprobe.seal);
+        let pair_root_identity = pair_root_identity(&self.root, self.lease.root_identity);
         let id = RuntimeId {
             install_digest,
             ffmpeg_version: self.version,
@@ -321,11 +565,7 @@ impl ProbedPair {
             build_configuration_digest: self.build_configuration_digest,
             pair_root_identity,
         };
-        let lease = Arc::new(RuntimeLease {
-            root: self.root,
-            ffmpeg: self.ffmpeg_seal,
-            ffprobe: self.ffprobe_seal,
-        });
+        let lease = Arc::new(self.lease);
         FfmpegRuntime {
             id,
             ffmpeg: self.ffmpeg,
@@ -343,11 +583,33 @@ async fn probe_pair(
     ffprobe_jellyfin_matcher: &str,
     supervisor: &ProcessSupervisor,
 ) -> Result<ProbedPair, CandidateFailure> {
-    let (root, ffmpeg, ffprobe) = validate_pair_paths(root)?;
-    let ffmpeg_before = seal_file(ffmpeg.clone()).await?;
-    let ffprobe_before = seal_file(ffprobe.clone()).await?;
-    let ffmpeg_version = probe_identity_command(&ffmpeg, &root, "-version", supervisor).await?;
-    let ffprobe_version = probe_identity_command(&ffprobe, &root, "-version", supervisor).await?;
+    let opened = open_pair_lease(root.to_path_buf()).await?;
+    let OpenedPair {
+        root,
+        ffmpeg,
+        ffprobe,
+        lease,
+    } = opened;
+    let ffmpeg_before = lease.ffmpeg.seal.clone();
+    let ffprobe_before = lease.ffprobe.seal.clone();
+    let ffmpeg_version = probe_identity_command(
+        &lease.ffmpeg.file,
+        &ffmpeg,
+        &lease._root_file,
+        &root,
+        "-version",
+        supervisor,
+    )
+    .await?;
+    let ffprobe_version = probe_identity_command(
+        &lease.ffprobe.file,
+        &ffprobe,
+        &lease._root_file,
+        &root,
+        "-version",
+        supervisor,
+    )
+    .await?;
     let ffmpeg_token = parse_version(&ffmpeg_version, "ffmpeg")?;
     let ffprobe_token = parse_version(&ffprobe_version, "ffprobe")?;
     if ffmpeg_token != ffprobe_token {
@@ -359,15 +621,31 @@ async fn probe_pair(
         return Err(CandidateFailure::Incompatible);
     }
 
-    let ffmpeg_build = probe_identity_command(&ffmpeg, &root, "-buildconf", supervisor).await?;
-    let ffprobe_build = probe_identity_command(&ffprobe, &root, "-buildconf", supervisor).await?;
+    let ffmpeg_build = probe_identity_command(
+        &lease.ffmpeg.file,
+        &ffmpeg,
+        &lease._root_file,
+        &root,
+        "-buildconf",
+        supervisor,
+    )
+    .await?;
+    let ffprobe_build = probe_identity_command(
+        &lease.ffprobe.file,
+        &ffprobe,
+        &lease._root_file,
+        &root,
+        "-buildconf",
+        supervisor,
+    )
+    .await?;
     let ffmpeg_configuration = build_configuration(&ffmpeg_build)?;
     let ffprobe_configuration = build_configuration(&ffprobe_build)?;
     if ffmpeg_configuration != ffprobe_configuration {
         return Err(CandidateFailure::Incompatible);
     }
-    let ffmpeg_after = seal_file(ffmpeg.clone()).await?;
-    let ffprobe_after = seal_file(ffprobe.clone()).await?;
+    let ffmpeg_after = seal_open_file(&lease.ffmpeg.file)?;
+    let ffprobe_after = seal_open_file(&lease.ffprobe.file)?;
     if ffmpeg_before != ffmpeg_after || ffprobe_before != ffprobe_after {
         return Err(CandidateFailure::Unsafe);
     }
@@ -375,8 +653,7 @@ async fn probe_pair(
         root,
         ffmpeg,
         ffprobe,
-        ffmpeg_seal: ffmpeg_after,
-        ffprobe_seal: ffprobe_after,
+        lease,
         version: required_version.to_owned(),
         jellyfin,
         build_configuration_digest: digest_bytes(&ffmpeg_configuration),
@@ -384,16 +661,20 @@ async fn probe_pair(
 }
 
 async fn probe_identity_command(
+    executable_file: &File,
     executable: &Path,
+    root_file: &File,
     root: &Path,
     argument: &str,
     supervisor: &ProcessSupervisor,
 ) -> Result<Vec<u8>, CandidateFailure> {
+    let executable = bound_execution_path(executable_file, executable)?;
+    let root = bound_execution_path(root_file, root)?;
     let output = supervisor
         .run_bounded(ProcessSpec {
-            executable: executable.to_path_buf(),
+            executable,
             args: vec![OsString::from(argument)],
-            current_dir: root.to_path_buf(),
+            current_dir: root,
             environment: BTreeMap::new(),
             stdin: StdinPolicy::Null,
             stdout: StdoutPolicy::Capture {
@@ -558,22 +839,126 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
-async fn seal_file(path: PathBuf) -> Result<FileSeal, CandidateFailure> {
-    tokio::task::spawn_blocking(move || seal_file_blocking(&path))
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum FdNamespace {
+    ProcSelf,
+    Unsupported,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_fd_path(namespace: FdNamespace, descriptor: i32) -> Option<PathBuf> {
+    if descriptor < 0 {
+        return None;
+    }
+    match namespace {
+        FdNamespace::ProcSelf => Some(PathBuf::from(format!("/proc/self/fd/{descriptor}"))),
+        FdNamespace::Unsupported => None,
+    }
+}
+
+fn bound_execution_path(file: &File, canonical_path: &Path) -> Result<PathBuf, CandidateFailure> {
+    #[cfg(windows)]
+    {
+        let _ = file;
+        Ok(canonical_path.to_path_buf())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = canonical_path;
+        render_fd_path(FdNamespace::ProcSelf, file.as_raw_fd()).ok_or(CandidateFailure::Probe)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (file, canonical_path);
+        render_fd_path(FdNamespace::Unsupported, -1).ok_or(CandidateFailure::Probe)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (file, canonical_path);
+        Err(CandidateFailure::Probe)
+    }
+}
+
+async fn open_pair_lease(root: PathBuf) -> Result<OpenedPair, CandidateFailure> {
+    tokio::task::spawn_blocking(move || open_pair_lease_blocking(&root))
         .await
         .map_err(|_| CandidateFailure::Unsafe)?
 }
 
-fn seal_file_blocking(path: &Path) -> Result<FileSeal, CandidateFailure> {
-    let metadata = fs::metadata(path).map_err(|_| CandidateFailure::Unsafe)?;
-    if !metadata.is_file() {
+fn open_pair_lease_blocking(root: &Path) -> Result<OpenedPair, CandidateFailure> {
+    let (root, ffmpeg, ffprobe) = validate_pair_paths(root)?;
+    let root_file = open_local_root(&root)?;
+    let root_metadata = root_file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+    if !root_metadata.is_dir() {
         return Err(CandidateFailure::Unsafe);
     }
-    let mut file = fs::File::open(path).map_err(|_| CandidateFailure::Unsafe)?;
+    let root_identity = file_identity(&root_file, &root_metadata)?;
+    let ffmpeg_file = Arc::new(open_local_file(&ffmpeg)?);
+    let ffprobe_file = Arc::new(open_local_file(&ffprobe)?);
+    let ffmpeg_seal = seal_open_file(&ffmpeg_file)?;
+    let ffprobe_seal = seal_open_file(&ffprobe_file)?;
+    Ok(OpenedPair {
+        root: root.clone(),
+        ffmpeg,
+        ffprobe,
+        lease: RuntimeLease {
+            root,
+            _root_file: Arc::new(root_file),
+            root_identity,
+            ffmpeg: FileLease {
+                file: ffmpeg_file,
+                seal: ffmpeg_seal,
+            },
+            ffprobe: FileLease {
+                file: ffprobe_file,
+                seal: ffprobe_seal,
+            },
+        },
+    })
+}
+
+fn open_local_file(path: &Path) -> Result<File, CandidateFailure> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        options.share_mode(FILE_SHARE_READ.0);
+    }
+    options.open(path).map_err(|_| CandidateFailure::Unsafe)
+}
+
+fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ};
+        options
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0);
+    }
+    options.open(path).map_err(|_| CandidateFailure::Unsafe)
+}
+
+fn seal_open_file(file: &File) -> Result<FileSeal, CandidateFailure> {
+    let metadata_before = file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+    if !metadata_before.is_file() {
+        return Err(CandidateFailure::Unsafe);
+    }
+    let identity = file_identity(file, &metadata_before)?;
+    let mut reader = file.try_clone().map_err(|_| CandidateFailure::Unsafe)?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| CandidateFailure::Unsafe)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = file
+        let count = reader
             .read(&mut buffer)
             .map_err(|_| CandidateFailure::Unsafe)?;
         if count == 0 {
@@ -581,11 +966,54 @@ fn seal_file_blocking(path: &Path) -> Result<FileSeal, CandidateFailure> {
         }
         hasher.update(&buffer[..count]);
     }
+    let metadata_after = file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+    if metadata_before.len() != metadata_after.len()
+        || metadata_before.modified().ok() != metadata_after.modified().ok()
+        || identity != file_identity(file, &metadata_after)?
+    {
+        return Err(CandidateFailure::Unsafe);
+    }
     Ok(FileSeal {
-        length: metadata.len(),
-        modified: metadata.modified().ok(),
+        length: metadata_after.len(),
+        modified: metadata_after.modified().ok(),
         digest: hasher.finalize().into(),
+        identity,
     })
+}
+
+fn file_identity(file: &File, metadata: &fs::Metadata) -> Result<FileIdentity, CandidateFailure> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        let _ = metadata;
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut information)
+                .map_err(|_| CandidateFailure::Unsafe)?;
+        }
+        Ok(FileIdentity {
+            volume: information.dwVolumeSerialNumber as u64,
+            file: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+        })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        Ok(FileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (file, metadata);
+        Err(CandidateFailure::Unsafe)
+    }
 }
 
 fn pair_install_digest(ffmpeg: &FileSeal, ffprobe: &FileSeal) -> String {
@@ -620,6 +1048,14 @@ fn digest_os_str(value: &OsStr) -> String {
     {
         digest_bytes(value.to_string_lossy().as_bytes())
     }
+}
+
+fn pair_root_identity(root: &Path, identity: FileIdentity) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(digest_os_str(root.as_os_str()).as_bytes());
+    hasher.update(identity.volume.to_le_bytes());
+    hasher.update(identity.file.to_le_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -661,5 +1097,69 @@ fn known_system_roots() -> Vec<PathBuf> {
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FdNamespace, render_fd_path};
+    use std::path::PathBuf;
+
+    #[test]
+    fn fd_bound_command_paths_are_absolute_and_platform_namespaced() {
+        assert_eq!(
+            render_fd_path(FdNamespace::ProcSelf, 42),
+            Some(PathBuf::from("/proc/self/fd/42"))
+        );
+        assert_eq!(render_fd_path(FdNamespace::Unsupported, 42), None);
+        assert_eq!(render_fd_path(FdNamespace::ProcSelf, -1), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "spawned by linux_fd_bound_execution_uses_the_opened_inode"]
+    fn fd_bound_execution_helper() {}
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_fd_bound_execution_uses_the_opened_inode() {
+        use super::{bound_execution_path, open_local_root};
+        use crate::transcoding::process::{
+            ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
+        };
+        use std::{collections::BTreeMap, ffi::OsString, fs, time::Duration};
+        use tokio_util::sync::CancellationToken;
+
+        let directory = tempfile::tempdir().expect("fd execution directory");
+        let executable = directory.path().join("runtime");
+        fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &executable,
+        )
+        .expect("copy executable");
+        let opened = fs::File::open(&executable).expect("open executable inode");
+        let opened_root = open_local_root(directory.path()).expect("open execution root");
+        fs::rename(&executable, directory.path().join("original")).expect("rename open inode");
+        fs::write(&executable, b"replacement is not executable").expect("replace pathname");
+
+        let output = ProcessSupervisor::new(CancellationToken::new())
+            .run_bounded(ProcessSpec {
+                executable: bound_execution_path(&opened, &executable).expect("fd executable"),
+                args: vec![
+                    OsString::from("--ignored"),
+                    OsString::from("--exact"),
+                    OsString::from("transcoding::runtime::tests::fd_bound_execution_helper"),
+                ],
+                current_dir: bound_execution_path(&opened_root, directory.path()).expect("fd root"),
+                environment: BTreeMap::new(),
+                stdin: StdinPolicy::Null,
+                stdout: StdoutPolicy::Null,
+                stderr_byte_limit: 8_192,
+                wall_deadline: Duration::from_secs(2),
+            })
+            .await
+            .expect("execute opened inode rather than replacement path");
+
+        assert!(output.status.success());
     }
 }
