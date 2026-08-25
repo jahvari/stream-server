@@ -803,6 +803,11 @@ fn old_scalar_fps_cannot_distinguish_conflicting_or_missing_nominal_and_average_
 
 #[test]
 fn mp_002a_cold_torrent_loopback_probe_is_pending_without_a_starvation_signal() {
+    // Binding MP-002A conclusion: the legacy control flow has no total probe
+    // deadline, so a cold source can remain pending indefinitely while its
+    // public state exposes neither progress nor a terminal starvation signal.
+    // The planned 10-minute default and 30-minute hard ceiling are therefore
+    // approved safety bounds, not compatibility regressions.
     with_fake_ffmpeg("probe_loopback_blocked", |log_path| {
         let release_path = log_path.with_file_name("release-probe");
         set_env_var("FAKE_FFMPEG_RELEASE", release_path.as_os_str());

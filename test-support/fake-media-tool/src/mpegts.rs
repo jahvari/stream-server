@@ -167,7 +167,7 @@ mod tests {
 
     fn has_sync_cadence(bytes: &[u8]) -> bool {
         !bytes.is_empty()
-            && bytes.len() % PACKET_SIZE == 0
+            && bytes.len().is_multiple_of(PACKET_SIZE)
             && bytes.chunks(PACKET_SIZE).all(|packet| packet[0] == 0x47)
     }
 

@@ -138,6 +138,48 @@ fn copied_ffmpeg_and_ffprobe_names_are_invoked_directly() {
 }
 
 #[test]
+fn option_looking_input_value_is_not_dispatched_as_a_query() {
+    let dir = tempdir().expect("temp dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fake-media-tool"))
+        .args(["-i", "-version", "-f", "mpegts", "pipe:1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run fake-media-tool");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 564);
+    assert_eq!(output.stdout.first(), Some(&0x47));
+    assert_eq!(output.stdout.get(188), Some(&0x47));
+    assert_eq!(output.stdout.get(376), Some(&0x47));
+}
+
+#[test]
+fn internal_child_token_used_as_an_input_value_does_not_activate_control_mode() {
+    let dir = tempdir().expect("temp dir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fake-media-tool"))
+        .args(["-i", "--fake-child", "-f", "mpegts", "pipe:1"])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fake-media-tool");
+
+    let exited = wait_for_exit(&mut child, Duration::from_secs(2));
+    if !exited {
+        force_cleanup_tree(&mut child);
+        panic!("input value activated the internal child control mode");
+    }
+    let output = child.wait_with_output().expect("collect fake tool output");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 564);
+    assert_eq!(output.stdout.first(), Some(&0x47));
+    assert!(!dir.path().join("fake-media-child.pid").exists());
+}
+
+#[test]
 fn spawned_descendant_is_discoverable_and_cleanup_is_bounded() {
     let dir = tempdir().expect("temp dir");
     fs::write(

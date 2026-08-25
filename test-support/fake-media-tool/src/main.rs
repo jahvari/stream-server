@@ -16,6 +16,7 @@ const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 20;
 const MAX_PROGRESS_INTERVAL_MS: u64 = 60_000;
 const MAX_SEGMENT_NUMBER_WIDTH: usize = 20;
 const OVERSIZED_LOG_LINES: usize = 4096;
+const OVERLONG_LOG_LINE_BYTES: usize = 16 * 1024 + 1;
 const STOP_FILE: &str = "fake-media-tool.stop";
 
 fn main() -> ExitCode {
@@ -117,9 +118,8 @@ impl Scenario {
     }
 
     fn load_from_candidate_dirs(cwd: &Path, adjacent: Option<&Path>) -> Result<Self, FakeError> {
-        match Self::load_from_exact_dir(cwd)? {
-            Some(scenario) => return Ok(scenario),
-            None => {}
+        if let Some(scenario) = Self::load_from_exact_dir(cwd)? {
+            return Ok(scenario);
         }
 
         if let Some(adjacent) = adjacent {
@@ -177,7 +177,7 @@ impl Default for Scenario {
 }
 
 fn dispatch(args: &[OsString], scenario: &Scenario) -> Result<ExitCode, FakeError> {
-    if contains_arg(args, "--fake-child") {
+    if is_exact_invocation(args, "--fake-child") {
         wait_until_stopped("child")?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -249,28 +249,38 @@ fn write_query_output(args: &[OsString], scenario: &Scenario) -> Result<bool, Fa
 }
 
 fn query_output(args: &[OsString], scenario: &Scenario) -> Option<String> {
-    if contains_arg(args, "-version") {
+    if is_inventory_query(args, "-version") {
         return Some(version_output(&scenario.version));
     }
-    if contains_arg(args, "-buildconf") {
+    if is_inventory_query(args, "-buildconf") {
         return Some(buildconf_output(&scenario.version));
     }
-    if contains_arg(args, "-hwaccels") {
+    if is_inventory_query(args, "-hwaccels") {
         return Some(HWACCELS.to_owned());
     }
-    if contains_arg(args, "-encoders") {
+    if is_inventory_query(args, "-encoders") {
         return Some(ENCODERS.to_owned());
     }
-    if contains_arg(args, "-decoders") {
+    if is_inventory_query(args, "-decoders") {
         return Some(DECODERS.to_owned());
     }
-    if contains_arg(args, "-filters") {
+    if is_inventory_query(args, "-filters") {
         return Some(FILTERS.to_owned());
     }
     if requests_json_probe(args) {
         return Some(PROBE_JSON.to_owned());
     }
     None
+}
+
+fn is_exact_invocation(args: &[OsString], flag: &str) -> bool {
+    matches!(args, [only] if only == flag)
+}
+
+fn is_inventory_query(args: &[OsString], query: &str) -> bool {
+    is_exact_invocation(args, query)
+        || matches!(args, [hide_banner, requested]
+            if hide_banner == "-hide_banner" && requested == query)
 }
 
 fn contains_arg(args: &[OsString], needle: &str) -> bool {
@@ -622,6 +632,13 @@ fn reject_path_components(value: &str) -> Result<(), FakeError> {
 }
 
 fn write_oversized_log(stderr: &mut dyn Write) -> Result<(), FakeError> {
+    stderr
+        .write_all(&[b'x'; OVERLONG_LOG_LINE_BYTES])
+        .map_err(|_| FakeError::Io)?;
+    stderr.write_all(b"\n").map_err(|_| FakeError::Io)?;
+    stderr
+        .write_all(b"fake_media_malformed_utf8=\xff\xfe\n")
+        .map_err(|_| FakeError::Io)?;
     for index in 0..OVERSIZED_LOG_LINES {
         writeln!(
             stderr,
@@ -828,6 +845,25 @@ mod tests {
         assert_eq!(output.matches("progress=continue").count(), 1);
         assert_eq!(output.matches("progress=end").count(), 1);
         assert!(output.ends_with("progress=end\n"));
+    }
+
+    #[test]
+    fn oversized_log_contains_bounded_capture_and_decoder_stressors() {
+        let mut stderr = Vec::new();
+
+        write_oversized_log(&mut stderr).expect("oversized log writes");
+
+        assert!(stderr.len() > 256 * 1024);
+        assert!(
+            stderr
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.len() > 16 * 1024),
+            "fixture must exercise overlong diagnostic lines"
+        );
+        assert!(
+            std::str::from_utf8(&stderr).is_err(),
+            "fixture must exercise malformed UTF-8 diagnostics"
+        );
     }
 
     #[test]
