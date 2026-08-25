@@ -11,32 +11,35 @@ use std::io::Write;
 use std::io::{Read, Seek};
 
 pub(crate) const SNAPSHOT_HELPER_ARGUMENT: &str = "--stream-server-internal-snapshot-v1";
+#[cfg(unix)]
+pub(crate) const SNAPSHOT_SOURCE_DESCRIPTOR: i32 = 198;
+#[cfg(unix)]
+pub(crate) const SNAPSHOT_DESTINATION_DESCRIPTOR: i32 = 199;
+#[cfg(unix)]
+pub(crate) const SNAPSHOT_MAXIMUM_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(unix)]
 pub(crate) fn maybe_run_from_environment() -> Option<i32> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
-    let position = arguments
+    maybe_run_from_arguments(&arguments)
+}
+
+fn maybe_run_from_arguments(arguments: &[std::ffi::OsString]) -> Option<i32> {
+    let marker_present = arguments
         .iter()
-        .position(|argument| argument == SNAPSHOT_HELPER_ARGUMENT)?;
-    let source = arguments
-        .get(position + 1)
-        .and_then(|value| value.to_str())
-        .and_then(|value| value.parse::<i32>().ok());
-    let destination = arguments
-        .get(position + 2)
-        .and_then(|value| value.to_str())
-        .and_then(|value| value.parse::<i32>().ok());
-    let maximum = arguments
-        .get(position + 3)
-        .and_then(|value| value.to_str())
-        .and_then(|value| value.parse::<u64>().ok());
-    let Some((source, destination, maximum)) = source
-        .zip(destination)
-        .zip(maximum)
-        .map(|((source, destination), maximum)| (source, destination, maximum))
-    else {
+        .any(|argument| argument == SNAPSHOT_HELPER_ARGUMENT);
+    if !marker_present {
+        return None;
+    }
+    let exact = arguments.len() == 5
+        && arguments[1] == SNAPSHOT_HELPER_ARGUMENT
+        && arguments[2] == std::ffi::OsStr::new("198")
+        && arguments[3] == std::ffi::OsStr::new("199")
+        && arguments[4] == std::ffi::OsStr::new("536870912");
+    if !exact {
         return Some(2);
-    };
-    match copy_and_hash(source, destination, maximum) {
+    }
+    match copy_and_hash() {
         Ok((length, digest)) => {
             let mut output = std::io::stdout().lock();
             if writeln!(output, "{length}:{}", hex::encode(digest)).is_ok() {
@@ -50,17 +53,33 @@ pub(crate) fn maybe_run_from_environment() -> Option<i32> {
 }
 
 #[cfg(unix)]
-fn copy_and_hash(
-    source_descriptor: i32,
-    destination_descriptor: i32,
-    maximum: u64,
-) -> std::io::Result<(u64, [u8; 32])> {
+fn copy_and_hash() -> std::io::Result<(u64, [u8; 32])> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
-    // These are child-local duplicates installed by pre_exec. Taking
-    // ownership cannot affect the parent's descriptors.
-    let source = unsafe { OwnedFd::from_raw_fd(source_descriptor) };
-    let destination = unsafe { OwnedFd::from_raw_fd(destination_descriptor) };
+    fn duplicate_checked(descriptor: i32, write: bool) -> std::io::Result<OwnedFd> {
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if status < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let access = status & libc::O_ACCMODE;
+        if (write && access == libc::O_RDONLY) || (!write && access == libc::O_WRONLY) {
+            return Err(std::io::Error::other("snapshot descriptor access mismatch"));
+        }
+        let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 256) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    // Validate the fixed inherited descriptors, then work only through new,
+    // distinct CLOEXEC-owned duplicates. The untrusted argv never becomes an
+    // fd ownership operation.
+    let source = duplicate_checked(SNAPSHOT_SOURCE_DESCRIPTOR, false)?;
+    let destination = duplicate_checked(SNAPSHOT_DESTINATION_DESCRIPTOR, true)?;
     let mut source = std::fs::File::from(source);
     let mut destination = std::fs::File::from(destination);
     source.seek(std::io::SeekFrom::Start(0))?;
@@ -77,7 +96,7 @@ fn copy_and_hash(
         length = length
             .checked_add(u64::try_from(count).map_err(std::io::Error::other)?)
             .ok_or_else(|| std::io::Error::other("snapshot length overflow"))?;
-        if length > maximum {
+        if length > SNAPSHOT_MAXIMUM_BYTES {
             return Err(std::io::Error::other("snapshot exceeds byte limit"));
         }
         destination.write_all(&buffer[..count])?;
@@ -89,10 +108,28 @@ fn copy_and_hash(
 }
 
 #[cfg(not(unix))]
-fn copy_and_hash(
-    _source_descriptor: i32,
-    _destination_descriptor: i32,
-    _maximum: u64,
-) -> std::io::Result<(u64, [u8; 32])> {
+fn copy_and_hash() -> std::io::Result<(u64, [u8; 32])> {
     Err(std::io::Error::other("unsupported snapshot helper host"))
+}
+
+#[cfg(test)]
+pub(crate) fn run_exact_test_request(malformed_case: Option<usize>) -> i32 {
+    let payload: Vec<&str> = match malformed_case {
+        None => vec![SNAPSHOT_HELPER_ARGUMENT, "198", "199", "536870912"],
+        Some(0) => vec![SNAPSHOT_HELPER_ARGUMENT, "-198", "199", "536870912"],
+        Some(1) => vec![SNAPSHOT_HELPER_ARGUMENT, "198", "198", "536870912"],
+        Some(2) => vec![SNAPSHOT_HELPER_ARGUMENT, "198", "199", "536870911"],
+        Some(3) => vec![SNAPSHOT_HELPER_ARGUMENT, "198", "199", "536870912", "extra"],
+        Some(4) => vec![
+            "prefix",
+            SNAPSHOT_HELPER_ARGUMENT,
+            "198",
+            "199",
+            "536870912",
+        ],
+        Some(_) => return 2,
+    };
+    let mut arguments = vec![std::ffi::OsString::from("snapshot-helper")];
+    arguments.extend(payload.into_iter().map(std::ffi::OsString::from));
+    maybe_run_from_arguments(&arguments).unwrap_or(2)
 }

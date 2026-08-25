@@ -1405,7 +1405,7 @@ fn open_macos_root_components(path: &Path) -> Result<File, CandidateFailure> {
         os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     };
 
-    if !path.is_absolute() {
+    if !macos_root_components_are_strict(path) {
         return Err(CandidateFailure::Unsafe);
     }
     let mut directory = fs::OpenOptions::new()
@@ -1438,6 +1438,28 @@ fn open_macos_root_components(path: &Path) -> Result<File, CandidateFailure> {
     Ok(directory)
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_root_components_are_strict(path: &Path) -> bool {
+    let Some(path) = path.as_os_str().to_str() else {
+        return false;
+    };
+    if !path.starts_with('/') || path.starts_with("//") {
+        return false;
+    }
+    let mut components = path.split('/');
+    if components.next() != Some("") {
+        return false;
+    }
+    let mut normal = false;
+    for component in components {
+        if component.is_empty() || component == "." || component == ".." {
+            return false;
+        }
+        normal = true;
+    }
+    normal
+}
+
 #[cfg(any(test, target_os = "linux"))]
 const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;
 #[cfg(any(test, target_os = "linux"))]
@@ -1463,6 +1485,14 @@ fn linux_mount_identity_matches(root_device: u64, child_device: u64) -> bool {
 #[cfg(any(test, target_os = "macos"))]
 fn macos_mount_flags_are_local(flags: u64, local_flag: u64) -> bool {
     flags & local_flag != 0
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_snapshot_reopen_identity_matches(
+    writer: (u64, u64, u64),
+    reader: (u64, u64, u64),
+) -> bool {
+    writer == reader
 }
 
 #[cfg(target_os = "linux")]
@@ -1722,7 +1752,42 @@ fn create_snapshot_file() -> Result<(File, Option<(tempfile::TempDir, PathBuf)>)
         }
         return Ok((unsafe { File::from_raw_fd(descriptor) }, None));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let directory = tempfile::Builder::new()
+            .prefix("stream-server-runtime-")
+            .tempdir()
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        let directory_file = File::open(directory.path()).map_err(|_| CandidateFailure::Unsafe)?;
+        let directory_metadata = directory_file
+            .metadata()
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        if !directory_metadata.is_dir()
+            || directory_metadata.mode() & 0o077 != 0
+            || !macos_file_is_local(&directory_file)?
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        let path = directory.path().join("execution-snapshot");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o700)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        if !macos_file_is_local(&file)?
+            || file.metadata().map_err(|_| CandidateFailure::Unsafe)?.dev()
+                != directory_metadata.dev()
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        return Ok((file, Some((directory, path))));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let directory = tempfile::tempdir().map_err(|_| CandidateFailure::Unsafe)?;
         let path = directory.path().join("execution-snapshot");
@@ -1732,13 +1797,6 @@ fn create_snapshot_file() -> Result<(File, Option<(tempfile::TempDir, PathBuf)>)
             .write(true)
             .open(&path)
             .map_err(|_| CandidateFailure::Unsafe)?;
-        #[cfg(unix)]
-        {
-            fs::remove_file(&path).map_err(|_| CandidateFailure::Unsafe)?;
-            drop(directory);
-            return Ok((file, None));
-        }
-        #[cfg(not(unix))]
         Ok((file, Some((directory, path))))
     }
 }
@@ -1783,6 +1841,54 @@ fn create_verified_execution_snapshot(
             return Err(CandidateFailure::Unsafe);
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Some((directory, path)) = temporary_path {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt, unix::fs::OpenOptionsExt};
+
+        let writer_metadata = writer.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        let reader_metadata = reader.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        let reader_status = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        let reader_descriptor_flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) };
+        if !macos_file_is_local(&writer)?
+            || !macos_file_is_local(&reader)?
+            || reader_status < 0
+            || reader_status & libc::O_ACCMODE != libc::O_RDONLY
+            || reader_descriptor_flags < 0
+            || reader_descriptor_flags & libc::FD_CLOEXEC == 0
+            || !macos_snapshot_reopen_identity_matches(
+                (
+                    writer_metadata.dev(),
+                    writer_metadata.ino(),
+                    writer_metadata.len(),
+                ),
+                (
+                    reader_metadata.dev(),
+                    reader_metadata.ino(),
+                    reader_metadata.len(),
+                ),
+            )
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        drop(writer);
+        fs::remove_file(&path).map_err(|_| CandidateFailure::Unsafe)?;
+        drop(directory);
+        if reader
+            .metadata()
+            .map_err(|_| CandidateFailure::Unsafe)?
+            .nlink()
+            != 0
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+        writer = reader;
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some((directory, path)) = temporary_path {
         fs::remove_file(&path).map_err(|_| CandidateFailure::Unsafe)?;
         drop(directory);
@@ -1860,26 +1966,25 @@ fn run_snapshot_helper(
         process::{Command, Stdio},
     };
 
-    let source_descriptor = source.as_raw_fd();
-    let destination_descriptor = destination.as_raw_fd();
-    let mut helper_descriptors = (198_i32..=255).filter(|descriptor| {
-        *descriptor != source_descriptor && *descriptor != destination_descriptor
-    });
-    let helper_source = helper_descriptors.next().ok_or(CandidateFailure::Unsafe)?;
-    let helper_destination = helper_descriptors.next().ok_or(CandidateFailure::Unsafe)?;
+    let staged_source = duplicate_snapshot_descriptor_for_child(source)?;
+    let staged_destination = duplicate_snapshot_descriptor_for_child(destination)?;
+    let staged_source_descriptor = staged_source.as_raw_fd();
+    let staged_destination_descriptor = staged_destination.as_raw_fd();
+    let helper_source = super::snapshot_helper::SNAPSHOT_SOURCE_DESCRIPTOR;
+    let helper_destination = super::snapshot_helper::SNAPSHOT_DESTINATION_DESCRIPTOR;
     let mut command = Command::new(std::env::current_exe().map_err(|_| CandidateFailure::Unsafe)?);
     #[cfg(test)]
     command.args([
         "--ignored",
         "--exact",
         "transcoding::runtime::tests::snapshot_worker_helper",
-        "--",
     ]);
+    #[cfg(not(test))]
     command.args([
         super::snapshot_helper::SNAPSHOT_HELPER_ARGUMENT.to_owned(),
         helper_source.to_string(),
         helper_destination.to_string(),
-        MAX_EXECUTABLE_BYTES.to_string(),
+        super::snapshot_helper::SNAPSHOT_MAXIMUM_BYTES.to_string(),
     ]);
     command
         .current_dir("/")
@@ -1889,18 +1994,19 @@ fn run_snapshot_helper(
         .stderr(Stdio::null());
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(source_descriptor, helper_source) < 0
-                || libc::dup2(destination_descriptor, helper_destination) < 0
+            if libc::dup2(staged_source_descriptor, helper_source) < 0
+                || libc::dup2(staged_destination_descriptor, helper_destination) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| CandidateFailure::Unsafe)?;
+    let child = command.spawn().map_err(|_| CandidateFailure::Unsafe)?;
+    let mut child = SnapshotHelperChild::new(child);
     let expires = Instant::now() + HASH_DEADLINE;
     loop {
-        match child.try_wait().map_err(|_| CandidateFailure::Unsafe)? {
+        match try_wait_snapshot_helper(&mut child, false)? {
             Some(status) => {
                 let output = child
                     .wait_with_output()
@@ -1920,13 +2026,83 @@ fn run_snapshot_helper(
                 return Ok((length, digest));
             }
             None if Instant::now() < expires => std::thread::sleep(Duration::from_millis(5)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CandidateFailure::Deadline);
-            }
+            None => return Err(CandidateFailure::Deadline),
         }
     }
+}
+
+#[cfg(unix)]
+fn duplicate_snapshot_descriptor_for_child(
+    file: &File,
+) -> Result<std::os::fd::OwnedFd, CandidateFailure> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let descriptor = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 256) };
+    if descriptor < 0 {
+        return Err(CandidateFailure::Unsafe);
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) })
+}
+
+#[cfg(any(unix, test))]
+struct SnapshotHelperChild {
+    child: Option<std::process::Child>,
+}
+
+#[cfg(any(unix, test))]
+impl SnapshotHelperChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut std::process::Child, CandidateFailure> {
+        self.child.as_mut().ok_or(CandidateFailure::Unsafe)
+    }
+
+    #[cfg(unix)]
+    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.child
+            .take()
+            .ok_or_else(|| std::io::Error::other("snapshot helper ownership missing"))?
+            .wait_with_output()
+    }
+}
+
+#[cfg(any(unix, test))]
+impl Drop for SnapshotHelperChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn try_wait_snapshot_helper(
+    child: &mut SnapshotHelperChild,
+    injected_failure: bool,
+) -> Result<Option<std::process::ExitStatus>, CandidateFailure> {
+    if injected_failure {
+        return Err(CandidateFailure::Unsafe);
+    }
+    child
+        .child_mut()?
+        .try_wait()
+        .map_err(|_| CandidateFailure::Unsafe)
+}
+
+#[cfg(test)]
+fn run_snapshot_guard_try_wait_failure_for_test(
+    child: std::process::Child,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), CandidateFailure> {
+    // Mirrors the real spawn_blocking closure: the hash-admission permit is
+    // acquired before helper ownership, so reverse local-drop order runs the
+    // child's kill-and-wait guard before admission can reopen.
+    let _admission_permit = permit;
+    let mut child = SnapshotHelperChild::new(child);
+    try_wait_snapshot_helper(&mut child, true).map(|_| ())
 }
 
 #[cfg(test)]
@@ -2247,14 +2423,121 @@ mod tests {
     };
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
-    #[cfg(unix)]
     #[test]
     #[ignore = "spawned only as the killable immutable snapshot worker"]
     fn snapshot_worker_helper() {
-        assert_eq!(
-            super::super::snapshot_helper::maybe_run_from_environment(),
-            Some(0)
-        );
+        let malformed_case = std::env::var("STREAM_SERVER_TEST_SNAPSHOT_MALFORMED_CASE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let exit_code = super::super::snapshot_helper::run_exact_test_request(malformed_case);
+        std::process::exit(exit_code);
+    }
+
+    #[test]
+    #[ignore = "spawned only by snapshot_helper_try_wait_failure_reaps_before_admission_returns"]
+    fn snapshot_guard_sleep_helper() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn snapshot_helper_try_wait_failure_reaps_before_admission_returns() {
+        use windows::Win32::{
+            Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+
+        let child =
+            std::process::Command::new(std::env::current_exe().expect("unit test executable"))
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transcoding::runtime::tests::snapshot_guard_sleep_helper",
+                ])
+                .spawn()
+                .expect("spawn guarded helper");
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, child.id()) }
+            .expect("open stable helper process handle");
+        let handle_value = handle.0 as usize;
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission
+            .clone()
+            .try_acquire_owned()
+            .expect("target hash admission permit");
+        let waiter = tokio::spawn({
+            let admission = admission.clone();
+            async move {
+                let _permit = admission.acquire_owned().await.expect("admission reopened");
+                let handle = HANDLE(handle_value as *mut std::ffi::c_void);
+                assert_eq!(unsafe { WaitForSingleObject(handle, 0) }, WAIT_OBJECT_0);
+                let _ = unsafe { CloseHandle(handle) };
+            }
+        });
+
+        let error = super::run_snapshot_guard_try_wait_failure_for_test(child, permit)
+            .expect_err("injected try_wait failure must surface");
+        assert!(matches!(error, CandidateFailure::Unsafe));
+        waiter.await.expect("admission waiter");
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn snapshot_helper_rejects_malformed_invocations_before_descriptor_access() {
+        let cases = [
+            vec![
+                "--stream-server-internal-snapshot-v1",
+                "-198",
+                "199",
+                "536870912",
+            ],
+            vec![
+                "--stream-server-internal-snapshot-v1",
+                "198",
+                "198",
+                "536870912",
+            ],
+            vec![
+                "--stream-server-internal-snapshot-v1",
+                "198",
+                "199",
+                "536870911",
+            ],
+            vec![
+                "--stream-server-internal-snapshot-v1",
+                "198",
+                "199",
+                "536870912",
+                "extra",
+            ],
+            vec![
+                "prefix",
+                "--stream-server-internal-snapshot-v1",
+                "198",
+                "199",
+                "536870912",
+            ],
+        ];
+
+        for (case, arguments) in cases.into_iter().enumerate() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("unit test executable"))
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "transcoding::runtime::tests::snapshot_worker_helper",
+                    ])
+                    .env(
+                        "STREAM_SERVER_TEST_SNAPSHOT_MALFORMED_CASE",
+                        case.to_string(),
+                    )
+                    .status()
+                    .expect("spawn malformed snapshot helper");
+            assert_eq!(
+                status.code(),
+                Some(2),
+                "malformed helper invocation was not rejected before fd access: {arguments:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -2298,6 +2581,54 @@ mod tests {
     fn macos_local_mount_policy_is_fail_closed() {
         assert!(super::macos_mount_flags_are_local(0x0000_1000, 0x0000_1000));
         assert!(!super::macos_mount_flags_are_local(0, 0x0000_1000));
+    }
+
+    #[test]
+    fn macos_root_component_policy_rejects_parent_and_non_rooted_paths() {
+        assert!(super::macos_root_components_are_strict(
+            std::path::Path::new("/Applications/Jellyfin")
+        ));
+        for unsafe_path in ["/a/../b", "a/b", "/", "/a/./b"] {
+            assert!(
+                !super::macos_root_components_are_strict(std::path::Path::new(unsafe_path)),
+                "unsafe macOS root components were accepted: {unsafe_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_snapshot_reopen_policy_requires_same_device_inode_and_length() {
+        assert!(super::macos_snapshot_reopen_identity_matches(
+            (7, 11, 4096),
+            (7, 11, 4096)
+        ));
+        for reopened in [(8, 11, 4096), (7, 12, 4096), (7, 11, 4095)] {
+            assert!(!super::macos_snapshot_reopen_identity_matches(
+                (7, 11, 4096),
+                reopened
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_snapshot_retains_only_unlinked_read_only_cloexec_identity() {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+        let directory = tempfile::tempdir().expect("snapshot source");
+        let source_path = directory.path().join("ffmpeg");
+        fs::write(&source_path, b"macOS immutable snapshot").expect("write source");
+        let source = fs::File::open(source_path).expect("open source");
+        let snapshot = super::create_immutable_execution_snapshot(&source)
+            .expect("create macOS read-only snapshot");
+        let status = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_GETFL) };
+        let descriptor_flags = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_GETFD) };
+        let metadata = snapshot.metadata().expect("snapshot metadata");
+
+        assert_eq!(status & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(metadata.nlink(), 0);
+        assert_eq!(metadata.len(), 24);
     }
 
     #[test]
@@ -2426,6 +2757,68 @@ mod tests {
                 .ends_with(" (deleted)"),
             "snapshot retained a reachable pathname: {descriptor_path:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_snapshot_descriptor_is_not_inherited_by_unrelated_children() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source_path = directory.path().join("ffmpeg");
+        fs::write(&source_path, b"snapshot executable bytes").expect("write source");
+        let source = fs::File::open(&source_path).expect("open source");
+        let snapshot = super::create_immutable_execution_snapshot(&source)
+            .expect("create app-owned execution snapshot");
+        let inherited_candidate =
+            unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 240) };
+        assert!(inherited_candidate >= 240);
+        let _inherited_candidate = unsafe { OwnedFd::from_raw_fd(inherited_candidate) };
+        let descriptor_path = if cfg!(target_os = "linux") {
+            format!("/proc/self/fd/{inherited_candidate}")
+        } else {
+            format!("/dev/fd/{inherited_candidate}")
+        };
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "test ! -e \"$SNAPSHOT_DESCRIPTOR_PATH\""])
+            .env("SNAPSHOT_DESCRIPTOR_PATH", descriptor_path)
+            .status()
+            .expect("spawn unrelated child");
+
+        assert!(status.success(), "unrelated child inherited snapshot fd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_parent_stages_distinct_cloexec_fds_away_from_fixed_child_targets() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("staging files");
+        let source_path = directory.path().join("source");
+        let destination_path = directory.path().join("destination");
+        fs::write(&source_path, b"source").expect("write source");
+        fs::write(&destination_path, b"").expect("write destination");
+        let source = fs::File::open(source_path).expect("open source");
+        let destination = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(destination_path)
+            .expect("open destination");
+        let staged_source =
+            super::duplicate_snapshot_descriptor_for_child(&source).expect("stage source fd");
+        let staged_destination = super::duplicate_snapshot_descriptor_for_child(&destination)
+            .expect("stage destination fd");
+
+        assert!(staged_source.as_raw_fd() >= 256);
+        assert!(staged_destination.as_raw_fd() >= 256);
+        assert_ne!(staged_source.as_raw_fd(), staged_destination.as_raw_fd());
+        for descriptor in [staged_source.as_raw_fd(), staged_destination.as_raw_fd()] {
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

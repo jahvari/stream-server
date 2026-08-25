@@ -100,6 +100,32 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+#[cfg(windows)]
+struct StableWindowsProcessHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl StableWindowsProcessHandle {
+    fn open(pid: u32) -> windows::core::Result<Self> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+        unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map(Self)
+    }
+
+    fn wait_until_signaled(&self, timeout: Duration) -> bool {
+        use windows::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        (unsafe { WaitForSingleObject(self.0, milliseconds) }) == WAIT_OBJECT_0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StableWindowsProcessHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -429,6 +455,10 @@ fn repeated_runtime_teardown_uses_kill_fallback_then_allows_confirmed_registry_d
         wait_for_file(&child_marker, Duration::from_secs(2));
         let parent_pid = read_pid(&parent_marker);
         let child_pid = read_pid(&child_marker);
+        let parent_handle = StableWindowsProcessHandle::open(parent_pid)
+            .expect("open stable parent identity before teardown");
+        let child_handle = StableWindowsProcessHandle::open(child_pid)
+            .expect("open stable descendant identity before teardown");
 
         runtime.shutdown_timeout(Duration::from_secs(3));
         let drain_runtime = tokio::runtime::Builder::new_current_thread()
@@ -440,11 +470,11 @@ fn repeated_runtime_teardown_uses_kill_fallback_then_allows_confirmed_registry_d
             .expect("registry drain after runtime teardown");
 
         assert!(
-            !process_is_alive(parent_pid),
+            parent_handle.wait_until_signaled(Duration::from_secs(1)),
             "iteration {iteration} left the parent alive"
         );
         assert!(
-            !process_is_alive(child_pid),
+            child_handle.wait_until_signaled(Duration::from_secs(1)),
             "iteration {iteration} left the descendant alive"
         );
         assert_eq!(supervisor.active_processes(), 0);
