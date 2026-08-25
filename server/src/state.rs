@@ -1,4 +1,5 @@
 use crate::routes::system::ServerSettings;
+use crate::transcoding::runtime::TranscodingService;
 use enginefs::EngineFS;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    pub transcoding: Arc<TranscodingService>,
 }
 
 impl AppState {
@@ -40,13 +42,19 @@ impl AppState {
     }
 
     #[allow(unused)]
-    pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
+    pub fn new(
+        engine: Arc<EngineFS>,
+        settings: ServerSettings,
+        config_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
+    ) -> Self {
         let log_dir = config_dir.join("logs");
         Self::new_with_shared_settings_and_log_dir(
             engine,
             Arc::new(RwLock::new(settings)),
             config_dir,
             log_dir,
+            transcoding,
         )
     }
 
@@ -55,9 +63,16 @@ impl AppState {
         engine: Arc<EngineFS>,
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         let log_dir = config_dir.join("logs");
-        Self::new_with_shared_settings_and_log_dir(engine, settings, config_dir, log_dir)
+        Self::new_with_shared_settings_and_log_dir(
+            engine,
+            settings,
+            config_dir,
+            log_dir,
+            transcoding,
+        )
     }
 
     pub fn new_with_shared_settings_and_log_dir(
@@ -65,6 +80,7 @@ impl AppState {
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
         log_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         Self::new_with_shared_settings_log_dir_and_download_engine(
             engine.clone(),
@@ -73,6 +89,7 @@ impl AppState {
             settings,
             config_dir,
             log_dir,
+            transcoding,
         )
     }
 
@@ -83,6 +100,7 @@ impl AppState {
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
         log_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
         let updater = Arc::new(crate::updater::UpdateManager::new(config_dir.clone()));
@@ -103,6 +121,7 @@ impl AppState {
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
+            transcoding,
         }
     }
 

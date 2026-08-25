@@ -99,11 +99,18 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_Kernel",
     "Win32_System_Memory",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Globalization",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 
 [features]

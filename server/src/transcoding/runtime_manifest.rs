@@ -59,12 +59,26 @@ pub enum RuntimeHost {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     InvalidManifest(&'static str),
+    UnsafePath,
+    Unavailable,
+    ProbeFailed,
+    ProbeDeadline,
+    IncompatiblePair,
+    RuntimeChanged,
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidManifest(reason) => write!(f, "invalid runtime manifest: {reason}"),
+            Self::UnsafePath => f.write_str("runtime path is not a trusted local install"),
+            Self::Unavailable => f.write_str("no compatible FFmpeg runtime is available"),
+            Self::ProbeFailed => f.write_str("FFmpeg runtime identity probe failed"),
+            Self::ProbeDeadline => {
+                f.write_str("FFmpeg runtime identity probe exceeded its deadline")
+            }
+            Self::IncompatiblePair => f.write_str("FFmpeg executable pair is incompatible"),
+            Self::RuntimeChanged => f.write_str("FFmpeg runtime changed after validation"),
         }
     }
 }
