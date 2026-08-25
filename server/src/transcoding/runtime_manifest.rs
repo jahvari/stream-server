@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, path::Path};
 use url::Url;
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -18,7 +18,7 @@ pub struct RuntimeArtifact {
     url: Url,
     sha256: String,
     max_bytes: u64,
-    required_paths: Vec<String>,
+    required_paths: Vec<RelativeArchivePath>,
     version_matchers: VersionOutputMatchers,
     license_url: Url,
     source_url: Url,
@@ -45,6 +45,9 @@ pub struct PeVersion {
     major: u16,
     minor: u16,
 }
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RelativeArchivePath(String);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeHost {
@@ -123,7 +126,7 @@ impl RuntimeArtifact {
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
-    pub fn required_paths(&self) -> &[String] {
+    pub fn required_paths(&self) -> &[RelativeArchivePath] {
         &self.required_paths
     }
     pub fn version_matchers(&self) -> &VersionOutputMatchers {
@@ -174,6 +177,15 @@ impl PeVersion {
         self.major != 0 || self.minor != 0
     }
 }
+impl RelativeArchivePath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
 
 impl TryFrom<RawArtifact> for RuntimeArtifact {
     type Error = RuntimeError;
@@ -212,13 +224,20 @@ impl TryFrom<RawArtifact> for RuntimeArtifact {
         }
         let required_paths = validate_required_paths(raw.required_paths)?;
         for required in ["ffmpeg.exe", "ffprobe.exe"] {
-            if !required_paths.iter().any(|path| path == required) {
+            if !required_paths.iter().any(|path| path.as_str() == required) {
                 return Err(RuntimeError::InvalidManifest("required executable missing"));
             }
         }
+        let expected_version_matcher = format!("{}-Jellyfin", raw.ffmpeg_version);
         let version_matchers = VersionOutputMatchers {
-            ffmpeg: validate_version_matcher(raw.version_matchers.ffmpeg)?,
-            ffprobe: validate_version_matcher(raw.version_matchers.ffprobe)?,
+            ffmpeg: validate_release_version_matcher(
+                raw.version_matchers.ffmpeg,
+                &expected_version_matcher,
+            )?,
+            ffprobe: validate_release_version_matcher(
+                raw.version_matchers.ffprobe,
+                &expected_version_matcher,
+            )?,
         };
         let license_url = parse_github_url(&raw.license_url)?;
         if license_url.path()
@@ -303,13 +322,13 @@ fn is_lowercase_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte <= b'f'))
 }
-fn validate_version_matcher(value: String) -> Result<String, RuntimeError> {
-    if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+fn validate_release_version_matcher(value: String, expected: &str) -> Result<String, RuntimeError> {
+    if value != expected {
         return Err(RuntimeError::InvalidManifest("invalid version matcher"));
     }
     Ok(value)
 }
-fn validate_required_paths(paths: Vec<String>) -> Result<Vec<String>, RuntimeError> {
+fn validate_required_paths(paths: Vec<String>) -> Result<Vec<RelativeArchivePath>, RuntimeError> {
     if paths.is_empty() {
         return Err(RuntimeError::InvalidManifest("no required archive paths"));
     }
@@ -323,7 +342,7 @@ fn validate_required_paths(paths: Vec<String>) -> Result<Vec<String>, RuntimeErr
     }
     Ok(normalized.into_iter().collect())
 }
-fn normalize_archive_path(path: &str) -> Result<String, RuntimeError> {
+fn normalize_archive_path(path: &str) -> Result<RelativeArchivePath, RuntimeError> {
     if path.is_empty()
         || path.len() > 240
         || path.starts_with('/')
@@ -350,7 +369,7 @@ fn normalize_archive_path(path: &str) -> Result<String, RuntimeError> {
     if normalized.ends_with(".lnk") {
         return Err(RuntimeError::InvalidManifest("link archive path"));
     }
-    Ok(normalized)
+    Ok(RelativeArchivePath(normalized))
 }
 fn is_windows_device_name(component: &str) -> bool {
     let stem = component
@@ -413,15 +432,16 @@ struct RawPeVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeHost, RuntimeManifest};
+    use super::{RelativeArchivePath, RuntimeHost, RuntimeManifest};
     use serde_json::{Value, json};
+    use std::path::Path;
 
     fn manifest() -> Value {
         json!({ "schemaVersion": 1, "entries": [{
             "platform": "windows", "arch": "x86_64", "ffmpegVersion": "7.1.4", "jellyfinRevision": "3",
             "url": "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.4-3/jellyfin-ffmpeg_7.1.4-3_portable_win64-clang-gpl.zip",
             "sha256": "113adeb702683c38be40a65d859f8ef7ffb07bae9df16dfb6c3df5ac3d95ef3c", "maxBytes": 60257737,
-            "requiredPaths": ["ffmpeg.exe", "ffprobe.exe"], "versionMatchers": { "ffmpeg": "-Jellyfin", "ffprobe": "-Jellyfin" },
+            "requiredPaths": ["ffmpeg.exe", "ffprobe.exe"], "versionMatchers": { "ffmpeg": "7.1.4-Jellyfin", "ffprobe": "7.1.4-Jellyfin" },
             "licenseUrl": "https://github.com/jellyfin/jellyfin-ffmpeg/blob/v7.1.4-3/LICENSE", "sourceUrl": "https://github.com/jellyfin/jellyfin-ffmpeg/tree/v7.1.4-3", "sourceTag": "v7.1.4-3",
             "minimumPlatform": { "windows": { "minimumOperatingSystemVersion": { "major": 6, "minor": 0 }, "minimumSubsystemVersion": { "major": 6, "minor": 0 } } }
         }]})
@@ -500,6 +520,12 @@ mod tests {
             value["entries"][0]["sha256"] = json!(digest);
             assert!(parse(value).is_err(), "accepted {digest}");
         }
+    }
+    #[test]
+    fn rejects_version_matchers_that_do_not_pin_the_declared_release() {
+        let mut value = manifest();
+        value["entries"][0]["versionMatchers"]["ffmpeg"] = json!("7.1.3-Jellyfin");
+        assert!(parse(value).is_err());
     }
     #[test]
     fn rejects_an_archive_bound_above_512_mib() {
@@ -585,5 +611,14 @@ mod tests {
                 .artifact_for_host(RuntimeHost::MacOsArm64)
                 .is_none()
         );
+    }
+    #[test]
+    fn runtime_artifact_exposes_validated_relative_paths() {
+        let manifest = RuntimeManifest::embedded().unwrap();
+        let artifact = manifest.artifact_for_host(RuntimeHost::WindowsX64).unwrap();
+        let path: &RelativeArchivePath = &artifact.required_paths()[0];
+
+        assert_eq!(path.as_str(), "ffmpeg.exe");
+        assert_eq!(path.as_path(), Path::new("ffmpeg.exe"));
     }
 }
