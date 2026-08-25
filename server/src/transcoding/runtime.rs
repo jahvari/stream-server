@@ -7,7 +7,7 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -30,6 +30,7 @@ const SUPPORTED_FFMPEG_VERSION: &str = "7.1.4";
 const SUPPORTED_JELLYFIN_MATCHER: &str = "7.1.4-Jellyfin";
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const HASH_DEADLINE: Duration = Duration::from_secs(10);
+const HASH_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_PATH_CANDIDATES: usize = 64;
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -213,12 +214,11 @@ impl VerifiedRuntimeSession {
         }
         let executable_path = match executable {
             RuntimeExecutable::Ffmpeg => {
-                bound_execution_path(&execution_lease.lease.ffmpeg.file, &execution_lease.ffmpeg)
+                bound_execution_path(&self.runtime.lease.ffmpeg.file, &self.runtime.ffmpeg)
             }
-            RuntimeExecutable::Ffprobe => bound_execution_path(
-                &execution_lease.lease.ffprobe.file,
-                &execution_lease.ffprobe,
-            ),
+            RuntimeExecutable::Ffprobe => {
+                bound_execution_path(&self.runtime.lease.ffprobe.file, &self.runtime.ffprobe)
+            }
         }
         .map_err(|_| RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged))?;
         let current_dir =
@@ -371,6 +371,10 @@ struct RuntimeLease {
 
 #[derive(Debug)]
 struct FileLease {
+    source_file: Arc<File>,
+    /// Exact immutable bytes used for Unix probe/session execution. Windows
+    /// uses the source handle because its share mode pins file identity and
+    /// prevents write/delete replacement while the lease is alive.
     file: Arc<File>,
     seal: FileSeal,
 }
@@ -425,12 +429,27 @@ struct HashTestObserver {
     max_active: AtomicUsize,
     total: AtomicUsize,
     paused: AtomicBool,
+    admission_deadline_millis: AtomicU64,
 }
 
 #[cfg(test)]
 impl HashTestObserver {
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Release);
+    }
+
+    fn set_admission_deadline(&self, deadline: Duration) {
+        self.admission_deadline_millis.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    fn admission_deadline(&self) -> Duration {
+        match self.admission_deadline_millis.load(Ordering::Acquire) {
+            0 => HASH_ADMISSION_DEADLINE,
+            milliseconds => Duration::from_millis(milliseconds),
+        }
     }
 
     fn snapshot(&self) -> (usize, usize) {
@@ -790,8 +809,8 @@ async fn probe_pair(
     if ffmpeg_configuration != ffprobe_configuration {
         return Err(CandidateFailure::Incompatible);
     }
-    let ffmpeg_after = metadata_seal_open_file(&lease.ffmpeg.file, ffmpeg_before.digest)?;
-    let ffprobe_after = metadata_seal_open_file(&lease.ffprobe.file, ffprobe_before.digest)?;
+    let ffmpeg_after = metadata_seal_open_file(&lease.ffmpeg.source_file, ffmpeg_before.digest)?;
+    let ffprobe_after = metadata_seal_open_file(&lease.ffprobe.source_file, ffprobe_before.digest)?;
     if ffmpeg_before != ffmpeg_after || ffprobe_before != ffprobe_after {
         return Err(CandidateFailure::Unsafe);
     }
@@ -982,6 +1001,7 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[derive(Clone, Copy)]
 enum FdNamespace {
     ProcSelf,
+    DevFd,
     Unsupported,
 }
 
@@ -992,6 +1012,7 @@ fn render_fd_path(namespace: FdNamespace, descriptor: i32) -> Option<PathBuf> {
     }
     match namespace {
         FdNamespace::ProcSelf => Some(PathBuf::from(format!("/proc/self/fd/{descriptor}"))),
+        FdNamespace::DevFd => Some(PathBuf::from(format!("/dev/fd/{descriptor}"))),
         FdNamespace::Unsupported => None,
     }
 }
@@ -1010,8 +1031,9 @@ fn bound_execution_path(file: &File, canonical_path: &Path) -> Result<PathBuf, C
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let _ = (file, canonical_path);
-        render_fd_path(FdNamespace::Unsupported, -1).ok_or(CandidateFailure::Probe)
+        use std::os::fd::AsRawFd;
+        let _ = canonical_path;
+        render_fd_path(FdNamespace::DevFd, file.as_raw_fd()).ok_or(CandidateFailure::Probe)
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -1022,23 +1044,38 @@ fn bound_execution_path(file: &File, canonical_path: &Path) -> Result<PathBuf, C
 
 async fn open_pair_lease(root: PathBuf, mode: OpenMode) -> Result<OpenedPair, CandidateFailure> {
     static HASH_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    #[cfg(test)]
+    let admission_deadline = match &mode {
+        OpenMode::FullObserved(observer) => observer.admission_deadline(),
+        _ => HASH_ADMISSION_DEADLINE,
+    };
+    #[cfg(not(test))]
+    let admission_deadline = HASH_ADMISSION_DEADLINE;
     let _hash_permit = match &mode {
         OpenMode::Full => Some(
-            HASH_ADMISSION
-                .get_or_init(|| Arc::new(Semaphore::new(1)))
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| CandidateFailure::Unsafe)?,
+            tokio::time::timeout(
+                admission_deadline,
+                HASH_ADMISSION
+                    .get_or_init(|| Arc::new(Semaphore::new(1)))
+                    .clone()
+                    .acquire_owned(),
+            )
+            .await
+            .map_err(|_| CandidateFailure::Deadline)?
+            .map_err(|_| CandidateFailure::Unsafe)?,
         ),
         #[cfg(test)]
         OpenMode::FullObserved(_) => Some(
-            HASH_ADMISSION
-                .get_or_init(|| Arc::new(Semaphore::new(1)))
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| CandidateFailure::Unsafe)?,
+            tokio::time::timeout(
+                admission_deadline,
+                HASH_ADMISSION
+                    .get_or_init(|| Arc::new(Semaphore::new(1)))
+                    .clone()
+                    .acquire_owned(),
+            )
+            .await
+            .map_err(|_| CandidateFailure::Deadline)?
+            .map_err(|_| CandidateFailure::Unsafe)?,
         ),
         OpenMode::MetadataOnly { .. } => None,
     };
@@ -1059,13 +1096,15 @@ fn open_pair_lease_blocking_with_hook(
     mode: OpenMode,
     after_root_opened: impl FnOnce(),
 ) -> Result<OpenedPair, CandidateFailure> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let root_file = open_local_root(root)?;
     #[cfg(target_os = "linux")]
     let root = final_linux_handle_path(&root_file)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let root = final_macos_handle_path(&root_file)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let root = canonical_local_root(root)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let root_file = open_local_root(&root)?;
     let root_metadata = root_file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
     if !root_metadata.is_dir() || opened_handle_is_reparse(&root_file)? {
@@ -1082,6 +1121,10 @@ fn open_pair_lease_blocking_with_hook(
     if !linux_file_is_local(&root_file)? {
         return Err(CandidateFailure::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    if !macos_file_is_local(&root_file)? {
+        return Err(CandidateFailure::Unsafe);
+    }
     after_root_opened();
     let root_identity = file_identity(&root_file, &root_metadata)?;
     let ffmpeg = root.join(executable_name("ffmpeg"));
@@ -1096,25 +1139,23 @@ fn open_pair_lease_blocking_with_hook(
         &root,
         executable_name("ffprobe"),
     )?);
-    validate_opened_child(&ffmpeg_file, &ffmpeg, &root)?;
-    validate_opened_child(&ffprobe_file, &ffprobe, &root)?;
-    let (ffmpeg_seal, ffprobe_seal) = match mode {
-        OpenMode::Full => (
-            seal_open_file(&ffmpeg_file, None)?,
-            seal_open_file(&ffprobe_file, None)?,
-        ),
+    validate_opened_child(&ffmpeg_file, &ffmpeg, &root, &root_file)?;
+    validate_opened_child(&ffprobe_file, &ffprobe, &root, &root_file)?;
+    let ffmpeg_lease = match &mode {
+        OpenMode::Full => full_file_lease(ffmpeg_file, None)?,
         #[cfg(test)]
-        OpenMode::FullObserved(observer) => (
-            seal_open_file(&ffmpeg_file, Some(&observer))?,
-            seal_open_file(&ffprobe_file, Some(&observer))?,
-        ),
-        OpenMode::MetadataOnly {
-            ffmpeg_digest,
-            ffprobe_digest,
-        } => (
-            metadata_seal_open_file(&ffmpeg_file, ffmpeg_digest)?,
-            metadata_seal_open_file(&ffprobe_file, ffprobe_digest)?,
-        ),
+        OpenMode::FullObserved(observer) => full_file_lease(ffmpeg_file, Some(observer.as_ref()))?,
+        OpenMode::MetadataOnly { ffmpeg_digest, .. } => {
+            metadata_file_lease(ffmpeg_file, *ffmpeg_digest)?
+        }
+    };
+    let ffprobe_lease = match &mode {
+        OpenMode::Full => full_file_lease(ffprobe_file, None)?,
+        #[cfg(test)]
+        OpenMode::FullObserved(observer) => full_file_lease(ffprobe_file, Some(observer.as_ref()))?,
+        OpenMode::MetadataOnly { ffprobe_digest, .. } => {
+            metadata_file_lease(ffprobe_file, *ffprobe_digest)?
+        }
     };
     Ok(OpenedPair {
         root: root.clone(),
@@ -1124,15 +1165,58 @@ fn open_pair_lease_blocking_with_hook(
             root,
             _root_file: Arc::new(root_file),
             root_identity,
-            ffmpeg: FileLease {
-                file: ffmpeg_file,
-                seal: ffmpeg_seal,
-            },
-            ffprobe: FileLease {
-                file: ffprobe_file,
-                seal: ffprobe_seal,
-            },
+            ffmpeg: ffmpeg_lease,
+            ffprobe: ffprobe_lease,
         },
+    })
+}
+
+fn full_file_lease(
+    source_file: Arc<File>,
+    #[cfg(test)] observer: Option<&HashTestObserver>,
+    #[cfg(not(test))] _observer: Option<&()>,
+) -> Result<FileLease, CandidateFailure> {
+    #[cfg(unix)]
+    {
+        let snapshot = create_verified_execution_snapshot(
+            &source_file,
+            #[cfg(test)]
+            observer,
+            #[cfg(not(test))]
+            _observer,
+        )?;
+        return Ok(FileLease {
+            source_file,
+            file: Arc::new(snapshot.file),
+            seal: snapshot.seal,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let seal = seal_open_file(
+            &source_file,
+            #[cfg(test)]
+            observer,
+            #[cfg(not(test))]
+            _observer,
+        )?;
+        Ok(FileLease {
+            source_file: source_file.clone(),
+            file: source_file,
+            seal,
+        })
+    }
+}
+
+fn metadata_file_lease(
+    source_file: Arc<File>,
+    expected_digest: [u8; 32],
+) -> Result<FileLease, CandidateFailure> {
+    let seal = metadata_seal_open_file(&source_file, expected_digest)?;
+    Ok(FileLease {
+        source_file: source_file.clone(),
+        file: source_file,
+        seal,
     })
 }
 
@@ -1226,30 +1310,41 @@ fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File,
             root_file.as_raw_fd(),
             std::ffi::OsStr::new(name),
             libc::O_RDONLY | libc::O_CLOEXEC,
-            LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS,
+            linux_child_resolve_flags(),
         );
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let path = root.join(name);
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let mut options = fs::OpenOptions::new();
-    #[cfg(not(any(windows, target_os = "linux")))]
-    options.read(true);
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = (root_file, path);
-        return Err(CandidateFailure::Unsafe);
-    }
-    #[cfg(not(any(windows, unix)))]
-    let _ = root_file;
-    #[cfg(not(any(windows, target_os = "linux")))]
-    options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            CandidateFailure::Missing
-        } else {
-            CandidateFailure::Unsafe
+        use std::{ffi::CString, os::fd::AsRawFd, os::fd::FromRawFd};
+
+        let _ = root;
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            return Err(CandidateFailure::Unsafe);
         }
-    })
+        let name = CString::new(name.as_bytes()).map_err(|_| CandidateFailure::Unsafe)?;
+        let descriptor = unsafe {
+            libc::openat(
+                root_file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                    CandidateFailure::Missing
+                } else {
+                    CandidateFailure::Unsafe
+                },
+            );
+        }
+        return Ok(unsafe { File::from_raw_fd(descriptor) });
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root_file, root, name);
+        Err(CandidateFailure::Unsafe)
+    }
 }
 
 fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
@@ -1278,9 +1373,13 @@ fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
             LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS,
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        return open_macos_root_components(path);
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     let mut options = fs::OpenOptions::new();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     options.read(true);
     #[cfg(windows)]
     {
@@ -1292,21 +1391,79 @@ fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0);
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    return Err(CandidateFailure::Unsafe);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     options.open(path).map_err(|_| CandidateFailure::Unsafe)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn open_macos_root_components(path: &Path) -> Result<File, CandidateFailure> {
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    };
+
+    if !path.is_absolute() {
+        return Err(CandidateFailure::Unsafe);
+    }
+    let mut directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|_| CandidateFailure::Unsafe)?;
+    let mut opened_component = false;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        opened_component = true;
+        let component = CString::new(component.as_bytes()).map_err(|_| CandidateFailure::Unsafe)?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(CandidateFailure::Unsafe);
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    if !opened_component {
+        return Err(CandidateFailure::Unsafe);
+    }
+    Ok(directory)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;
+#[cfg(any(test, target_os = "linux"))]
 const LINUX_RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 const LINUX_RESOLVE_NO_SYMLINKS: u64 = 0x04;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 const LINUX_RESOLVE_BENEATH: u64 = 0x08;
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_child_resolve_flags() -> u64 {
+    LINUX_RESOLVE_NO_XDEV
+        | LINUX_RESOLVE_BENEATH
+        | LINUX_RESOLVE_NO_MAGICLINKS
+        | LINUX_RESOLVE_NO_SYMLINKS
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_mount_identity_matches(root_device: u64, child_device: u64) -> bool {
+    root_device == child_device
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_mount_flags_are_local(flags: u64, local_flag: u64) -> bool {
+    flags & local_flag != 0
+}
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -1367,6 +1524,22 @@ fn final_linux_handle_path(file: &File) -> Result<PathBuf, CandidateFailure> {
     Ok(path)
 }
 
+#[cfg(target_os = "macos")]
+fn final_macos_handle_path(file: &File) -> Result<PathBuf, CandidateFailure> {
+    use std::{ffi::CStr, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+
+    let mut buffer = vec![0_i8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } != 0 {
+        return Err(CandidateFailure::Unsafe);
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    let path = PathBuf::from(OsStr::from_bytes(bytes));
+    if !path.is_absolute() {
+        return Err(CandidateFailure::Unsafe);
+    }
+    Ok(path)
+}
+
 fn opened_handle_is_reparse(file: &File) -> Result<bool, CandidateFailure> {
     #[cfg(windows)]
     {
@@ -1394,7 +1567,10 @@ fn validate_opened_child(
     file: &File,
     expected: &Path,
     root: &Path,
+    root_file: &File,
 ) -> Result<(), CandidateFailure> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = root_file;
     if !file
         .metadata()
         .map_err(|_| CandidateFailure::Unsafe)?
@@ -1410,8 +1586,28 @@ fn validate_opened_child(
             return Err(CandidateFailure::Unsafe);
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root_metadata = root_file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        let child_metadata = file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        if !linux_file_is_local(file)?
+            || !linux_mount_identity_matches(root_metadata.dev(), child_metadata.dev())
+        {
+            return Err(CandidateFailure::Unsafe);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root_metadata = root_file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        let child_metadata = file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+        if !macos_file_is_local(file)? || root_metadata.dev() != child_metadata.dev() {
+            return Err(CandidateFailure::Unsafe);
+        }
+    }
     #[cfg(not(windows))]
-    let _ = (expected, root);
+    let _ = (expected, root, root_file);
     Ok(())
 }
 
@@ -1461,6 +1657,21 @@ fn linux_file_is_local(file: &File) -> Result<bool, CandidateFailure> {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn macos_file_is_local(file: &File) -> Result<bool, CandidateFailure> {
+    use std::os::fd::AsRawFd;
+
+    let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
+        return Err(CandidateFailure::Unsafe);
+    }
+    let statistics = unsafe { statistics.assume_init() };
+    Ok(macos_mount_flags_are_local(
+        statistics.f_flags as u64,
+        libc::MNT_LOCAL as u64,
+    ))
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn linux_filesystem_type_is_allowed_local(filesystem_type: i64) -> bool {
     matches!(
@@ -1482,6 +1693,252 @@ fn linux_filesystem_type_is_allowed_local(filesystem_type: i64) -> bool {
             | 0x5346_544e // NTFS/NTFS3
             | 0x6175_6673 // aufs
     )
+}
+
+#[cfg(any(unix, test))]
+struct ImmutableExecutionSnapshot {
+    file: File,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    seal: FileSeal,
+}
+
+#[cfg(any(unix, test))]
+fn create_snapshot_file() -> Result<(File, Option<(tempfile::TempDir, PathBuf)>), CandidateFailure>
+{
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::fd::FromRawFd};
+
+        let name = CString::new("stream-server-ffmpeg").expect("static memfd name has no nul");
+        let descriptor = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            ) as i32
+        };
+        if descriptor < 0 {
+            return Err(CandidateFailure::Unsafe);
+        }
+        return Ok((unsafe { File::from_raw_fd(descriptor) }, None));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let directory = tempfile::tempdir().map_err(|_| CandidateFailure::Unsafe)?;
+        let path = directory.path().join("execution-snapshot");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).map_err(|_| CandidateFailure::Unsafe)?;
+            drop(directory);
+            return Ok((file, None));
+        }
+        #[cfg(not(unix))]
+        Ok((file, Some((directory, path))))
+    }
+}
+
+#[cfg(any(unix, test))]
+fn create_verified_execution_snapshot(
+    source: &File,
+    #[cfg(test)] observer: Option<&HashTestObserver>,
+    #[cfg(not(test))] _observer: Option<&()>,
+) -> Result<ImmutableExecutionSnapshot, CandidateFailure> {
+    let metadata_before = source.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+    if !metadata_before.is_file() || metadata_before.len() > MAX_EXECUTABLE_BYTES {
+        return Err(CandidateFailure::Unsafe);
+    }
+    let identity = file_identity(source, &metadata_before)?;
+    #[cfg(test)]
+    let _observation = observer.map(HashObservation::start);
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        while observer.paused.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let (mut writer, temporary_path) = create_snapshot_file()?;
+    #[cfg(unix)]
+    let (length, digest) = run_snapshot_helper(source, &writer)?;
+    #[cfg(not(unix))]
+    let (length, digest) = copy_snapshot_in_process(source, &mut writer)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        writer
+            .set_permissions(fs::Permissions::from_mode(0o500))
+            .map_err(|_| CandidateFailure::Unsafe)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+            return Err(CandidateFailure::Unsafe);
+        }
+    }
+    if let Some((directory, path)) = temporary_path {
+        fs::remove_file(&path).map_err(|_| CandidateFailure::Unsafe)?;
+        drop(directory);
+    }
+    writer
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| CandidateFailure::Unsafe)?;
+    let metadata_after = source.metadata().map_err(|_| CandidateFailure::Unsafe)?;
+    if metadata_before.len() != metadata_after.len()
+        || metadata_before.modified().ok() != metadata_after.modified().ok()
+        || identity != file_identity(source, &metadata_after)?
+        || length != metadata_after.len()
+    {
+        return Err(CandidateFailure::Unsafe);
+    }
+    Ok(ImmutableExecutionSnapshot {
+        file: writer,
+        seal: FileSeal {
+            length,
+            modified: metadata_after.modified().ok(),
+            digest,
+            identity,
+        },
+    })
+}
+
+#[cfg(all(test, not(unix)))]
+fn copy_snapshot_in_process(
+    source: &File,
+    writer: &mut File,
+) -> Result<(u64, [u8; 32]), CandidateFailure> {
+    use std::io::Write;
+
+    let expires = Instant::now() + HASH_DEADLINE;
+    let mut reader = source.try_clone().map_err(|_| CandidateFailure::Unsafe)?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| CandidateFailure::Unsafe)?;
+    let mut hasher = Sha256::new();
+    let mut length = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if Instant::now() >= expires {
+            return Err(CandidateFailure::Deadline);
+        }
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        if count == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        hasher.update(&buffer[..count]);
+        length = length
+            .checked_add(u64::try_from(count).map_err(|_| CandidateFailure::Unsafe)?)
+            .ok_or(CandidateFailure::Unsafe)?;
+        if length > MAX_EXECUTABLE_BYTES {
+            return Err(CandidateFailure::Unsafe);
+        }
+    }
+    writer.flush().map_err(|_| CandidateFailure::Unsafe)?;
+    writer.sync_all().map_err(|_| CandidateFailure::Unsafe)?;
+    Ok((length, hasher.finalize().into()))
+}
+
+#[cfg(unix)]
+fn run_snapshot_helper(
+    source: &File,
+    destination: &File,
+) -> Result<(u64, [u8; 32]), CandidateFailure> {
+    use std::{
+        os::{fd::AsRawFd, unix::process::CommandExt},
+        process::{Command, Stdio},
+    };
+
+    let source_descriptor = source.as_raw_fd();
+    let destination_descriptor = destination.as_raw_fd();
+    let mut helper_descriptors = (198_i32..=255).filter(|descriptor| {
+        *descriptor != source_descriptor && *descriptor != destination_descriptor
+    });
+    let helper_source = helper_descriptors.next().ok_or(CandidateFailure::Unsafe)?;
+    let helper_destination = helper_descriptors.next().ok_or(CandidateFailure::Unsafe)?;
+    let mut command = Command::new(std::env::current_exe().map_err(|_| CandidateFailure::Unsafe)?);
+    #[cfg(test)]
+    command.args([
+        "--ignored",
+        "--exact",
+        "transcoding::runtime::tests::snapshot_worker_helper",
+        "--",
+    ]);
+    command.args([
+        super::snapshot_helper::SNAPSHOT_HELPER_ARGUMENT.to_owned(),
+        helper_source.to_string(),
+        helper_destination.to_string(),
+        MAX_EXECUTABLE_BYTES.to_string(),
+    ]);
+    command
+        .current_dir("/")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source_descriptor, helper_source) < 0
+                || libc::dup2(destination_descriptor, helper_destination) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|_| CandidateFailure::Unsafe)?;
+    let expires = Instant::now() + HASH_DEADLINE;
+    loop {
+        match child.try_wait().map_err(|_| CandidateFailure::Unsafe)? {
+            Some(status) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|_| CandidateFailure::Unsafe)?;
+                if !status.success() || output.stdout.len() > 96 {
+                    return Err(CandidateFailure::Unsafe);
+                }
+                let text = std::str::from_utf8(&output.stdout)
+                    .map_err(|_| CandidateFailure::Unsafe)?
+                    .trim();
+                let (length, digest) = text.split_once(':').ok_or(CandidateFailure::Unsafe)?;
+                let length = length
+                    .parse::<u64>()
+                    .map_err(|_| CandidateFailure::Unsafe)?;
+                let digest = hex::decode(digest).map_err(|_| CandidateFailure::Unsafe)?;
+                let digest: [u8; 32] = digest.try_into().map_err(|_| CandidateFailure::Unsafe)?;
+                return Ok((length, digest));
+            }
+            None if Instant::now() < expires => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CandidateFailure::Deadline);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn create_immutable_execution_snapshot(source: &File) -> Result<File, CandidateFailure> {
+    create_verified_execution_snapshot(
+        source,
+        #[cfg(test)]
+        None,
+        #[cfg(not(test))]
+        None,
+    )
+    .map(|snapshot| snapshot.file)
 }
 
 fn seal_open_file(
@@ -1509,13 +1966,22 @@ fn seal_open_file(
         .map_err(|_| CandidateFailure::Unsafe)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
+    #[cfg(windows)]
+    let io_deadline = WindowsIoDeadline::new(HASH_DEADLINE)?;
     loop {
         if Instant::now() >= expires {
             return Err(CandidateFailure::Deadline);
         }
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|_| CandidateFailure::Unsafe)?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            #[cfg(windows)]
+            Err(_) if io_deadline.timed_out() => return Err(CandidateFailure::Deadline),
+            Err(_) => return Err(CandidateFailure::Unsafe),
+        };
+        #[cfg(windows)]
+        if io_deadline.timed_out() {
+            return Err(CandidateFailure::Deadline);
+        }
         if count == 0 {
             break;
         }
@@ -1534,6 +2000,89 @@ fn seal_open_file(
         digest: hasher.finalize().into(),
         identity,
     })
+}
+
+#[cfg(windows)]
+struct WindowsIoDeadline {
+    completed: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    timed_out: Arc<AtomicBool>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl WindowsIoDeadline {
+    fn new(deadline: Duration) -> Result<Self, CandidateFailure> {
+        use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
+
+        let thread = unsafe { OpenThread(THREAD_TERMINATE, false, GetCurrentThreadId()) }
+            .map_err(|_| CandidateFailure::Unsafe)?;
+        let thread_value = thread.0 as usize;
+        let completed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let watchdog_completed = completed.clone();
+        let watchdog_timed_out = timed_out.clone();
+        let watchdog = std::thread::Builder::new()
+            .name("verification-io-deadline".to_owned())
+            .spawn(move || {
+                use windows::Win32::{
+                    Foundation::{CloseHandle, HANDLE},
+                    System::IO::CancelSynchronousIo,
+                };
+
+                let thread = HANDLE(thread_value as *mut std::ffi::c_void);
+
+                let (lock, wake) = &*watchdog_completed;
+                let complete = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (complete, wait) = wake
+                    .wait_timeout_while(complete, deadline, |complete| !*complete)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !*complete && wait.timed_out() {
+                    watchdog_timed_out.store(true, Ordering::Release);
+                    let _ = unsafe { CancelSynchronousIo(thread) };
+                }
+                let _ = unsafe { CloseHandle(thread) };
+            })
+            .map_err(|_| {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(thread) };
+                CandidateFailure::Unsafe
+            })?;
+        Ok(Self {
+            completed,
+            timed_out,
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsIoDeadline {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.completed;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_one();
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+fn windows_cancellable_read_for_test(
+    file: &File,
+    deadline: Duration,
+) -> Result<(), CandidateFailure> {
+    let io_deadline = WindowsIoDeadline::new(deadline)?;
+    let mut reader = file;
+    let mut byte = [0_u8; 1];
+    match reader.read(&mut byte) {
+        Ok(_) => Ok(()),
+        Err(_) if io_deadline.timed_out() => Err(CandidateFailure::Deadline),
+        Err(_) => Err(CandidateFailure::Unsafe),
+    }
 }
 
 #[cfg(test)]
@@ -1698,6 +2247,16 @@ mod tests {
     };
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned only as the killable immutable snapshot worker"]
+    fn snapshot_worker_helper() {
+        assert_eq!(
+            super::super::snapshot_helper::maybe_run_from_environment(),
+            Some(0)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn mapped_remote_drive_type_is_rejected_by_local_path_policy() {
@@ -1723,6 +2282,269 @@ mod tests {
                 filesystem_type
             ));
         }
+    }
+
+    #[test]
+    fn linux_child_open_policy_forbids_mount_crossing() {
+        let flags = super::linux_child_resolve_flags();
+        assert_ne!(flags & super::LINUX_RESOLVE_NO_XDEV, 0);
+        assert_ne!(flags & super::LINUX_RESOLVE_BENEATH, 0);
+        assert_ne!(flags & super::LINUX_RESOLVE_NO_SYMLINKS, 0);
+        assert!(super::linux_mount_identity_matches(41, 41));
+        assert!(!super::linux_mount_identity_matches(41, 42));
+    }
+
+    #[test]
+    fn macos_local_mount_policy_is_fail_closed() {
+        assert!(super::macos_mount_flags_are_local(0x0000_1000, 0x0000_1000));
+        assert!(!super::macos_mount_flags_are_local(0, 0x0000_1000));
+    }
+
+    #[test]
+    fn dev_fd_command_paths_are_absolute_and_platform_namespaced() {
+        assert_eq!(
+            render_fd_path(FdNamespace::DevFd, 17),
+            Some(PathBuf::from("/dev/fd/17"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_child_open_remains_bound_to_the_held_root_after_namespace_swap() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().expect("macOS root-relative open root");
+        let root = directory.path().join("approved");
+        let moved = directory.path().join("moved-approved");
+        fs::create_dir(&root).expect("create approved root");
+        fs::write(root.join("ffmpeg"), b"original-root").expect("write original marker");
+        let held_root = super::open_local_root(&root).expect("hold root descriptor");
+        fs::rename(&root, &moved).expect("move held root namespace");
+        fs::create_dir(&root).expect("replace root namespace");
+        fs::write(root.join("ffmpeg"), b"replacement-root").expect("write replacement marker");
+
+        let mut opened = super::open_local_file_at(&held_root, &root, "ffmpeg")
+            .expect("open through held root descriptor");
+        let mut marker = String::new();
+        opened.read_to_string(&mut marker).expect("read marker");
+
+        assert_eq!(marker, "original-root");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_open_rejects_a_symlinked_ancestor_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("macOS ancestor root");
+        let real_namespace = directory.path().join("real-namespace");
+        let real_root = real_namespace.join("approved");
+        let linked_namespace = directory.path().join("linked-namespace");
+        fs::create_dir_all(&real_root).expect("create real root");
+        symlink(&real_namespace, &linked_namespace).expect("link ancestor namespace");
+
+        let error = super::open_local_root(&linked_namespace.join("approved"))
+            .expect_err("component open must reject a symlinked ancestor");
+
+        assert!(matches!(error, CandidateFailure::Unsafe));
+    }
+
+    #[test]
+    fn immutable_execution_snapshot_does_not_change_when_source_bytes_change() {
+        use std::io::{Read, Seek, Write};
+
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source_path = directory.path().join("ffmpeg");
+        fs::write(&source_path, b"original-bytes").expect("write original source");
+        let source = fs::File::open(&source_path).expect("open original source");
+        let mut snapshot = super::create_immutable_execution_snapshot(&source)
+            .expect("create app-owned execution snapshot");
+
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&source_path)
+            .expect("open source for same-length replacement")
+            .write_all(b"replaced-bytes")
+            .expect("replace source bytes");
+        snapshot
+            .seek(std::io::SeekFrom::Start(0))
+            .expect("rewind snapshot");
+        let mut bytes = Vec::new();
+        snapshot.read_to_end(&mut bytes).expect("read snapshot");
+
+        assert_eq!(bytes, b"original-bytes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kernel_blocked_windows_verification_read_is_cancelled_at_its_own_deadline() {
+        use std::os::windows::io::FromRawHandle;
+        use windows::Win32::{Foundation::HANDLE, System::Pipes::CreatePipe};
+
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe { CreatePipe(&raw mut read, &raw mut write, None, 0) }
+            .expect("create blocking verification pipe");
+        let read = unsafe { fs::File::from_raw_handle(read.0) };
+        let _write = unsafe { fs::File::from_raw_handle(write.0) };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                super::windows_cancellable_read_for_test(&read, Duration::from_millis(50))
+            }),
+        )
+        .await
+        .expect("kernel-blocked verification was not bounded")
+        .expect("verification worker join");
+
+        assert!(matches!(result, Err(CandidateFailure::Deadline)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_snapshot_descriptor_is_private_until_the_spawn_boundary_and_has_no_path() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source_path = directory.path().join("ffmpeg");
+        fs::write(&source_path, b"snapshot executable bytes").expect("write source");
+        let source = fs::File::open(&source_path).expect("open source");
+        let snapshot = super::create_immutable_execution_snapshot(&source)
+            .expect("create app-owned execution snapshot");
+        let descriptor = snapshot.as_raw_fd();
+        let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        let descriptor_path = fs::read_link(format!("/proc/self/fd/{descriptor}"))
+            .expect("read snapshot descriptor link");
+
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+        assert!(
+            descriptor_path
+                .as_os_str()
+                .to_string_lossy()
+                .ends_with(" (deleted)"),
+            "snapshot retained a reachable pathname: {descriptor_path:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_pair_probe_executes_unlinked_snapshots_from_the_held_root() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio_util::sync::CancellationToken;
+
+        let directory = tempfile::tempdir().expect("snapshot probe root");
+        fs::write(
+            directory.path().join("probe-origin-marker"),
+            b"held root marker",
+        )
+        .expect("write cwd marker");
+        for role in ["ffmpeg", "ffprobe"] {
+            let executable = directory.path().join(role);
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n[ -f ./probe-origin-marker ] || exit 91\ncase \"$1\" in\n-version) echo \"{role} version 7.1.4\" ;;\n-buildconf) echo \"configuration: --snapshot-origin\" ;;\n*) exit 92 ;;\nesac\n"
+                ),
+            )
+            .expect("write fake pair executable");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
+                .expect("mark fake pair executable");
+        }
+
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let pair = super::probe_pair(
+            directory.path(),
+            "7.1.4",
+            "7.1.4-Jellyfin",
+            "7.1.4-Jellyfin",
+            &supervisor,
+        )
+        .await
+        .expect("probe immutable fake pair from held cwd");
+
+        assert_eq!(pair.version, "7.1.4");
+        for file in [&pair.lease.ffmpeg.file, &pair.lease.ffprobe.file] {
+            let descriptor = file.as_raw_fd();
+            let link = fs::read_link(format!("/proc/self/fd/{descriptor}"))
+                .expect("read leased executable descriptor link");
+            assert!(link.as_os_str().to_string_lossy().ends_with(" (deleted)"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_session_executes_original_snapshot_after_same_metadata_source_mutation() {
+        use super::{
+            RuntimeCommand, RuntimeConfig, RuntimeExecutable, TranscodingService, resolve_runtime,
+        };
+        use crate::transcoding::process::{ProcessSupervisor, StdoutPolicy};
+        use std::{fs::FileTimes, os::unix::fs::PermissionsExt};
+        use tokio_util::sync::CancellationToken;
+
+        fn script(role: &str, value: &str) -> Vec<u8> {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n-version) echo \"{role} version 7.1.4\" ;;\n-buildconf) echo \"configuration: --immutable-session\" ;;\n--snapshot-value) echo \"{value}\" ;;\n*) exit 92 ;;\nesac\n"
+            )
+            .into_bytes()
+        }
+
+        let directory = tempfile::tempdir().expect("immutable session root");
+        for role in ["ffmpeg", "ffprobe"] {
+            let path = directory.path().join(role);
+            fs::write(&path, script(role, "ORIGINAL")).expect("write original fake runtime");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500))
+                .expect("mark fake runtime executable");
+        }
+        let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+        let config = RuntimeConfig::isolated().with_explicit_root(directory.path().to_path_buf());
+        let runtime = resolve_runtime(&config, &supervisor)
+            .await
+            .expect("resolve original immutable pair");
+        let service = TranscodingService::resolved(config, supervisor, runtime);
+        service
+            .runtime_for_session()
+            .await
+            .expect("required first-session full integrity check");
+
+        for role in ["ffmpeg", "ffprobe"] {
+            let path = directory.path().join(role);
+            let metadata = fs::metadata(&path).expect("capture original metadata");
+            let replacement = script(role, "MUTATED!");
+            assert_eq!(replacement.len(), metadata.len() as usize);
+            fs::write(&path, replacement).expect("mutate same inode and size");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open source to restore timestamps")
+                .set_times(
+                    FileTimes::new()
+                        .set_accessed(metadata.accessed().expect("original access time"))
+                        .set_modified(metadata.modified().expect("original modified time")),
+                )
+                .expect("restore source timestamps");
+        }
+
+        let session = service
+            .runtime_for_session()
+            .await
+            .expect("metadata identity remains unchanged");
+        let output = session
+            .run_bounded(
+                RuntimeExecutable::Ffmpeg,
+                RuntimeCommand {
+                    args: vec![OsString::from("--snapshot-value")],
+                    stdout: StdoutPolicy::Capture { byte_limit: 1024 },
+                    stderr_byte_limit: 1024,
+                    wall_deadline: Duration::from_secs(2),
+                },
+            )
+            .await
+            .expect("execute retained immutable snapshot");
+
+        assert_eq!(output.stdout, b"ORIGINAL\n");
     }
 
     #[cfg(target_os = "linux")]
@@ -1906,6 +2728,48 @@ mod tests {
             .expect("join second hash")
             .expect("second hash after retained admission");
         assert_eq!(observer.snapshot(), (4, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_admission_has_an_independent_deadline_while_a_worker_is_blocked() {
+        let directory = tempfile::tempdir().expect("hash admission root");
+        for role in ["ffmpeg", "ffprobe"] {
+            fs::copy(
+                std::env::current_exe().expect("test executable"),
+                directory
+                    .path()
+                    .join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
+            )
+            .expect("copy hash input");
+        }
+        let observer = Arc::new(HashTestObserver::default());
+        observer.set_paused(true);
+        let first = tokio::spawn(open_pair_lease(
+            directory.path().to_path_buf(),
+            OpenMode::FullObserved(observer.clone()),
+        ));
+        while observer.snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        observer.set_admission_deadline(Duration::from_millis(50));
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            open_pair_lease(
+                directory.path().to_path_buf(),
+                OpenMode::FullObserved(observer.clone()),
+            ),
+        )
+        .await
+        .expect("admission deadline is independent of the blocked worker")
+        .expect_err("blocked admission must fail closed");
+        assert!(matches!(second, CandidateFailure::Deadline));
+
+        observer.set_paused(false);
+        first
+            .await
+            .expect("join admitted verification")
+            .expect("finish admitted verification");
     }
 
     #[tokio::test]

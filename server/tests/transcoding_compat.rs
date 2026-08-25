@@ -628,6 +628,30 @@ fn transcode_profile_aliases_preserve_encoder_selection_contract() {
 
 #[test]
 fn device_and_profiler_routes_preserve_compatibility_shapes() {
+    // Every embedded-server compatibility test takes this process-local lock.
+    // Hold it while the isolated helper runs so the helper owns both the fresh
+    // hwaccel cache and the fixed librqbit listen ports for its lifetime.
+    let _embedded_server_guard = lock_env();
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "device_and_profiler_routes_preserve_compatibility_shapes_isolated",
+        ])
+        .output()
+        .expect("spawn isolated device and profiler compatibility test");
+
+    assert!(
+        output.status.success(),
+        "isolated device and profiler compatibility test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "spawned only by device_and_profiler_routes_preserve_compatibility_shapes"]
+fn device_and_profiler_routes_preserve_compatibility_shapes_isolated() {
     with_fake_ffmpeg("device_probe", |log_path| {
         with_embedded_server(|client, base| {
             let device_info = client

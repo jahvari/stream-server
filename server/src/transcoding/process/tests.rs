@@ -93,6 +93,131 @@ fn unix_group_identity_forbids_reap_before_final_signal_and_reuse_after_reap() {
     );
 }
 
+#[test]
+fn failed_unix_final_signal_keeps_identity_retryable() {
+    let mut identity = super::UnixGroupIdentity::new(4_322);
+    let injected = Err(super::ProcessError::new(ProcessErrorCode::WaitFailed));
+
+    assert_eq!(
+        identity
+            .record_final_signal_result(injected)
+            .expect_err("injected signal failure must surface")
+            .code(),
+        ProcessErrorCode::WaitFailed
+    );
+    assert_eq!(
+        identity.final_signal_target(),
+        Some(4_322),
+        "failed signal must preserve the pinned retry target"
+    );
+    assert!(identity.killable_for_retention());
+
+    identity
+        .record_final_signal_result(Ok(()))
+        .expect("successful retry marks the final signal");
+    assert_eq!(identity.final_signal_target(), None);
+    assert!(!identity.killable_for_retention());
+}
+
+#[test]
+fn unix_registry_release_requires_child_reap_and_both_reader_joins() {
+    let mut ownership = super::UnixDurableOwnership::new();
+    assert!(!ownership.can_release());
+    ownership.mark_final_signal_sent();
+    ownership.mark_child_reaped();
+    assert!(!ownership.can_release(), "readers are still owned");
+    ownership.mark_reader_joined();
+    assert!(!ownership.can_release(), "one reader is still owned");
+    ownership.mark_reader_joined();
+    assert!(
+        ownership.can_release(),
+        "registry/permit release requires child reap and both reader joins"
+    );
+}
+
+#[test]
+fn panicked_unix_reader_is_terminally_joined_but_still_reports_wait_failure() {
+    let mut ownership = super::UnixDurableOwnership::new();
+    ownership.mark_final_signal_sent();
+    ownership.mark_child_reaped();
+
+    let result = ownership.record_reader_join_result::<Vec<u8>>(Err(super::ProcessError::new(
+        ProcessErrorCode::WaitFailed,
+    )));
+
+    assert_eq!(
+        result.expect_err("reader panic must remain visible").code(),
+        ProcessErrorCode::WaitFailed
+    );
+    assert!(!ownership.can_release(), "the second reader remains owned");
+    ownership.mark_reader_joined();
+    assert!(ownership.can_release());
+}
+
+#[test]
+fn unix_fd_execution_parser_limits_inheritance_to_the_selected_bound_descriptor() {
+    assert_eq!(
+        super::unix_bound_execution_descriptor(std::path::Path::new("/proc/self/fd/41")),
+        Some(41)
+    );
+    assert_eq!(
+        super::unix_bound_execution_descriptor(std::path::Path::new("/dev/fd/42")),
+        Some(42)
+    );
+    for unbound in [
+        "/usr/bin/ffmpeg",
+        "/proc/self/fd/41/trailing",
+        "/proc/other/fd/41",
+        "/dev/fd/-1",
+    ] {
+        assert_eq!(
+            super::unix_bound_execution_descriptor(std::path::Path::new(unbound)),
+            None
+        );
+    }
+}
+
+#[test]
+fn unix_bound_descriptor_inheritance_never_changes_parent_fd_flags() {
+    let source = include_str!("../process.rs");
+    let configuration = source
+        .split("fn configure_unix_descriptor_inheritance")
+        .nth(1)
+        .and_then(|source| source.split("\n#[cfg(").next())
+        .expect("Unix child-only descriptor inheritance configuration");
+
+    assert!(configuration.contains(".pre_exec("));
+    assert!(configuration.contains("libc::F_SETFD"));
+    assert_eq!(
+        source.matches("libc::F_SETFD").count(),
+        configuration.matches("libc::F_SETFD").count(),
+        "FD_CLOEXEC may only be changed by the forked child's pre_exec hook"
+    );
+    assert!(
+        !source.contains("struct UnixDescriptorInheritance"),
+        "a parent-side inheritance guard can race unrelated process spawns"
+    );
+}
+
+#[test]
+fn linux_group_parser_distinguishes_terminal_zombies_with_stable_start_identity() {
+    let statistics =
+        "321 (descendant with spaces) Z 300 300 300 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 987654 0";
+    let identity = super::parse_linux_process_identity(statistics).expect("parse proc stat");
+
+    assert_eq!(identity.process_group, 300);
+    assert_eq!(identity.start_time, 987654);
+    assert!(identity.terminal);
+}
+
+#[test]
+fn macos_process_status_only_treats_zombies_as_terminal_before_leader_reap() {
+    assert!(super::macos_process_status_is_terminal(5));
+    for running_status in [1, 2, 3, 4] {
+        assert!(!super::macos_process_status_is_terminal(running_status));
+    }
+}
+
 async fn abort_one_run_at_reader_handoff(
     supervisor: &std::sync::Arc<ProcessSupervisor>,
 ) -> Result<(), super::ProcessError> {

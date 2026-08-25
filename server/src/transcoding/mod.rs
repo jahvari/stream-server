@@ -11,6 +11,8 @@ pub mod model;
 pub(crate) mod process;
 pub mod runtime;
 pub mod runtime_manifest;
+#[cfg(unix)]
+pub(crate) mod snapshot_helper;
 
 pub use error::{FailureCode, TranscodeFailure};
 pub use model::{

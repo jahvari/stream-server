@@ -682,7 +682,15 @@ async fn parent_exit_still_kills_a_descendant_that_keeps_the_capture_pipes_open(
 #[tokio::test]
 async fn windows_command_line_round_trips_empty_unicode_quotes_backslashes_and_option_values() {
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
-    let expected = vec!["", "Zażółć 世界", "a\"b", r"a\b", "trailing\\", "-version"];
+    let expected = vec![
+        "",
+        "Zażółć 世界",
+        "a\"b",
+        r"a\b",
+        "trailing\\",
+        "quoted trailing\\",
+        "-version",
+    ];
     let mut args = vec![OsString::from("--echo")];
     args.extend(expected.iter().map(OsString::from));
 
@@ -712,6 +720,11 @@ async fn windows_rejects_nul_invalid_or_duplicate_environment_and_oversized_bloc
     duplicate_path.insert(OsString::from("Path"), OsString::from("one"));
     duplicate_path.insert(OsString::from("PATH"), OsString::from("two"));
     cases.push(("case-insensitive duplicate", duplicate_path));
+
+    let mut non_ascii_duplicate = BTreeMap::new();
+    non_ascii_duplicate.insert(OsString::from("Ångström"), OsString::from("one"));
+    non_ascii_duplicate.insert(OsString::from("ångström"), OsString::from("two"));
+    cases.push(("ordinal non-ASCII duplicate", non_ascii_duplicate));
 
     let mut nul_value = BTreeMap::new();
     nul_value.insert(OsString::from("SAFE"), OsString::from("bad\0value"));
@@ -976,7 +989,10 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
 
     assert!(matches!(error, RuntimeError::ProbeDeadline));
     assert!(started.elapsed() >= Duration::from_secs(10));
-    assert!(started.elapsed() <= Duration::from_millis(10_100));
+    assert!(
+        started.elapsed() <= Duration::from_millis(17_100),
+        "the ten-second probe deadline may be followed by the specified two-second grace and five-second bounded reap"
+    );
     assert_eq!(supervisor.active_processes(), 0);
 }
 

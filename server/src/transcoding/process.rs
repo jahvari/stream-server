@@ -283,12 +283,67 @@ impl UnixGroupIdentity {
         self.final_signal_sent = true;
     }
 
+    fn record_final_signal_result(
+        &mut self,
+        result: Result<(), ProcessError>,
+    ) -> Result<(), ProcessError> {
+        result?;
+        self.mark_final_signal_sent();
+        Ok(())
+    }
+
     fn mark_leader_reaped(&mut self) -> Result<(), ProcessError> {
         if !self.final_signal_sent {
             return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
         }
         self.leader_reaped = true;
         Ok(())
+    }
+
+    fn killable_for_retention(&self) -> bool {
+        self.final_signal_target().is_some()
+    }
+}
+
+#[cfg(any(unix, test))]
+struct UnixDurableOwnership {
+    final_signal_sent: bool,
+    child_reaped: bool,
+    readers_joined: usize,
+}
+
+#[cfg(any(unix, test))]
+impl UnixDurableOwnership {
+    fn new() -> Self {
+        Self {
+            final_signal_sent: false,
+            child_reaped: false,
+            readers_joined: 0,
+        }
+    }
+
+    fn mark_final_signal_sent(&mut self) {
+        self.final_signal_sent = true;
+    }
+
+    fn mark_child_reaped(&mut self) {
+        self.child_reaped = true;
+    }
+
+    fn mark_reader_joined(&mut self) {
+        self.readers_joined = self.readers_joined.saturating_add(1).min(2);
+    }
+
+    fn record_reader_join_result<T>(
+        &mut self,
+        result: Result<T, ProcessError>,
+    ) -> Result<T, ProcessError> {
+        self.mark_reader_joined();
+        result
+    }
+
+    fn can_release(&self) -> bool {
+        self.final_signal_sent && self.child_reaped && self.readers_joined == 2
     }
 }
 
@@ -467,7 +522,7 @@ impl ProcessRegistry {
     }
 
     #[cfg(unix)]
-    fn retain_unix_after_final_signal(&self, id: u64) {
+    fn retain_unix(&self, id: u64, killable: bool) {
         let mut entries = self
             .entries
             .lock()
@@ -475,7 +530,7 @@ impl ProcessRegistry {
         let Some(entry) = entries.get_mut(&id) else {
             return;
         };
-        entry.unix_killable = false;
+        entry.unix_killable = killable;
         entry.retained = true;
         entry.cleanup_started = false;
     }
@@ -566,7 +621,7 @@ impl Drop for Registration {
                 }
             }
             #[cfg(unix)]
-            self.registry.retain_unix_after_final_signal(self.id);
+            self.registry.retain_unix(self.id, true);
             #[cfg(windows)]
             drop(self.owner_signal.take());
         }
@@ -621,8 +676,8 @@ impl Registration {
     }
 
     #[cfg(unix)]
-    fn retain(mut self) {
-        self.registry.retain_unix_after_final_signal(self.id);
+    fn retain(mut self, killable: bool) {
+        self.registry.retain_unix(self.id, killable);
         self.completed = true;
     }
 
@@ -678,6 +733,7 @@ struct UnixOwnedProcess {
     child: Option<tokio::process::Child>,
     registration: Option<Registration>,
     identity: UnixGroupIdentity,
+    ownership: UnixDurableOwnership,
 }
 
 #[cfg(unix)]
@@ -687,6 +743,7 @@ impl UnixOwnedProcess {
             child: Some(child),
             registration: Some(registration),
             identity: UnixGroupIdentity::new(process_group),
+            ownership: UnixDurableOwnership::new(),
         }
     }
 
@@ -704,20 +761,23 @@ impl UnixOwnedProcess {
         let Some(process_group) = self.identity.final_signal_target() else {
             return Ok(());
         };
-        let result = terminate_unix_group(process_group);
-        self.identity.mark_final_signal_sent();
+        self.identity
+            .record_final_signal_result(terminate_unix_group(process_group))?;
+        self.ownership.mark_final_signal_sent();
         if let Some(registration) = &self.registration {
             registration.mark_unix_final_signal_sent();
         }
-        result
+        Ok(())
     }
 
     fn mark_leader_reaped(&mut self) -> Result<(), ProcessError> {
-        self.identity.mark_leader_reaped()
+        self.identity.mark_leader_reaped()?;
+        self.ownership.mark_child_reaped();
+        Ok(())
     }
 
     fn complete(mut self) -> Result<(), ProcessError> {
-        if !self.identity.leader_reaped {
+        if !self.ownership.can_release() {
             return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
         }
         self.registration
@@ -733,8 +793,9 @@ impl UnixOwnedProcess {
 impl Drop for UnixOwnedProcess {
     fn drop(&mut self) {
         let _ = self.send_final_signal();
+        let killable = self.identity.killable_for_retention();
         if let Some(registration) = self.registration.take() {
-            registration.retain();
+            registration.retain(killable);
         }
         drop(self.child.take());
     }
@@ -1072,7 +1133,7 @@ impl ProcessSupervisor {
     ) -> Result<BoundedOutput, ProcessError> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
-        let wall_expires = tokio::time::Instant::now() + spec.wall_deadline;
+        let wall_expires = std::time::Instant::now() + spec.wall_deadline;
 
         let stdout_limit = match spec.stdout {
             StdoutPolicy::Null => None,
@@ -1091,6 +1152,7 @@ impl ProcessSupervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
+        configure_unix_descriptor_inheritance(&mut command, &spec.executable)?;
         let (child, pid, registration) = {
             let _gate = self
                 .inner
@@ -1114,138 +1176,309 @@ impl ProcessSupervisor {
             (child, pid, registration)
         };
         let mut owner = UnixOwnedProcess::new(child, pid, registration);
-        let Some(stdout_pipe) = owner.child_mut()?.stdout.take() else {
-            cleanup_failed_unix_spawn(owner).await?;
-            return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
-        };
-        let Some(stderr_pipe) = owner.child_mut()?.stderr.take() else {
-            cleanup_failed_unix_spawn(owner).await?;
-            return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
-        };
-        let (limit_tx, limit_rx) = tokio::sync::mpsc::unbounded_channel();
-        let stdout_reader = tokio::spawn({
-            let limit_tx = limit_tx.clone();
-            async move {
-                read_async_pipe(
-                    stdout_pipe,
-                    stdout_limit,
-                    keep_stdout,
-                    ProcessErrorCode::StdoutLimitExceeded,
-                    limit_tx,
-                )
-                .await
-            }
-        });
-        let stderr_reader = tokio::spawn(async move {
-            read_async_pipe(
-                stderr_pipe,
-                Some(spec.stderr_byte_limit),
-                true,
-                ProcessErrorCode::StderrLimitExceeded,
-                limit_tx,
-            )
-            .await
-        });
+        let stdout_pipe = owner
+            .child_mut()?
+            .stdout
+            .take()
+            .and_then(|pipe| pipe.into_owned_fd().ok())
+            .map(std::fs::File::from);
+        let stderr_pipe = owner
+            .child_mut()?
+            .stderr
+            .take()
+            .and_then(|pipe| pipe.into_owned_fd().ok())
+            .map(std::fs::File::from);
+        let (limit_tx, limit_rx) = std::sync::mpsc::channel();
+        let (stdout_reader, stdout_setup_failed) = spawn_unix_reader(
+            stdout_pipe,
+            stdout_limit,
+            keep_stdout,
+            ProcessErrorCode::StdoutLimitExceeded,
+            limit_tx.clone(),
+        );
+        let (stderr_reader, stderr_setup_failed) = spawn_unix_reader(
+            stderr_pipe,
+            Some(spec.stderr_byte_limit),
+            true,
+            ProcessErrorCode::StderrLimitExceeded,
+            limit_tx,
+        );
+        let setup_failed = stdout_setup_failed || stderr_setup_failed;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let cancellation = self.inner.cancellation.clone();
-        tokio::spawn(own_unix_process(
+        let owner_state = Arc::new(Mutex::new(Some((
             owner,
             stdout_reader,
             stderr_reader,
             limit_rx,
             cancellation,
             wall_expires,
+            setup_failed,
             result_tx,
-        ));
+        ))));
+        let thread_state = owner_state.clone();
+        if std::thread::Builder::new()
+            .name("transcoding-process-owner".to_owned())
+            .spawn(move || {
+                if let Some(arguments) = thread_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    own_unix_process(arguments);
+                }
+            })
+            .is_err()
+            && let Some(arguments) = owner_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            // Thread exhaustion is exceptional, but successful spawn ownership
+            // still cannot be abandoned. Perform the same durable cleanup
+            // synchronously rather than dropping the child/registration.
+            own_unix_process(arguments);
+        }
         result_rx
             .await
             .unwrap_or_else(|_| Err(ProcessError::new(ProcessErrorCode::WaitFailed)))
     }
 }
 
+#[cfg(any(unix, test))]
+fn unix_bound_execution_descriptor(path: &std::path::Path) -> Option<i32> {
+    let path = path.to_str()?;
+    let descriptor = path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| path.strip_prefix("/dev/fd/"))?;
+    if descriptor.is_empty() || descriptor.contains('/') {
+        return None;
+    }
+    descriptor
+        .parse::<i32>()
+        .ok()
+        .filter(|descriptor| *descriptor >= 0)
+}
+
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-async fn own_unix_process(
-    mut owner: UnixOwnedProcess,
-    mut stdout_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
-    mut stderr_reader: tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
-    mut limit_rx: tokio::sync::mpsc::UnboundedReceiver<ProcessErrorCode>,
-    cancellation: CancellationToken,
-    wall_expires: tokio::time::Instant,
-    mut result_tx: tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>,
-) {
+fn configure_unix_descriptor_inheritance(
+    command: &mut tokio::process::Command,
+    path: &std::path::Path,
+) -> Result<(), ProcessError> {
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(descriptor) = unix_bound_execution_descriptor(path) else {
+        return Ok(());
+    };
+    let original_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if original_flags < 0 {
+        return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
+    }
+    // `pre_exec` runs after fork in the child. The parent's sealed runtime
+    // descriptor remains CLOEXEC at every point, including while unrelated
+    // components concurrently spawn their own children.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::fcntl(
+                descriptor,
+                libc::F_SETFD,
+                original_flags & !libc::FD_CLOEXEC,
+            ) != 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+type UnixOwnerArguments = (
+    UnixOwnedProcess,
+    DurableUnixReader,
+    DurableUnixReader,
+    std::sync::mpsc::Receiver<ProcessErrorCode>,
+    CancellationToken,
+    std::time::Instant,
+    bool,
+    tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>,
+);
+
+#[cfg(unix)]
+fn own_unix_process(arguments: UnixOwnerArguments) {
+    let (
+        mut owner,
+        stdout_reader,
+        stderr_reader,
+        limit_rx,
+        cancellation,
+        wall_expires,
+        setup_failed,
+        result_tx,
+    ) = arguments;
     enum Completion {
-        Exited(Result<(), ProcessError>),
+        Exited,
         Stop(ProcessErrorCode),
     }
-
-    let cleanup = async {
-        let process_group = owner.process_group();
-        let mut wait_leader = Box::pin(wait_for_unix_leader_unreaped(process_group));
-        let deadline = tokio::time::sleep_until(wall_expires);
-        tokio::pin!(deadline);
-        let completion = tokio::select! {
-            result = &mut wait_leader => Completion::Exited(result),
-            _ = cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
-            _ = result_tx.closed() => Completion::Stop(ProcessErrorCode::Cancelled),
-            _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
-            limit = limit_rx.recv() => match limit {
-                Some(code) => Completion::Stop(code),
-                None => Completion::Exited((&mut wait_leader).await),
-            },
-        };
-        let terminal_error = match completion {
-            Completion::Exited(result) => {
-                result?;
-                None
-            }
-            Completion::Stop(ProcessErrorCode::Cancelled) => {
-                graceful_terminate_unix_group(process_group)?;
-                if let Ok(result) = tokio::time::timeout(CANCELLATION_GRACE, &mut wait_leader).await
-                {
-                    result?;
+    let process_group = owner.process_group();
+    let completion = 'completion: loop {
+        if setup_failed {
+            break 'completion Completion::Stop(ProcessErrorCode::SpawnFailed);
+        }
+        match unix_leader_is_waitable_without_reap(process_group) {
+            Ok(true) => break Completion::Exited,
+            Ok(false) => {}
+            Err(_) => break Completion::Stop(ProcessErrorCode::WaitFailed),
+        }
+        if cancellation.is_cancelled() || result_tx.is_closed() {
+            break Completion::Stop(ProcessErrorCode::Cancelled);
+        }
+        if std::time::Instant::now() >= wall_expires {
+            break Completion::Stop(ProcessErrorCode::DeadlineExceeded);
+        }
+        match limit_rx.try_recv() {
+            Ok(code) => break Completion::Stop(code),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let terminal_error = match completion {
+        Completion::Exited => None,
+        Completion::Stop(ProcessErrorCode::Cancelled) => {
+            if graceful_terminate_unix_group(process_group).is_err() {
+                Some(ProcessError::new(ProcessErrorCode::WaitFailed))
+            } else {
+                let grace_expires = std::time::Instant::now() + CANCELLATION_GRACE;
+                while std::time::Instant::now() < grace_expires {
+                    match unix_leader_is_waitable_without_reap(process_group) {
+                        Ok(true) => break,
+                        Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+                        Err(_) => break,
+                    }
                 }
                 Some(ProcessError::new(ProcessErrorCode::Cancelled))
             }
-            Completion::Stop(code) => Some(ProcessError::new(code)),
-        };
-
-        owner.send_final_signal()?;
-        let status = tokio::time::timeout(CLEANUP_DEADLINE, owner.child_mut()?.wait())
-            .await
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-            .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-        owner.mark_leader_reaped()?;
-        wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE).await?;
-        let stdout = await_unix_reader(&mut stdout_reader).await;
-        let stderr = await_unix_reader(&mut stderr_reader).await;
-        Ok((status, stdout, stderr, terminal_error))
-    }
-    .await;
-
-    let outcome = match cleanup {
-        Ok((status, stdout, stderr, terminal_error)) => {
-            let completed = owner.complete();
-            completed.and_then(|_| {
-                let stdout = stdout?;
-                let stderr = stderr?;
-                if let Some(error) = terminal_error {
-                    return Err(error);
-                }
-                Ok(BoundedOutput {
-                    status,
-                    stdout,
-                    stderr,
-                })
-            })
         }
-        Err(error) => {
-            abort_unix_readers(&mut stdout_reader, &mut stderr_reader).await;
-            drop(owner);
-            Err(error)
+        Completion::Stop(code) => Some(ProcessError::new(code)),
+    };
+
+    // The durable owner never relinquishes the real Child or reader handles
+    // after a cleanup error. It reports a bounded error once, then continues
+    // retrying while retaining registry ownership and the admission permit.
+    let cleanup_expires = std::time::Instant::now() + CLEANUP_DEADLINE;
+    let mut result_tx = Some(result_tx);
+    loop {
+        match owner.send_final_signal() {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < cleanup_expires => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                if let Some(sender) = result_tx.take() {
+                    let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let descendant_identities = loop {
+        match linux_terminal_group_descendants(process_group) {
+            Ok(Some(descendants)) => break descendants,
+            Ok(None) | Err(_) => {}
+        }
+        if std::time::Instant::now() >= cleanup_expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    #[cfg(target_os = "macos")]
+    let descendant_identities = loop {
+        match macos_terminal_group_descendants(process_group) {
+            Ok(Some(descendants)) => break descendants,
+            Ok(None) | Err(_) => {}
+        }
+        if std::time::Instant::now() >= cleanup_expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    while !unix_group_descendants_drained(process_group).unwrap_or(false) {
+        if std::time::Instant::now() >= cleanup_expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let status = loop {
+        match owner.child_mut().and_then(|child| {
+            child
+                .try_wait()
+                .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))
+        }) {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < cleanup_expires => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                if let Some(sender) = result_tx.take() {
+                    let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
     };
-    let _ = result_tx.send(outcome);
+    if let Err(error) = owner.mark_leader_reaped() {
+        owner.ownership.mark_child_reaped();
+        if let Some(sender) = result_tx.take() {
+            let _ = sender.send(Err(error));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    while !linux_process_identities_are_gone(&descendant_identities) {
+        if std::time::Instant::now() >= cleanup_expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    #[cfg(target_os = "macos")]
+    while !macos_process_identities_are_gone(&descendant_identities) {
+        if std::time::Instant::now() >= cleanup_expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let stdout = join_unix_reader_durably(stdout_reader, &mut owner, &mut result_tx);
+    let stderr = join_unix_reader_durably(stderr_reader, &mut owner, &mut result_tx);
+    let completed = owner.complete();
+    if let Some(sender) = result_tx.take() {
+        let outcome = completed.and_then(|_| {
+            let stdout = stdout?;
+            let stderr = stderr?;
+            if let Some(error) = terminal_error {
+                return Err(error);
+            }
+            Ok(BoundedOutput {
+                status,
+                stdout,
+                stderr,
+            })
+        });
+        let _ = sender.send(outcome);
+    }
 }
 
 #[cfg(windows)]
@@ -1438,16 +1671,6 @@ async fn await_registered_windows_readers(
     Ok([stdout, stderr])
 }
 
-#[cfg(unix)]
-async fn wait_for_unix_leader_unreaped(process_group: i32) -> Result<(), ProcessError> {
-    loop {
-        if unix_leader_is_waitable_without_reap(process_group)? {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unix_leader_is_waitable_without_reap(process_group: i32) -> Result<bool, ProcessError> {
     let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -1507,75 +1730,84 @@ fn unix_group_is_empty(process_group: i32) -> Result<bool, ProcessError> {
 }
 
 #[cfg(unix)]
-async fn wait_for_unix_group_drain(
-    process_group: i32,
-    deadline: Duration,
-) -> Result<(), ProcessError> {
-    let expires = tokio::time::Instant::now() + deadline;
-    while !unix_group_is_empty(process_group)? {
-        if tokio::time::Instant::now() >= expires {
-            return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn cleanup_failed_unix_spawn(mut owner: UnixOwnedProcess) -> Result<(), ProcessError> {
-    let process_group = owner.process_group();
-    owner.send_final_signal()?;
-    tokio::time::timeout(CLEANUP_DEADLINE, owner.child_mut()?.wait())
-        .await
-        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
-        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
-    owner.mark_leader_reaped()?;
-    if wait_for_unix_group_drain(process_group, CLEANUP_DEADLINE)
-        .await
-        .is_err()
-    {
-        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
-    }
-    owner.complete()
-}
-
-#[cfg(unix)]
-async fn abort_unix_readers(
-    stdout: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
-    stderr: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
-) {
-    stdout.abort();
-    stderr.abort();
-    let _ = stdout.await;
-    let _ = stderr.await;
-}
-
-#[cfg(unix)]
-async fn await_unix_reader(
-    reader: &mut tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>>,
-) -> Result<Vec<u8>, ProcessError> {
-    match tokio::time::timeout(CLEANUP_DEADLINE, &mut *reader).await {
-        Ok(result) => result.map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?,
-        Err(_) => {
-            reader.abort();
-            let _ = reader.await;
-            Err(ProcessError::new(ProcessErrorCode::WaitFailed))
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn read_async_pipe<R>(
-    mut pipe: R,
+struct UnixReaderInput {
+    pipe: Option<std::fs::File>,
     limit: Option<usize>,
     keep: bool,
     limit_code: ProcessErrorCode,
-    limit_tx: tokio::sync::mpsc::UnboundedSender<ProcessErrorCode>,
-) -> Result<Vec<u8>, ProcessError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
+    limit_tx: std::sync::mpsc::Sender<ProcessErrorCode>,
+}
+
+#[cfg(unix)]
+enum DurableUnixReader {
+    Thread(std::thread::JoinHandle<Result<Vec<u8>, ProcessError>>),
+    Inline(UnixReaderInput),
+}
+
+#[cfg(unix)]
+fn spawn_unix_reader(
+    pipe: Option<std::fs::File>,
+    limit: Option<usize>,
+    keep: bool,
+    limit_code: ProcessErrorCode,
+    limit_tx: std::sync::mpsc::Sender<ProcessErrorCode>,
+) -> (DurableUnixReader, bool) {
+    let missing_pipe = pipe.is_none();
+    let input = Arc::new(Mutex::new(Some(UnixReaderInput {
+        pipe,
+        limit,
+        keep,
+        limit_code,
+        limit_tx,
+    })));
+    let thread_input = input.clone();
+    match std::thread::Builder::new()
+        .name("transcoding-pipe-reader".to_owned())
+        .spawn(move || {
+            let input = thread_input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .ok_or_else(|| ProcessError::new(ProcessErrorCode::SpawnFailed))?;
+            let Some(pipe) = input.pipe else {
+                let _ = input.limit_tx.send(ProcessErrorCode::SpawnFailed);
+                return Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
+            };
+            read_sync_pipe(
+                pipe,
+                input.limit,
+                input.keep,
+                input.limit_code,
+                input.limit_tx,
+            )
+        }) {
+        Ok(reader) => (DurableUnixReader::Thread(reader), missing_pipe),
+        Err(_) => {
+            let input = input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_else(|| UnixReaderInput {
+                    pipe: None,
+                    limit: None,
+                    keep: false,
+                    limit_code: ProcessErrorCode::WaitFailed,
+                    limit_tx: std::sync::mpsc::channel().0,
+                });
+            (DurableUnixReader::Inline(input), true)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_sync_pipe(
+    mut pipe: std::fs::File,
+    limit: Option<usize>,
+    keep: bool,
+    limit_code: ProcessErrorCode,
+    limit_tx: std::sync::mpsc::Sender<ProcessErrorCode>,
+) -> Result<Vec<u8>, ProcessError> {
+    use std::io::Read as _;
 
     let mut output = Vec::with_capacity(limit.unwrap_or(0).min(8_192));
     let mut buffer = [0_u8; 8_192];
@@ -1584,7 +1816,6 @@ where
     loop {
         let count = pipe
             .read(&mut buffer)
-            .await
             .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
         if count == 0 {
             break;
@@ -1608,6 +1839,215 @@ where
     } else {
         Ok(Vec::new())
     }
+}
+
+#[cfg(unix)]
+fn join_unix_reader_durably(
+    reader: DurableUnixReader,
+    owner: &mut UnixOwnedProcess,
+    result_tx: &mut Option<tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>>,
+) -> Result<Vec<u8>, ProcessError> {
+    let reader = match reader {
+        DurableUnixReader::Thread(reader) => reader,
+        DurableUnixReader::Inline(input) => {
+            let result = match input.pipe {
+                Some(pipe) => read_sync_pipe(
+                    pipe,
+                    input.limit,
+                    input.keep,
+                    input.limit_code,
+                    input.limit_tx,
+                ),
+                None => Err(ProcessError::new(ProcessErrorCode::SpawnFailed)),
+            };
+            owner.ownership.mark_reader_joined();
+            return result;
+        }
+    };
+    let expires = std::time::Instant::now() + CLEANUP_DEADLINE;
+    while !reader.is_finished() {
+        if std::time::Instant::now() >= expires {
+            if let Some(sender) = result_tx.take() {
+                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let result = reader
+        .join()
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))
+        .and_then(|result| result);
+    owner.ownership.record_reader_join_result(result)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxProcessIdentity {
+    process_group: i32,
+    start_time: u64,
+    terminal: bool,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_process_identity(statistics: &str) -> Option<LinuxProcessIdentity> {
+    let fields = statistics.rsplit_once(") ")?.1;
+    let mut fields = fields.split_ascii_whitespace();
+    let terminal = fields.next()? == "Z";
+    let process_group = fields.nth(1)?.parse::<i32>().ok()?;
+    let start_time = fields.nth(16)?.parse::<u64>().ok()?;
+    Some(LinuxProcessIdentity {
+        process_group,
+        start_time,
+        terminal,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxDescendantIdentity {
+    pid: i32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminal_group_descendants(
+    process_group: i32,
+) -> Result<Option<Vec<LinuxDescendantIdentity>>, ProcessError> {
+    let mut descendants = Vec::new();
+    for entry in
+        std::fs::read_dir("/proc").map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == process_group {
+            continue;
+        }
+        let Ok(statistics) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(identity) = parse_linux_process_identity(&statistics) else {
+            continue;
+        };
+        if identity.process_group == process_group {
+            if !identity.terminal {
+                return Ok(None);
+            }
+            descendants.push(LinuxDescendantIdentity {
+                pid,
+                start_time: identity.start_time,
+            });
+        }
+    }
+    Ok(Some(descendants))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_identities_are_gone(descendants: &[LinuxDescendantIdentity]) -> bool {
+    descendants.iter().all(|descendant| {
+        let statistics = std::fs::read_to_string(format!("/proc/{}/stat", descendant.pid));
+        match statistics
+            .ok()
+            .as_deref()
+            .and_then(parse_linux_process_identity)
+        {
+            Some(identity) => identity.start_time != descendant.start_time,
+            None => true,
+        }
+    })
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_process_status_is_terminal(status: u32) -> bool {
+    const SZOMB: u32 = 5;
+    status == SZOMB
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacosDescendantIdentity {
+    pid: i32,
+    start_seconds: u64,
+    start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            information.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    (written == expected).then(|| unsafe { information.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_terminal_group_descendants(
+    process_group: i32,
+) -> Result<Option<Vec<MacosDescendantIdentity>>, ProcessError> {
+    let required = unsafe { libc::proc_listpgrppids(process_group, std::ptr::null_mut(), 0) };
+    if required < 0 {
+        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+    }
+    let mut pids = vec![0_i32; (required as usize / std::mem::size_of::<i32>()) + 8];
+    let buffer_size = i32::try_from(pids.len() * std::mem::size_of::<i32>())
+        .map_err(|_| ProcessError::new(ProcessErrorCode::WaitFailed))?;
+    let written =
+        unsafe { libc::proc_listpgrppids(process_group, pids.as_mut_ptr().cast(), buffer_size) };
+    if written < 0 {
+        return Err(ProcessError::new(ProcessErrorCode::WaitFailed));
+    }
+    pids.truncate(written as usize / std::mem::size_of::<i32>());
+    let mut descendants = Vec::new();
+    for pid in pids
+        .into_iter()
+        .filter(|pid| *pid != 0 && *pid != process_group)
+    {
+        let Some(information) = macos_process_info(pid) else {
+            continue;
+        };
+        if information.pbi_pgid != process_group as u32 {
+            continue;
+        }
+        if !macos_process_status_is_terminal(information.pbi_status) {
+            return Ok(None);
+        }
+        descendants.push(MacosDescendantIdentity {
+            pid,
+            start_seconds: information.pbi_start_tvsec,
+            start_microseconds: information.pbi_start_tvusec,
+        });
+    }
+    Ok(Some(descendants))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identities_are_gone(descendants: &[MacosDescendantIdentity]) -> bool {
+    descendants.iter().all(|descendant| {
+        macos_process_info(descendant.pid).is_none_or(|information| {
+            information.pbi_start_tvsec != descendant.start_seconds
+                || information.pbi_start_tvusec != descendant.start_microseconds
+        })
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn unix_group_descendants_drained(_process_group: i32) -> Result<bool, ProcessError> {
+    Err(ProcessError::new(ProcessErrorCode::WaitFailed))
 }
 
 fn validate_common_spec(spec: &ProcessSpec) -> Result<(), ProcessError> {
@@ -1653,3 +2093,7 @@ type NativeFailurePoint = Option<FailurePoint>;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "process/unix_tests.rs"]
+mod unix_tests;
