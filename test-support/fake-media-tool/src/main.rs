@@ -283,17 +283,64 @@ fn is_inventory_query(args: &[OsString], query: &str) -> bool {
             if hide_banner == "-hide_banner" && requested == query)
 }
 
-fn contains_arg(args: &[OsString], needle: &str) -> bool {
-    args.iter().any(|arg| arg == needle)
-}
-
 fn requests_json_probe(args: &[OsString]) -> bool {
-    let has_json_output = args
-        .windows(2)
-        .any(|pair| pair[0] == "-of" && pair[1] == "json");
-    let has_show_request = ["-show_format", "-show_streams", "-show_chapters"]
+    let mut has_json_output = false;
+    let mut has_show_request = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if [
+            "-of",
+            "-print_format",
+            "-v",
+            "-loglevel",
+            "-select_streams",
+            "-show_entries",
+            "-analyzeduration",
+            "-probesize",
+            "-read_intervals",
+            "-i",
+        ]
         .iter()
-        .any(|needle| contains_arg(args, needle));
+        .any(|option| argument == option)
+        {
+            let Some(value) = args.get(index + 1) else {
+                return false;
+            };
+            if (argument == "-of" || argument == "-print_format") && value == "json" {
+                has_json_output = true;
+            }
+            index += 2;
+            continue;
+        }
+
+        if ["-show_format", "-show_streams", "-show_chapters"]
+            .iter()
+            .any(|option| argument == option)
+        {
+            has_show_request = true;
+            index += 1;
+            continue;
+        }
+
+        if argument == "-hide_banner"
+            || argument == "-count_frames"
+            || argument == "-count_packets"
+            || argument == "-sexagesimal"
+            || argument == "-pretty"
+            || argument == "-"
+            || !argument.to_string_lossy().starts_with('-')
+        {
+            index += 1;
+            continue;
+        }
+
+        return false;
+    }
 
     has_json_output && has_show_request
 }
@@ -811,6 +858,40 @@ mod tests {
         assert_eq!(parsed["format"]["filename"], "fixture-input");
         assert!(!output.contains("private"));
         assert!(!output.contains("movie.mkv"));
+    }
+
+    #[test]
+    fn probe_control_tokens_used_as_input_values_are_not_dispatched_as_queries() {
+        for input_value in ["-show_streams", "-show_format", "-show_chapters"] {
+            let args = os_args(["-of", "json", "-i", input_value]);
+            assert_eq!(
+                query_output(&args, &Scenario::default()),
+                None,
+                "input value {input_value} activated JSON probe mode"
+            );
+        }
+
+        let after_option_delimiter = os_args(["-of", "json", "--", "-show_streams"]);
+        assert_eq!(
+            query_output(&after_option_delimiter, &Scenario::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn print_format_probe_with_value_options_is_recognized() {
+        let args = os_args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "s",
+            "fixture-input",
+        ]);
+
+        assert!(query_output(&args, &Scenario::default()).is_some());
     }
 
     #[test]
