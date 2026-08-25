@@ -6,6 +6,8 @@ use super::{
     runtime_manifest::{RuntimeError, RuntimeHost, RuntimeManifest},
 };
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -21,9 +23,6 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-
 const IDENTITY_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const IDENTITY_STDOUT_LIMIT: usize = 128 * 1024;
 const IDENTITY_STDERR_LIMIT: usize = 32 * 1024;
@@ -33,15 +32,6 @@ const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const HASH_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_PATH_CANDIDATES: usize = 64;
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(30);
-
-#[cfg(test)]
-static HASH_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static HASH_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static HASH_TOTAL: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static HASH_PAUSED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -356,6 +346,8 @@ pub struct FfmpegRuntime {
     kind: RuntimeKind,
     lease: Arc<RuntimeLease>,
     first_session_verified: AtomicBool,
+    #[cfg(test)]
+    hash_observer: Option<Arc<HashTestObserver>>,
 }
 
 impl FfmpegRuntime {
@@ -415,13 +407,38 @@ struct OpenedPair {
     lease: RuntimeLease,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum OpenMode {
     Full,
+    #[cfg(test)]
+    FullObserved(Arc<HashTestObserver>),
     MetadataOnly {
         ffmpeg_digest: [u8; 32],
         ffprobe_digest: [u8; 32],
     },
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct HashTestObserver {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    total: AtomicUsize,
+    paused: AtomicBool,
+}
+
+#[cfg(test)]
+impl HashTestObserver {
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        (
+            self.total.load(Ordering::Acquire),
+            self.max_active.load(Ordering::Acquire),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -641,7 +658,16 @@ fn candidate_failure_error(failure: CandidateFailure) -> RuntimeError {
 }
 
 pub async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
-    verify_opened(runtime, OpenMode::Full).await
+    #[cfg(test)]
+    let mode = runtime
+        .hash_observer
+        .as_ref()
+        .map_or(OpenMode::Full, |observer| {
+            OpenMode::FullObserved(observer.clone())
+        });
+    #[cfg(not(test))]
+    let mode = OpenMode::Full;
+    verify_opened(runtime, mode).await
 }
 
 async fn verify_metadata_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
@@ -690,6 +716,8 @@ impl ProbedPair {
             kind,
             lease,
             first_session_verified: AtomicBool::new(false),
+            #[cfg(test)]
+            hash_observer: None,
         }
     }
 }
@@ -994,8 +1022,17 @@ fn bound_execution_path(file: &File, canonical_path: &Path) -> Result<PathBuf, C
 
 async fn open_pair_lease(root: PathBuf, mode: OpenMode) -> Result<OpenedPair, CandidateFailure> {
     static HASH_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let _hash_permit = match mode {
+    let _hash_permit = match &mode {
         OpenMode::Full => Some(
+            HASH_ADMISSION
+                .get_or_init(|| Arc::new(Semaphore::new(1)))
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| CandidateFailure::Unsafe)?,
+        ),
+        #[cfg(test)]
+        OpenMode::FullObserved(_) => Some(
             HASH_ADMISSION
                 .get_or_init(|| Arc::new(Semaphore::new(1)))
                 .clone()
@@ -1063,8 +1100,13 @@ fn open_pair_lease_blocking_with_hook(
     validate_opened_child(&ffprobe_file, &ffprobe, &root)?;
     let (ffmpeg_seal, ffprobe_seal) = match mode {
         OpenMode::Full => (
-            seal_open_file(&ffmpeg_file)?,
-            seal_open_file(&ffprobe_file)?,
+            seal_open_file(&ffmpeg_file, None)?,
+            seal_open_file(&ffprobe_file, None)?,
+        ),
+        #[cfg(test)]
+        OpenMode::FullObserved(observer) => (
+            seal_open_file(&ffmpeg_file, Some(&observer))?,
+            seal_open_file(&ffprobe_file, Some(&observer))?,
         ),
         OpenMode::MetadataOnly {
             ffmpeg_digest,
@@ -1442,16 +1484,22 @@ fn linux_filesystem_type_is_allowed_local(filesystem_type: i64) -> bool {
     )
 }
 
-fn seal_open_file(file: &File) -> Result<FileSeal, CandidateFailure> {
+fn seal_open_file(
+    file: &File,
+    #[cfg(test)] observer: Option<&HashTestObserver>,
+    #[cfg(not(test))] _observer: Option<&()>,
+) -> Result<FileSeal, CandidateFailure> {
     let metadata_before = file.metadata().map_err(|_| CandidateFailure::Unsafe)?;
     if !metadata_before.is_file() || metadata_before.len() > MAX_EXECUTABLE_BYTES {
         return Err(CandidateFailure::Unsafe);
     }
     #[cfg(test)]
-    let _observation = HashObservation::start();
+    let _observation = observer.map(HashObservation::start);
     #[cfg(test)]
-    while HASH_PAUSED.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(1));
+    if let Some(observer) = observer {
+        while observer.paused.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     let expires = Instant::now() + HASH_DEADLINE;
     let identity = file_identity(file, &metadata_before)?;
@@ -1489,43 +1537,25 @@ fn seal_open_file(file: &File) -> Result<FileSeal, CandidateFailure> {
 }
 
 #[cfg(test)]
-struct HashObservation;
+struct HashObservation<'a> {
+    observer: &'a HashTestObserver,
+}
 
 #[cfg(test)]
-impl HashObservation {
-    fn start() -> Self {
-        HASH_TOTAL.fetch_add(1, Ordering::AcqRel);
-        let active = HASH_ACTIVE.fetch_add(1, Ordering::AcqRel) + 1;
-        HASH_MAX_ACTIVE.fetch_max(active, Ordering::AcqRel);
-        Self
+impl<'a> HashObservation<'a> {
+    fn start(observer: &'a HashTestObserver) -> Self {
+        observer.total.fetch_add(1, Ordering::AcqRel);
+        let active = observer.active.fetch_add(1, Ordering::AcqRel) + 1;
+        observer.max_active.fetch_max(active, Ordering::AcqRel);
+        Self { observer }
     }
 }
 
 #[cfg(test)]
-impl Drop for HashObservation {
+impl Drop for HashObservation<'_> {
     fn drop(&mut self) {
-        HASH_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        self.observer.active.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-#[cfg(test)]
-fn reset_hash_observation() {
-    HASH_ACTIVE.store(0, Ordering::Release);
-    HASH_MAX_ACTIVE.store(0, Ordering::Release);
-    HASH_TOTAL.store(0, Ordering::Release);
-}
-
-#[cfg(test)]
-fn set_hash_pause(paused: bool) {
-    HASH_PAUSED.store(paused, Ordering::Release);
-}
-
-#[cfg(test)]
-fn snapshot_hash_observation() -> (usize, usize) {
-    (
-        HASH_TOTAL.load(Ordering::Acquire),
-        HASH_MAX_ACTIVE.load(Ordering::Acquire),
-    )
 }
 
 fn metadata_seal_open_file(file: &File, digest: [u8; 32]) -> Result<FileSeal, CandidateFailure> {
@@ -1663,10 +1693,10 @@ fn known_system_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateFailure, FdNamespace, MAX_EXECUTABLE_BYTES, OpenMode, open_pair_lease,
-        render_fd_path, reset_hash_observation, set_hash_pause, snapshot_hash_observation,
+        CandidateFailure, FdNamespace, HashTestObserver, MAX_EXECUTABLE_BYTES, OpenMode,
+        open_pair_lease, render_fd_path,
     };
-    use std::{fs, path::PathBuf, time::Duration};
+    use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
     #[cfg(windows)]
     #[test]
@@ -1800,14 +1830,20 @@ mod tests {
             )
             .expect("copy hash input");
         }
-        reset_hash_observation();
+        let observer = Arc::new(HashTestObserver::default());
         let (first, second) = tokio::join!(
-            open_pair_lease(directory.path().to_path_buf(), OpenMode::Full),
-            open_pair_lease(directory.path().to_path_buf(), OpenMode::Full),
+            open_pair_lease(
+                directory.path().to_path_buf(),
+                OpenMode::FullObserved(observer.clone()),
+            ),
+            open_pair_lease(
+                directory.path().to_path_buf(),
+                OpenMode::FullObserved(observer.clone()),
+            ),
         );
         let first = first.expect("first full verification");
         second.expect("second full verification");
-        assert_eq!(snapshot_hash_observation(), (4, 1));
+        assert_eq!(observer.snapshot(), (4, 1));
 
         open_pair_lease(
             directory.path().to_path_buf(),
@@ -1819,7 +1855,7 @@ mod tests {
         .await
         .expect("metadata-only command-boundary reopen");
         assert_eq!(
-            snapshot_hash_observation(),
+            observer.snapshot(),
             (4, 1),
             "metadata-only command validation unexpectedly started hash work"
         );
@@ -1837,13 +1873,13 @@ mod tests {
             )
             .expect("copy hash input");
         }
-        reset_hash_observation();
-        set_hash_pause(true);
+        let observer = Arc::new(HashTestObserver::default());
+        observer.set_paused(true);
         let first = tokio::spawn(open_pair_lease(
             directory.path().to_path_buf(),
-            OpenMode::Full,
+            OpenMode::FullObserved(observer.clone()),
         ));
-        while snapshot_hash_observation().0 == 0 {
+        while observer.snapshot().0 == 0 {
             tokio::task::yield_now().await;
         }
         first.abort();
@@ -1855,21 +1891,21 @@ mod tests {
         );
         let second = tokio::spawn(open_pair_lease(
             directory.path().to_path_buf(),
-            OpenMode::Full,
+            OpenMode::FullObserved(observer.clone()),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            snapshot_hash_observation().0,
+            observer.snapshot().0,
             1,
             "aborted future released admission while blocking hash was still alive"
         );
 
-        set_hash_pause(false);
+        observer.set_paused(false);
         second
             .await
             .expect("join second hash")
             .expect("second hash after retained admission");
-        assert_eq!(snapshot_hash_observation(), (4, 1));
+        assert_eq!(observer.snapshot(), (4, 1));
     }
 
     #[tokio::test]
@@ -1905,11 +1941,11 @@ mod tests {
             kind: RuntimeKind::SoftwareCompatible,
             lease: Arc::new(opened.lease),
             first_session_verified: AtomicBool::new(false),
+            hash_observer: Some(Arc::new(HashTestObserver::default())),
         });
         let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
-        let service = TranscodingService::resolved(RuntimeConfig::isolated(), supervisor, runtime);
-        reset_hash_observation();
-
+        let service =
+            TranscodingService::resolved(RuntimeConfig::isolated(), supervisor, runtime.clone());
         for _ in 0..16 {
             service
                 .runtime_for_session()
@@ -1918,7 +1954,11 @@ mod tests {
         }
 
         assert_eq!(
-            snapshot_hash_observation(),
+            runtime
+                .hash_observer
+                .as_ref()
+                .expect("test hash observer")
+                .snapshot(),
             (2, 1),
             "sessions after the first integrity check must use metadata identity seals"
         );
@@ -1937,14 +1977,17 @@ mod tests {
             file.set_len(MAX_EXECUTABLE_BYTES + 1)
                 .expect("size sparse executable");
         }
-        reset_hash_observation();
+        let observer = Arc::new(HashTestObserver::default());
 
-        let error = open_pair_lease(directory.path().to_path_buf(), OpenMode::Full)
-            .await
-            .expect_err("oversized executable must fail closed");
+        let error = open_pair_lease(
+            directory.path().to_path_buf(),
+            OpenMode::FullObserved(observer.clone()),
+        )
+        .await
+        .expect_err("oversized executable must fail closed");
 
         assert!(matches!(error, CandidateFailure::Unsafe));
-        assert_eq!(snapshot_hash_observation(), (0, 0));
+        assert_eq!(observer.snapshot(), (0, 0));
     }
 
     #[test]

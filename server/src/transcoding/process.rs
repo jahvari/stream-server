@@ -1,3 +1,5 @@
+#[cfg(all(test, windows))]
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
@@ -23,54 +25,109 @@ const MAX_WALL_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 const CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
-#[cfg(all(test, windows))]
-static PAUSE_OWNER_COMPLETE: AtomicBool = AtomicBool::new(false);
-#[cfg(all(test, windows))]
-static OWNER_COMPLETE_REACHED: AtomicBool = AtomicBool::new(false);
-#[cfg(all(test, windows))]
-static PAUSE_READER_HANDOFF: AtomicBool = AtomicBool::new(false);
-#[cfg(all(test, windows))]
-static READER_HANDOFF_REACHED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(super) static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(test, windows))]
-fn set_owner_complete_pause(paused: bool) {
-    PAUSE_OWNER_COMPLETE.store(paused, Ordering::Release);
-    if paused {
-        OWNER_COMPLETE_REACHED.store(false, Ordering::Release);
+#[derive(Default)]
+pub(super) struct WindowsLifecycleHooks {
+    pause_owner_complete: AtomicBool,
+    owner_complete_reached: AtomicBool,
+    pause_reader_handoff: AtomicBool,
+    reader_handoff_reached: AtomicBool,
+    pause_reader_completion: AtomicBool,
+    reader_completion_reached: AtomicUsize,
+    pause_after_resume: AtomicBool,
+    after_resume_reached: AtomicBool,
+    last_created_pid: AtomicU32,
+}
+
+#[cfg(all(test, windows))]
+impl WindowsLifecycleHooks {
+    fn set_owner_complete_pause(&self, paused: bool) {
+        self.pause_owner_complete.store(paused, Ordering::Release);
+        if paused {
+            self.owner_complete_reached.store(false, Ordering::Release);
+        }
     }
-}
 
-#[cfg(all(test, windows))]
-fn owner_complete_reached() -> bool {
-    OWNER_COMPLETE_REACHED.load(Ordering::Acquire)
-}
-
-#[cfg(all(test, windows))]
-async fn pause_owner_complete() {
-    OWNER_COMPLETE_REACHED.store(true, Ordering::Release);
-    while PAUSE_OWNER_COMPLETE.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    fn owner_complete_reached(&self) -> bool {
+        self.owner_complete_reached.load(Ordering::Acquire)
     }
-}
 
-#[cfg(all(test, windows))]
-fn set_reader_handoff_pause(paused: bool) {
-    PAUSE_READER_HANDOFF.store(paused, Ordering::Release);
-    if paused {
-        READER_HANDOFF_REACHED.store(false, Ordering::Release);
+    async fn pause_owner_complete(&self) {
+        self.owner_complete_reached.store(true, Ordering::Release);
+        while self.pause_owner_complete.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
-}
 
-#[cfg(all(test, windows))]
-fn reader_handoff_reached() -> bool {
-    READER_HANDOFF_REACHED.load(Ordering::Acquire)
-}
+    fn set_reader_handoff_pause(&self, paused: bool) {
+        self.pause_reader_handoff.store(paused, Ordering::Release);
+        if paused {
+            self.reader_handoff_reached.store(false, Ordering::Release);
+        }
+    }
 
-#[cfg(all(test, windows))]
-async fn pause_reader_handoff() {
-    READER_HANDOFF_REACHED.store(true, Ordering::Release);
-    while PAUSE_READER_HANDOFF.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    fn reader_handoff_reached(&self) -> bool {
+        self.reader_handoff_reached.load(Ordering::Acquire)
+    }
+
+    async fn pause_reader_handoff(&self) {
+        self.reader_handoff_reached.store(true, Ordering::Release);
+        while self.pause_reader_handoff.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn set_reader_completion_pause(&self, paused: bool) {
+        self.pause_reader_completion
+            .store(paused, Ordering::Release);
+        if paused {
+            self.reader_completion_reached.store(0, Ordering::Release);
+        }
+    }
+
+    fn reader_completion_reached(&self) -> bool {
+        self.reader_completion_reached.load(Ordering::Acquire) >= 2
+    }
+
+    fn pause_reader_completion(&self) {
+        self.reader_completion_reached
+            .fetch_add(1, Ordering::AcqRel);
+        while self.pause_reader_completion.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn set_after_resume_pause(&self, paused: bool) {
+        self.pause_after_resume.store(paused, Ordering::Release);
+        if paused {
+            self.after_resume_reached.store(false, Ordering::Release);
+        }
+    }
+
+    fn after_resume_reached(&self) -> bool {
+        self.after_resume_reached.load(Ordering::Acquire)
+    }
+
+    fn pause_after_resume(&self) {
+        self.after_resume_reached.store(true, Ordering::Release);
+        while self.pause_after_resume.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn clear_last_created_pid(&self) {
+        self.last_created_pid.store(0, Ordering::Release);
+    }
+
+    fn record_created_pid(&self, pid: u32) {
+        self.last_created_pid.store(pid, Ordering::Release);
+    }
+
+    fn last_created_pid(&self) -> u32 {
+        self.last_created_pid.load(Ordering::Acquire)
     }
 }
 
@@ -168,6 +225,10 @@ struct ProcessRegistry {
     next_id: AtomicU64,
     entries: Mutex<HashMap<u64, RegisteredEntry>>,
     idle: Notify,
+    #[cfg(all(test, windows))]
+    test_hooks: Arc<WindowsLifecycleHooks>,
+    #[cfg(all(test, windows))]
+    test_resources: Arc<windows::NativeResourceTracker>,
 }
 
 #[cfg(windows)]
@@ -257,6 +318,10 @@ impl ProcessRegistry {
             next_id: AtomicU64::new(1),
             entries: Mutex::new(HashMap::new()),
             idle: Notify::new(),
+            #[cfg(all(test, windows))]
+            test_hooks: Arc::new(WindowsLifecycleHooks::default()),
+            #[cfg(all(test, windows))]
+            test_resources: Arc::new(windows::NativeResourceTracker::default()),
         }
     }
 
@@ -702,6 +767,21 @@ impl ProcessSupervisor {
         self.inner.registry.len()
     }
 
+    #[cfg(all(test, windows))]
+    fn test_hooks(&self) -> Arc<WindowsLifecycleHooks> {
+        self.inner.registry.test_hooks.clone()
+    }
+
+    #[cfg(all(test, windows))]
+    fn test_resource_snapshot(&self) -> windows::ResourceSnapshot {
+        self.inner.registry.test_resources.snapshot()
+    }
+
+    #[cfg(all(test, windows))]
+    fn test_native_handle_count(&self) -> usize {
+        self.inner.registry.test_resources.handle_count()
+    }
+
     pub fn cancel(&self) {
         let _gate = self
             .inner
@@ -823,7 +903,7 @@ impl ProcessSupervisor {
                 spawned.registration.start_windows_owner_on(&owner_runtime);
                 #[cfg(test)]
                 if failure_point == Some(FailurePoint::PauseAfterResume) {
-                    windows::pause_after_resume();
+                    inner.registry.test_hooks.pause_after_resume();
                 }
             }
             (spec, spawned)
@@ -851,6 +931,8 @@ impl ProcessSupervisor {
             keep_stdout,
             ProcessErrorCode::StdoutLimitExceeded,
             limit_tx.clone(),
+            #[cfg(test)]
+            self.inner.registry.test_hooks.clone(),
         );
         let stderr_reader = windows::read_pipe(
             stderr,
@@ -858,6 +940,8 @@ impl ProcessSupervisor {
             true,
             ProcessErrorCode::StderrLimitExceeded,
             limit_tx,
+            #[cfg(test)]
+            self.inner.registry.test_hooks.clone(),
         );
         registration.set_windows_readers(stdout_reader, stderr_reader);
         registration.start_windows_owner();
@@ -1239,9 +1323,9 @@ fn spawn_windows_owner(
         let mut fallback = fallback;
         if let Ok(WindowsOwnerAction::Complete(result)) = receiver.await {
             #[cfg(test)]
-            pause_owner_complete().await;
+            registry.test_hooks.pause_owner_complete().await;
             #[cfg(test)]
-            pause_reader_handoff().await;
+            registry.test_hooks.pause_reader_handoff().await;
             let output = await_registered_windows_readers(&registry, id, true).await;
             if output.is_err() {
                 registry.mark_retained(id);

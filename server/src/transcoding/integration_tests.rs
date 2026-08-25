@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::transcoding::process::{
-    ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
+    PROCESS_TEST_LOCK, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
 #[cfg(unix)]
 use crate::transcoding::runtime::verify_unchanged;
@@ -17,8 +17,6 @@ use crate::transcoding::runtime::{
 use crate::transcoding::runtime_manifest::RuntimeError;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-
-static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct FakeProcess {
     _directory: TempDir,

@@ -1,6 +1,10 @@
+#[cfg(test)]
+use super::WindowsLifecycleHooks;
 use super::{
     NativeFailurePoint, ProcessError, ProcessErrorCode, ProcessRegistry, ProcessSpec, Registration,
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{
     cmp::Ordering,
     ffi::{OsStr, OsString},
@@ -11,10 +15,7 @@ use std::{
         ffi::OsStrExt,
         io::{FromRawHandle, RawHandle},
     },
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    },
+    sync::Arc,
 };
 use windows::{
     Win32::{
@@ -57,22 +58,6 @@ const FAILURE_AFTER_SUSPENDED_CREATE: u8 = 3;
 const FAILURE_AFTER_JOB_ASSIGNMENT: u8 = 4;
 const FAILURE_AFTER_REGISTRY_INSERTION: u8 = 5;
 
-static TRACKED_HANDLES: AtomicUsize = AtomicUsize::new(0);
-static TRACKED_ATTRIBUTE_LISTS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static LAST_CREATED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(test)]
-static PAUSE_AFTER_RESUME: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static PAUSE_AFTER_RESUME_REACHED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static PAUSE_READER_COMPLETION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static READER_COMPLETION_REACHED: AtomicUsize = AtomicUsize::new(0);
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ResourceSnapshot {
@@ -81,10 +66,23 @@ pub(super) struct ResourceSnapshot {
 }
 
 #[cfg(test)]
-pub(super) fn resource_snapshot() -> ResourceSnapshot {
-    ResourceSnapshot {
-        handles: TRACKED_HANDLES.load(AtomicOrdering::Acquire),
-        attribute_lists: TRACKED_ATTRIBUTE_LISTS.load(AtomicOrdering::Acquire),
+#[derive(Default)]
+pub(super) struct NativeResourceTracker {
+    handles: AtomicUsize,
+    attribute_lists: AtomicUsize,
+}
+
+#[cfg(test)]
+impl NativeResourceTracker {
+    pub(super) fn snapshot(&self) -> ResourceSnapshot {
+        ResourceSnapshot {
+            handles: self.handles.load(AtomicOrdering::Acquire),
+            attribute_lists: self.attribute_lists.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    pub(super) fn handle_count(&self) -> usize {
+        self.handles.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -99,53 +97,6 @@ pub(super) fn process_handle_count() -> u32 {
         .expect("query process handle count");
     }
     count
-}
-
-#[cfg(test)]
-pub(super) fn last_created_pid() -> u32 {
-    LAST_CREATED_PID.load(AtomicOrdering::Acquire)
-}
-
-#[cfg(test)]
-pub(super) fn set_pause_after_resume(paused: bool) {
-    PAUSE_AFTER_RESUME.store(paused, AtomicOrdering::Release);
-    if paused {
-        PAUSE_AFTER_RESUME_REACHED.store(false, AtomicOrdering::Release);
-    }
-}
-
-#[cfg(test)]
-pub(super) fn pause_after_resume_reached() -> bool {
-    PAUSE_AFTER_RESUME_REACHED.load(AtomicOrdering::Acquire)
-}
-
-#[cfg(test)]
-pub(super) fn pause_after_resume() {
-    PAUSE_AFTER_RESUME_REACHED.store(true, AtomicOrdering::Release);
-    while PAUSE_AFTER_RESUME.load(AtomicOrdering::Acquire) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-#[cfg(test)]
-pub(super) fn set_reader_completion_pause(paused: bool) {
-    PAUSE_READER_COMPLETION.store(paused, AtomicOrdering::Release);
-    if paused {
-        READER_COMPLETION_REACHED.store(0, AtomicOrdering::Release);
-    }
-}
-
-#[cfg(test)]
-pub(super) fn reader_completion_reached() -> bool {
-    READER_COMPLETION_REACHED.load(AtomicOrdering::Acquire) >= 2
-}
-
-#[cfg(test)]
-fn pause_reader_completion() {
-    READER_COMPLETION_REACHED.fetch_add(1, AtomicOrdering::AcqRel);
-    while PAUSE_READER_COMPLETION.load(AtomicOrdering::Acquire) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
 }
 
 #[cfg(test)]
@@ -178,29 +129,49 @@ pub(super) struct SpawnedProcess {
 
 pub(super) struct TrackedHandle {
     raw: HANDLE,
+    #[cfg(test)]
+    tracker: Arc<NativeResourceTracker>,
 }
 
 unsafe impl Send for TrackedHandle {}
 unsafe impl Sync for TrackedHandle {}
 
 impl TrackedHandle {
-    fn new(raw: HANDLE) -> Result<Self, ProcessError> {
+    fn new(
+        raw: HANDLE,
+        #[cfg(test)] tracker: Arc<NativeResourceTracker>,
+    ) -> Result<Self, ProcessError> {
         if raw.is_invalid() {
             return Err(spawn_error());
         }
-        TRACKED_HANDLES.fetch_add(1, AtomicOrdering::AcqRel);
-        Ok(Self { raw })
+        #[cfg(test)]
+        tracker.handles.fetch_add(1, AtomicOrdering::AcqRel);
+        Ok(Self {
+            raw,
+            #[cfg(test)]
+            tracker,
+        })
     }
 
     fn raw(&self) -> HANDLE {
         self.raw
     }
 
+    #[cfg(not(test))]
     fn into_file(mut self) -> File {
         let raw = self.raw;
         self.raw = HANDLE::default();
-        TRACKED_HANDLES.fetch_sub(1, AtomicOrdering::AcqRel);
         unsafe { File::from_raw_handle(raw.0 as RawHandle) }
+    }
+
+    #[cfg(test)]
+    fn into_file(mut self) -> TrackedFile {
+        let raw = self.raw;
+        self.raw = HANDLE::default();
+        TrackedFile {
+            file: unsafe { File::from_raw_handle(raw.0 as RawHandle) },
+            tracker: self.tracker.clone(),
+        }
     }
 }
 
@@ -210,19 +181,46 @@ impl Drop for TrackedHandle {
             unsafe {
                 let _ = CloseHandle(self.raw);
             }
-            TRACKED_HANDLES.fetch_sub(1, AtomicOrdering::AcqRel);
+            #[cfg(test)]
+            self.tracker.handles.fetch_sub(1, AtomicOrdering::AcqRel);
             self.raw = HANDLE::default();
         }
+    }
+}
+
+#[cfg(test)]
+struct TrackedFile {
+    file: File,
+    tracker: Arc<NativeResourceTracker>,
+}
+
+#[cfg(test)]
+impl Read for TrackedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TrackedFile {
+    fn drop(&mut self) {
+        self.tracker.handles.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
 
 struct AttributeList {
     storage: Vec<usize>,
     pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
+    #[cfg(test)]
+    tracker: Arc<NativeResourceTracker>,
 }
 
 impl AttributeList {
-    fn new(handles: &[HANDLE], failure_point: NativeFailurePoint) -> Result<Self, ProcessError> {
+    fn new(
+        handles: &[HANDLE],
+        failure_point: NativeFailurePoint,
+        #[cfg(test)] tracker: Arc<NativeResourceTracker>,
+    ) -> Result<Self, ProcessError> {
         let mut bytes = 0_usize;
         unsafe {
             let _ = InitializeProcThreadAttributeList(None, 1, None, &mut bytes);
@@ -237,8 +235,14 @@ impl AttributeList {
             InitializeProcThreadAttributeList(Some(pointer), 1, None, &mut bytes)
                 .map_err(|_| spawn_error())?;
         }
-        TRACKED_ATTRIBUTE_LISTS.fetch_add(1, AtomicOrdering::AcqRel);
-        let list = Self { storage, pointer };
+        #[cfg(test)]
+        tracker.attribute_lists.fetch_add(1, AtomicOrdering::AcqRel);
+        let list = Self {
+            storage,
+            pointer,
+            #[cfg(test)]
+            tracker,
+        };
         inject(failure_point, FAILURE_DURING_ATTRIBUTE_LIST_UPDATE)?;
         unsafe {
             UpdateProcThreadAttribute(
@@ -261,7 +265,10 @@ impl Drop for AttributeList {
         unsafe {
             DeleteProcThreadAttributeList(self.pointer);
         }
-        TRACKED_ATTRIBUTE_LISTS.fetch_sub(1, AtomicOrdering::AcqRel);
+        #[cfg(test)]
+        self.tracker
+            .attribute_lists
+            .fetch_sub(1, AtomicOrdering::AcqRel);
         self.storage.clear();
     }
 }
@@ -276,10 +283,19 @@ struct PipeSet {
 }
 
 impl PipeSet {
-    fn new() -> Result<Self, ProcessError> {
-        let (stdin_child, stdin_parent) = create_pipe()?;
-        let (stdout_parent, stdout_child) = create_pipe()?;
-        let (stderr_parent, stderr_child) = create_pipe()?;
+    fn new(#[cfg(test)] tracker: Arc<NativeResourceTracker>) -> Result<Self, ProcessError> {
+        let (stdin_child, stdin_parent) = create_pipe(
+            #[cfg(test)]
+            tracker.clone(),
+        )?;
+        let (stdout_parent, stdout_child) = create_pipe(
+            #[cfg(test)]
+            tracker.clone(),
+        )?;
+        let (stderr_parent, stderr_child) = create_pipe(
+            #[cfg(test)]
+            tracker,
+        )?;
         set_non_inheritable(&stdin_parent)?;
         set_non_inheritable(&stdout_parent)?;
         set_non_inheritable(&stderr_parent)?;
@@ -360,12 +376,15 @@ pub(super) fn spawn(
     failure_point: NativeFailurePoint,
 ) -> Result<SpawnedProcess, ProcessError> {
     #[cfg(test)]
-    LAST_CREATED_PID.store(0, AtomicOrdering::Release);
+    registry.test_hooks.clear_last_created_pid();
     let executable = nul_terminated(spec.executable.as_os_str())?;
     let current_dir = nul_terminated(spec.current_dir.as_os_str())?;
     let mut command_line = build_command_line(spec.executable.as_os_str(), &spec.args)?;
     let environment = build_environment_block(&spec.environment)?;
-    let mut pipes = PipeSet::new()?;
+    let mut pipes = PipeSet::new(
+        #[cfg(test)]
+        registry.test_resources.clone(),
+    )?;
     inject(failure_point, FAILURE_AFTER_PIPE_SETUP)?;
 
     let inheritable = [
@@ -373,7 +392,12 @@ pub(super) fn spawn(
         pipes.stdout_child.raw(),
         pipes.stderr_child.raw(),
     ];
-    let attributes = AttributeList::new(&inheritable, failure_point)?;
+    let attributes = AttributeList::new(
+        &inheritable,
+        failure_point,
+        #[cfg(test)]
+        registry.test_resources.clone(),
+    )?;
     inject(failure_point, FAILURE_AFTER_ATTRIBUTE_LIST_SETUP)?;
 
     let mut startup = STARTUPINFOEXW::default();
@@ -404,9 +428,19 @@ pub(super) fn spawn(
         .map_err(|_| spawn_error())?;
     }
     #[cfg(test)]
-    LAST_CREATED_PID.store(process_info.dwProcessId, AtomicOrdering::Release);
-    let process = TrackedHandle::new(process_info.hProcess)?;
-    let thread = TrackedHandle::new(process_info.hThread)?;
+    registry
+        .test_hooks
+        .record_created_pid(process_info.dwProcessId);
+    let process = TrackedHandle::new(
+        process_info.hProcess,
+        #[cfg(test)]
+        registry.test_resources.clone(),
+    )?;
+    let thread = TrackedHandle::new(
+        process_info.hThread,
+        #[cfg(test)]
+        registry.test_resources.clone(),
+    )?;
     let mut cleanup = FailedSpawnCleanup::new(process, thread);
     if inject(failure_point, FAILURE_AFTER_SUSPENDED_CREATE).is_err() {
         cleanup.terminate_and_wait()?;
@@ -420,7 +454,11 @@ pub(super) fn spawn(
             return Err(spawn_error());
         }
     };
-    let job = match TrackedHandle::new(raw_job) {
+    let job = match TrackedHandle::new(
+        raw_job,
+        #[cfg(test)]
+        registry.test_resources.clone(),
+    ) {
         Ok(job) => job,
         Err(error) => {
             cleanup.terminate_and_wait()?;
@@ -490,12 +528,16 @@ pub(super) fn spawn(
         &mut pipes.stdout_parent,
         TrackedHandle {
             raw: HANDLE::default(),
+            #[cfg(test)]
+            tracker: registry.test_resources.clone(),
         },
     );
     let stderr = std::mem::replace(
         &mut pipes.stderr_parent,
         TrackedHandle {
             raw: HANDLE::default(),
+            #[cfg(test)]
+            tracker: registry.test_resources.clone(),
         },
     );
     Ok(SpawnedProcess {
@@ -513,6 +555,7 @@ pub(super) fn read_pipe(
     keep: bool,
     limit_code: ProcessErrorCode,
     limit_tx: tokio::sync::mpsc::UnboundedSender<ProcessErrorCode>,
+    #[cfg(test)] test_hooks: Arc<WindowsLifecycleHooks>,
 ) -> tokio::task::JoinHandle<Result<Vec<u8>, ProcessError>> {
     tokio::task::spawn_blocking(move || {
         let mut file = pipe.into_file();
@@ -542,7 +585,7 @@ pub(super) fn read_pipe(
             }
         }
         #[cfg(test)]
-        pause_reader_completion();
+        test_hooks.pause_reader_completion();
         if exceeded {
             Err(ProcessError::new(limit_code))
         } else if keep {
@@ -629,7 +672,9 @@ pub(super) fn process_id(process: &TrackedHandle) -> u32 {
     unsafe { GetProcessId(process.raw()) }
 }
 
-fn create_pipe() -> Result<(TrackedHandle, TrackedHandle), ProcessError> {
+fn create_pipe(
+    #[cfg(test)] tracker: Arc<NativeResourceTracker>,
+) -> Result<(TrackedHandle, TrackedHandle), ProcessError> {
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
     let attributes = SECURITY_ATTRIBUTES {
@@ -641,8 +686,16 @@ fn create_pipe() -> Result<(TrackedHandle, TrackedHandle), ProcessError> {
         CreatePipe(&mut read, &mut write, Some(&raw const attributes), 0)
             .map_err(|_| spawn_error())?;
     }
-    let read = TrackedHandle::new(read)?;
-    let write = TrackedHandle::new(write)?;
+    let read = TrackedHandle::new(
+        read,
+        #[cfg(test)]
+        tracker.clone(),
+    )?;
+    let write = TrackedHandle::new(
+        write,
+        #[cfg(test)]
+        tracker,
+    )?;
     Ok((read, write))
 }
 

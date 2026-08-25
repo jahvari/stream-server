@@ -12,7 +12,46 @@ fn retained_registry_sleep_helper() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
-async fn wait_for_hook(reached: fn() -> bool) {
+#[tokio::test]
+#[ignore = "spawned only by isolated_native_handle_baseline_is_stable_after_repeated_runs"]
+async fn isolated_native_handle_baseline_helper() {
+    let supervisor = ProcessSupervisor::new(CancellationToken::new());
+    supervisor
+        .run_bounded(inert_spec())
+        .await
+        .expect("warm native process resources");
+    let handles_before = super::windows::process_handle_count();
+
+    for _ in 0..4 {
+        supervisor
+            .run_bounded(inert_spec())
+            .await
+            .expect("repeat bounded native process");
+    }
+
+    assert_eq!(supervisor.test_native_handle_count(), 0);
+    assert_eq!(super::windows::process_handle_count(), handles_before);
+}
+
+#[test]
+fn isolated_native_handle_baseline_is_stable_after_repeated_runs() {
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "transcoding::process::tests::isolated_native_handle_baseline_helper",
+        ])
+        .output()
+        .expect("spawn isolated native handle test");
+
+    assert!(
+        output.status.success(),
+        "isolated native handle test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn wait_for_hook(reached: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while !reached() {
             tokio::task::yield_now().await;
@@ -57,14 +96,15 @@ fn unix_group_identity_forbids_reap_before_final_signal_and_reuse_after_reap() {
 async fn abort_one_run_at_reader_handoff(
     supervisor: &std::sync::Arc<ProcessSupervisor>,
 ) -> Result<(), super::ProcessError> {
-    super::windows::set_reader_completion_pause(true);
-    super::set_reader_handoff_pause(true);
+    let hooks = supervisor.test_hooks();
+    hooks.set_reader_completion_pause(true);
+    hooks.set_reader_handoff_pause(true);
     let running = {
         let supervisor = supervisor.clone();
         tokio::spawn(async move { supervisor.run_bounded(inert_spec()).await })
     };
-    wait_for_hook(super::windows::reader_completion_reached).await;
-    wait_for_hook(super::reader_handoff_reached).await;
+    wait_for_hook(|| hooks.reader_completion_reached()).await;
+    wait_for_hook(|| hooks.reader_handoff_reached()).await;
     running.abort();
     assert!(
         running
@@ -72,9 +112,9 @@ async fn abort_one_run_at_reader_handoff(
             .expect_err("run future must be aborted")
             .is_cancelled()
     );
-    super::set_reader_handoff_pause(false);
+    hooks.set_reader_handoff_pause(false);
     let premature_drain = supervisor.wait_for_idle(Duration::from_millis(100)).await;
-    super::windows::set_reader_completion_pause(false);
+    hooks.set_reader_completion_pause(false);
     supervisor
         .wait_for_idle(Duration::from_secs(5))
         .await
@@ -83,7 +123,42 @@ async fn abort_one_run_at_reader_handoff(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_pauses_only_block_the_target_supervisor() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
+    let target = std::sync::Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let control = ProcessSupervisor::new(CancellationToken::new());
+    let hooks = target.test_hooks();
+    hooks.set_reader_completion_pause(true);
+    hooks.set_owner_complete_pause(true);
+    let target_run = {
+        let target = target.clone();
+        tokio::spawn(async move { target.run_bounded(inert_spec()).await })
+    };
+
+    wait_for_hook(|| hooks.reader_completion_reached()).await;
+    tokio::time::timeout(Duration::from_secs(2), control.run_bounded(inert_spec()))
+        .await
+        .expect("unrelated supervisor must not inherit reader pause")
+        .expect("unrelated supervisor completes normally");
+    assert_eq!(target.active_processes(), 1);
+
+    hooks.set_reader_completion_pause(false);
+    wait_for_hook(|| hooks.owner_complete_reached()).await;
+    assert!(
+        !target_run.is_finished(),
+        "target owner must remain at its own completion barrier"
+    );
+    hooks.set_owner_complete_pause(false);
+    target_run
+        .await
+        .expect("join target run")
+        .expect("target completes after releasing its own hooks");
+    assert_eq!(target.active_processes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_after_complete_send_keeps_owner_until_registry_and_permit_are_released() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     let supervisor = std::sync::Arc::new(ProcessSupervisor::with_max_concurrency(
         CancellationToken::new(),
         1,
@@ -92,14 +167,15 @@ async fn abort_after_complete_send_keeps_owner_until_registry_and_permit_are_rel
         .run_bounded(inert_spec())
         .await
         .expect("warm owner resources");
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
-    super::set_owner_complete_pause(true);
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
+    let hooks = supervisor.test_hooks();
+    hooks.set_owner_complete_pause(true);
     let running = {
         let supervisor = supervisor.clone();
         tokio::spawn(async move { supervisor.run_bounded(inert_spec()).await })
     };
-    wait_for_hook(super::owner_complete_reached).await;
+    wait_for_hook(|| hooks.owner_complete_reached()).await;
     let registration_id = *supervisor
         .inner
         .registry
@@ -119,7 +195,7 @@ async fn abort_after_complete_send_keeps_owner_until_registry_and_permit_are_rel
             .expect_err("run future must be aborted")
             .is_cancelled()
     );
-    super::set_owner_complete_pause(false);
+    hooks.set_owner_complete_pause(false);
     let first_drain = supervisor.wait_for_idle(Duration::from_millis(100)).await;
     if first_drain.is_err() {
         remove_test_registry_entry(&supervisor, registration_id);
@@ -131,19 +207,20 @@ async fn abort_after_complete_send_keeps_owner_until_registry_and_permit_are_rel
     );
     assert_eq!(supervisor.active_processes(), 0);
     assert_eq!(supervisor.inner.permits.available_permits(), 1);
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_after_reader_handoff_keeps_readers_registry_and_permit_owned_until_joined() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     let supervisor = std::sync::Arc::new(ProcessSupervisor::with_max_concurrency(
         CancellationToken::new(),
         1,
     ));
     let _ = abort_one_run_at_reader_handoff(&supervisor).await;
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
     let premature_drain = abort_one_run_at_reader_handoff(&supervisor).await;
 
     assert!(
@@ -152,12 +229,13 @@ async fn abort_after_reader_handoff_keeps_readers_registry_and_permit_owned_unti
     );
     assert_eq!(supervisor.active_processes(), 0);
     assert_eq!(supervisor.inner.permits.available_permits(), 1);
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[test]
 fn registration_drop_without_a_runtime_leaves_no_stuck_cleanup_state() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.blocking_lock();
     let supervisor = ProcessSupervisor::with_max_concurrency(CancellationToken::new(), 1);
     let permit = supervisor
         .inner
@@ -208,6 +286,7 @@ fn registration_drop_without_a_runtime_leaves_no_stuck_cleanup_state() {
 
 #[test]
 fn never_polled_owner_is_killed_and_made_reapable_during_runtime_teardown() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.blocking_lock();
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
     let mut request = inert_spec();
     request.args = vec![
@@ -298,6 +377,7 @@ fn inert_spec() -> ProcessSpec {
 
 #[tokio::test]
 async fn every_injected_native_spawn_failure_releases_all_resources_and_registry_ownership() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     let points = [
         FailurePoint::PipeSetup,
         FailurePoint::AttributeListUpdate,
@@ -316,8 +396,8 @@ async fn every_injected_native_spawn_failure_releases_all_resources_and_registry
 
     for point in points {
         let supervisor = ProcessSupervisor::with_failure_point(CancellationToken::new(), point);
-        let before = super::windows::resource_snapshot();
-        let handles_before = super::windows::process_handle_count();
+        let before = supervisor.test_resource_snapshot();
+        let handles_before = supervisor.test_native_handle_count();
 
         let error = supervisor
             .run_bounded(inert_spec())
@@ -331,12 +411,12 @@ async fn every_injected_native_spawn_failure_releases_all_resources_and_registry
             "{point:?} leaked registry ownership"
         );
         assert_eq!(
-            super::windows::resource_snapshot(),
+            supervisor.test_resource_snapshot(),
             before,
             "{point:?} leaked native resources"
         );
         assert_eq!(
-            super::windows::process_handle_count(),
+            supervisor.test_native_handle_count(),
             handles_before,
             "{point:?} changed the native process handle count"
         );
@@ -345,6 +425,7 @@ async fn every_injected_native_spawn_failure_releases_all_resources_and_registry
 
 #[tokio::test]
 async fn update_attribute_failure_creates_no_child_and_releases_initialized_storage() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     ProcessSupervisor::new(CancellationToken::new())
         .run_bounded(inert_spec())
         .await
@@ -353,8 +434,8 @@ async fn update_attribute_failure_creates_no_child_and_releases_initialized_stor
         CancellationToken::new(),
         FailurePoint::AttributeListUpdate,
     );
-    let before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
 
     let error = supervisor
         .run_bounded(inert_spec())
@@ -362,14 +443,15 @@ async fn update_attribute_failure_creates_no_child_and_releases_initialized_stor
         .expect_err("attribute update injection must fail");
 
     assert_eq!(error.code(), ProcessErrorCode::SpawnFailed);
-    assert_eq!(super::windows::last_created_pid(), 0);
+    assert_eq!(supervisor.test_hooks().last_created_pid(), 0);
     assert_eq!(supervisor.active_processes(), 0);
-    assert_eq!(super::windows::resource_snapshot(), before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[tokio::test]
 async fn every_post_create_injected_failure_waits_until_the_actual_pid_is_dead() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     for point in [
         FailurePoint::SuspendedCreate,
         FailurePoint::JobAssignment,
@@ -382,7 +464,7 @@ async fn every_post_create_injected_failure_waits_until_the_actual_pid_is_dead()
             .run_bounded(inert_spec())
             .await
             .expect_err("post-create injection must fail");
-        let pid = super::windows::last_created_pid();
+        let pid = supervisor.test_hooks().last_created_pid();
 
         assert_ne!(pid, 0, "{point:?} did not reach CreateProcessW");
         assert!(
@@ -395,6 +477,7 @@ async fn every_post_create_injected_failure_waits_until_the_actual_pid_is_dead()
 
 #[tokio::test]
 async fn post_resume_failure_drains_descendant_job_before_return() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     ProcessSupervisor::new(CancellationToken::new())
         .run_bounded(inert_spec())
         .await
@@ -405,8 +488,8 @@ async fn post_resume_failure_drains_descendant_job_before_return() {
         CancellationToken::new(),
         FailurePoint::ResumeAfterDescendant,
     );
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
     let mut request = inert_spec();
     request.args = vec![
         OsString::from("--ignored"),
@@ -422,7 +505,7 @@ async fn post_resume_failure_drains_descendant_job_before_return() {
         .run_bounded(request)
         .await
         .expect_err("post-resume injection must fail");
-    let parent_pid = super::windows::last_created_pid();
+    let parent_pid = supervisor.test_hooks().last_created_pid();
     let child_pid = fs::read_to_string(&marker)
         .expect("read descendant pid")
         .parse::<u32>()
@@ -432,12 +515,13 @@ async fn post_resume_failure_drains_descendant_job_before_return() {
     assert!(!super::windows::process_is_alive(parent_pid));
     assert!(!super::windows::process_is_alive(child_pid));
     assert_eq!(supervisor.active_processes(), 0);
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     ProcessSupervisor::new(CancellationToken::new())
         .run_bounded(inert_spec())
         .await
@@ -448,8 +532,8 @@ async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned(
         CancellationToken::new(),
         FailurePoint::PauseAfterResume,
     ));
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
     let mut request = inert_spec();
     request.args = vec![
         OsString::from("--ignored"),
@@ -460,18 +544,19 @@ async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned(
         OsString::from("STREAM_SERVER_TEST_DESCENDANT_MARKER"),
         marker.as_os_str().to_os_string(),
     );
-    super::windows::set_pause_after_resume(true);
+    let hooks = supervisor.test_hooks();
+    hooks.set_after_resume_pause(true);
     let running = tokio::spawn({
         let supervisor = supervisor.clone();
         async move { supervisor.run_bounded(request).await }
     });
-    while !super::windows::pause_after_resume_reached() {
+    while !hooks.after_resume_reached() {
         tokio::task::yield_now().await;
     }
     while !marker.is_file() {
         tokio::task::yield_now().await;
     }
-    let parent_pid = super::windows::last_created_pid();
+    let parent_pid = hooks.last_created_pid();
     let child_pid = fs::read_to_string(&marker)
         .expect("read descendant pid")
         .parse::<u32>()
@@ -483,7 +568,7 @@ async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned(
         supervisor.inner.permits.available_permits(),
         super::DEFAULT_MAX_CONCURRENT_PROCESSES - 1
     );
-    super::windows::set_pause_after_resume(false);
+    hooks.set_after_resume_pause(false);
     assert!(
         running
             .await
@@ -502,19 +587,20 @@ async fn abort_during_native_return_handoff_keeps_tree_permit_and_handles_owned(
         supervisor.inner.permits.available_permits(),
         super::DEFAULT_MAX_CONCURRENT_PROCESSES
     );
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[tokio::test]
 async fn retained_registry_entry_can_be_retried_until_confirmed_drained() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
     supervisor
         .run_bounded(inert_spec())
         .await
         .expect("warm owner and blocking cleanup resources");
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
     let mut request = inert_spec();
     request.args = vec![
         OsString::from("--ignored"),
@@ -553,12 +639,13 @@ async fn retained_registry_entry_can_be_retried_until_confirmed_drained() {
 
     assert_eq!(supervisor.active_processes(), 0);
     assert!(!super::windows::process_is_alive(pid));
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
 
 #[tokio::test]
 async fn post_spawn_wait_failure_retains_blocking_readers_until_retry_drains_every_resource() {
+    let _resource_guard = super::PROCESS_TEST_LOCK.lock().await;
     ProcessSupervisor::new(CancellationToken::new())
         .run_bounded(inert_spec())
         .await
@@ -567,8 +654,8 @@ async fn post_spawn_wait_failure_retains_blocking_readers_until_retry_drains_eve
         CancellationToken::new(),
         FailurePoint::WaitAfterReaders,
     );
-    let resources_before = super::windows::resource_snapshot();
-    let handles_before = super::windows::process_handle_count();
+    let resources_before = supervisor.test_resource_snapshot();
+    let handles_before = supervisor.test_native_handle_count();
     let mut request = inert_spec();
     request.args = vec![
         OsString::from("--ignored"),
@@ -594,6 +681,6 @@ async fn post_spawn_wait_failure_retains_blocking_readers_until_retry_drains_eve
         .expect("retry must drain process and retained blocking readers");
 
     assert_eq!(supervisor.active_processes(), 0);
-    assert_eq!(super::windows::resource_snapshot(), resources_before);
-    assert_eq!(super::windows::process_handle_count(), handles_before);
+    assert_eq!(supervisor.test_resource_snapshot(), resources_before);
+    assert_eq!(supervisor.test_native_handle_count(), handles_before);
 }
