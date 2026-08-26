@@ -59,8 +59,11 @@ fn archive_magic(bytes: &[u8]) -> bool {
         || bytes.get(257..262) == Some(b"ustar")
 }
 
-fn forbidden_runtime_payload(path: &Path, bytes: &[u8]) -> bool {
-    let path = normalized(path);
+fn forbidden_runtime_payload(repository: &Path, path: &Path, bytes: &[u8]) -> bool {
+    let Ok(relative) = path.strip_prefix(repository) else {
+        return true;
+    };
+    let path = normalized(relative);
     let file_name = path.rsplit('/').next().unwrap_or_default();
     if matches!(
         file_name,
@@ -82,7 +85,7 @@ fn forbidden_runtime_payload(path: &Path, bytes: &[u8]) -> bool {
     bytes.starts_with(b"MZ")
         && !ALLOWED_APPLICATION_PE
             .iter()
-            .any(|allowed| path == *allowed || path.ends_with(&format!("/{allowed}")))
+            .any(|allowed| path == *allowed)
 }
 
 #[cfg(windows)]
@@ -96,22 +99,28 @@ fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn scan_candidate_tree_with<F>(path: &Path, read_children: &mut F) -> Result<(), &'static str>
+fn scan_candidate_tree_with<F>(
+    repository: &Path,
+    path: &Path,
+    read_children: &mut F,
+) -> Result<(), &'static str>
 where
     F: FnMut(&Path) -> std::io::Result<Vec<PathBuf>>,
 {
+    path.strip_prefix(repository)
+        .map_err(|_| "package input is outside the repository")?;
     let metadata = fs::symlink_metadata(path).map_err(|_| "package input metadata unavailable")?;
     if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
         return Err("package input is a link or reparse point");
     }
     if metadata.is_dir() {
         for child in read_children(path).map_err(|_| "package directory enumeration failed")? {
-            scan_candidate_tree_with(&child, read_children)?;
+            scan_candidate_tree_with(repository, &child, read_children)?;
         }
         Ok(())
     } else if metadata.is_file() {
         let bytes = fs::read(path).map_err(|_| "package input could not be read")?;
-        if forbidden_runtime_payload(path, &bytes) {
+        if forbidden_runtime_payload(repository, path, &bytes) {
             Err("forbidden runtime payload in package input")
         } else {
             Ok(())
@@ -121,8 +130,8 @@ where
     }
 }
 
-fn candidate_tree_is_safe(path: &Path) -> Result<(), &'static str> {
-    scan_candidate_tree_with(path, &mut |directory| {
+fn candidate_tree_is_safe(repository: &Path, path: &Path) -> Result<(), &'static str> {
+    scan_candidate_tree_with(repository, path, &mut |directory| {
         fs::read_dir(directory)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
@@ -209,12 +218,15 @@ fn cargo_deb_sources(cargo: &str) -> Result<BTreeSet<String>, &'static str> {
 #[derive(Debug)]
 struct WorkflowStep {
     job: String,
+    ordinal: usize,
     name: Option<String>,
     uses: Option<String>,
     artifact_name: Option<String>,
     paths: Vec<String>,
     release_files: Vec<String>,
     run: Option<String>,
+    fields: BTreeSet<String>,
+    inputs: BTreeMap<String, Vec<String>>,
 }
 
 fn yaml_indent(line: &str) -> Result<usize, &'static str> {
@@ -225,8 +237,28 @@ fn yaml_indent(line: &str) -> Result<usize, &'static str> {
     Ok(whitespace)
 }
 
-fn yaml_scalar(value: &str) -> String {
-    value.trim().trim_matches(['"', '\'']).to_owned()
+fn yaml_scalar(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty()
+        || value
+            .chars()
+            .next()
+            .is_some_and(|value| matches!(value, '&' | '*' | '!' | '{' | '[' | '>'))
+        || matches!(value, "|" | "|-")
+    {
+        return Err("unsupported workflow scalar shape");
+    }
+    if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|value| matches!(value, '"' | '\''))
+    {
+        if value.len() < 2 || !value.ends_with(quote) {
+            return Err("unterminated workflow scalar");
+        }
+        return Ok(value[1..value.len() - 1].to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 fn yaml_field(value: &str) -> Option<(&str, &str)> {
@@ -277,6 +309,61 @@ fn block_value(
         index += 1;
     }
     Ok((value, end))
+}
+
+fn allowed_action_inputs(action: &str) -> Option<&'static [&'static str]> {
+    match action {
+        "actions/checkout@v7" => Some(&["fetch-depth"]),
+        "dtolnay/rust-toolchain@1.98.0" => Some(&["components", "targets"]),
+        "taiki-e/install-action@v2" => Some(&["tool"]),
+        "actions/cache@v6" => Some(&["path", "key", "restore-keys"]),
+        "actions/github-script@v9" => Some(&["script"]),
+        "lukka/run-vcpkg@v11" => Some(&[
+            "vcpkgGitCommitId",
+            "vcpkgDirectory",
+            "vcpkgJsonGlob",
+            "runVcpkgInstall",
+        ]),
+        "actions/upload-artifact@v7" => Some(&["name", "path"]),
+        "actions/download-artifact@v8" => Some(&["path"]),
+        "softprops/action-gh-release@v3" => {
+            Some(&["files", "body_path", "generate_release_notes", "prerelease"])
+        }
+        _ => None,
+    }
+}
+
+fn validate_workflow_step_shape(step: &WorkflowStep) -> Result<(), &'static str> {
+    match (step.uses.as_deref(), step.run.as_deref()) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err("workflow step must declare exactly one action or run command");
+        }
+        (Some(action), None) => {
+            let allowed = allowed_action_inputs(action).ok_or("unknown workflow action")?;
+            if step
+                .inputs
+                .keys()
+                .any(|input| !allowed.contains(&input.as_str()))
+            {
+                return Err("unknown workflow action input");
+            }
+            if step.fields.iter().any(|field| field == "run") {
+                return Err("action step includes a run field");
+            }
+        }
+        (None, Some(_)) => {
+            if step.fields.contains("with")
+                || !step.inputs.is_empty()
+                || step
+                    .fields
+                    .iter()
+                    .any(|field| matches!(field.as_str(), "uses" | "id"))
+            {
+                return Err("run step includes action-only fields");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
@@ -348,6 +435,7 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
             .min()
             .ok_or("workflow steps sequence is empty")?;
         let mut cursor = steps_mapping + 1;
+        let mut ordinal = 0;
         while cursor < sequence_end {
             if lines[cursor].trim().is_empty() {
                 cursor += 1;
@@ -370,13 +458,17 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
             let end = cursor;
             let mut step = WorkflowStep {
                 job: job.clone(),
+                ordinal,
                 name: None,
                 uses: None,
                 artifact_name: None,
                 paths: Vec::new(),
                 release_files: Vec::new(),
                 run: None,
+                fields: BTreeSet::new(),
+                inputs: BTreeMap::new(),
             };
+            ordinal += 1;
             let first = lines[start]
                 .trim_start()
                 .strip_prefix('-')
@@ -397,22 +489,28 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
             }
             if let Some(field_indent) = field_indent {
                 for (index, line) in lines.iter().enumerate().take(end).skip(start + 1) {
-                    if yaml_indent(line)? == field_indent
-                        && let Some((key, value)) = yaml_field(line.trim())
-                    {
+                    if yaml_indent(line)? == field_indent {
+                        let (key, value) = yaml_field(line.trim())
+                            .ok_or("unsupported workflow step field shape")?;
                         fields.push((index, key, value));
                     }
                 }
             }
             for (index, key, value) in fields {
+                if !matches!(key, "name" | "uses" | "with" | "run" | "env" | "id" | "if") {
+                    return Err("unknown workflow step field");
+                }
+                if !step.fields.insert(key.to_owned()) {
+                    return Err("duplicate workflow step field");
+                }
                 match key {
                     "name" => {
-                        if step.name.replace(yaml_scalar(value)).is_some() {
+                        if step.name.replace(yaml_scalar(value)?).is_some() {
                             return Err("duplicate workflow step name");
                         }
                     }
                     "uses" => {
-                        if step.uses.replace(yaml_scalar(value)).is_some() {
+                        if step.uses.replace(yaml_scalar(value)?).is_some() {
                             return Err("duplicate workflow action declaration");
                         }
                     }
@@ -420,7 +518,7 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                         let value = if matches!(value, "|" | "|-") {
                             block_value(&lines, index, yaml_indent(lines[index])?, end)?.0
                         } else {
-                            yaml_scalar(value)
+                            yaml_scalar(value)?
                         };
                         if step.run.replace(value).is_some() {
                             return Err("duplicate workflow run declaration");
@@ -431,7 +529,13 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             return Err("inline workflow action inputs are not accepted");
                         }
                         let with_indent = yaml_indent(lines[index])?;
-                        let child_indent = lines[index + 1..end]
+                        let with_end = (index + 1..end)
+                            .find(|child| {
+                                !lines[*child].trim().is_empty()
+                                    && yaml_indent(lines[*child]).ok() == Some(with_indent)
+                            })
+                            .unwrap_or(end);
+                        let child_indent = lines[index + 1..with_end]
                             .iter()
                             .filter(|line| !line.trim().is_empty())
                             .map(|line| yaml_indent(line))
@@ -441,21 +545,33 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             .min()
                             .ok_or("workflow action inputs are empty")?;
                         let mut child = index + 1;
-                        while child < end {
-                            if yaml_indent(lines[child])? == child_indent
-                                && let Some((input, value)) = yaml_field(lines[child].trim())
-                            {
+                        while child < with_end {
+                            if yaml_indent(lines[child])? == child_indent {
+                                let (input, value) = yaml_field(lines[child].trim())
+                                    .ok_or("unsupported workflow action input shape")?;
                                 let values = if matches!(value, "|" | "|-") {
-                                    block_value(&lines, child, yaml_indent(lines[child])?, end)?
-                                        .0
-                                        .lines()
-                                        .map(str::trim)
-                                        .filter(|line| !line.is_empty())
-                                        .map(yaml_scalar)
-                                        .collect::<Vec<_>>()
+                                    block_value(
+                                        &lines,
+                                        child,
+                                        yaml_indent(lines[child])?,
+                                        with_end,
+                                    )?
+                                    .0
+                                    .lines()
+                                    .map(str::trim)
+                                    .filter(|line| !line.is_empty())
+                                    .map(yaml_scalar)
+                                    .collect::<Result<Vec<_>, _>>()?
                                 } else {
-                                    vec![yaml_scalar(value)]
+                                    vec![yaml_scalar(value)?]
                                 };
+                                if step
+                                    .inputs
+                                    .insert(input.to_owned(), values.clone())
+                                    .is_some()
+                                {
+                                    return Err("duplicate workflow action input");
+                                }
                                 match input {
                                     "name" if values.len() == 1 => {
                                         if step.artifact_name.replace(values[0].clone()).is_some() {
@@ -470,9 +586,38 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             child += 1;
                         }
                     }
-                    _ => {}
+                    "env" => {
+                        if !value.is_empty() {
+                            return Err("inline workflow environment is not accepted");
+                        }
+                        let env_indent = yaml_indent(lines[index])?;
+                        let env_end = (index + 1..end)
+                            .find(|child| {
+                                !lines[*child].trim().is_empty()
+                                    && yaml_indent(lines[*child]).ok() == Some(env_indent)
+                            })
+                            .unwrap_or(end);
+                        let mut variables = BTreeSet::new();
+                        for line in lines.iter().take(env_end).skip(index + 1) {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() || trimmed.starts_with('#') {
+                                continue;
+                            }
+                            let (variable, value) = yaml_field(trimmed)
+                                .ok_or("unsupported workflow environment shape")?;
+                            if !variables.insert(variable) {
+                                return Err("duplicate workflow environment key");
+                            }
+                            yaml_scalar(value)?;
+                        }
+                    }
+                    "id" | "if" => {
+                        yaml_scalar(value)?;
+                    }
+                    _ => unreachable!("workflow step field allowlist checked"),
                 }
             }
+            validate_workflow_step_shape(&step)?;
             steps.push(step);
         }
         job_start = job_end;
@@ -713,15 +858,33 @@ fn expected_artifact_job(artifact: &str) -> Option<&'static str> {
     }
 }
 
+struct ClassifiedWorkflowRuns {
+    assembly: Vec<(String, String, String)>,
+    package_completion: BTreeMap<String, usize>,
+    assembly_ordinal: usize,
+}
+
+fn require_step_fields(step: &WorkflowStep, expected: &[&str]) -> Result<(), &'static str> {
+    let expected = expected
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<BTreeSet<_>>();
+    (step.fields == expected)
+        .then_some(())
+        .ok_or("release-affecting workflow step fields changed")
+}
+
 fn classify_package_and_release_runs(
     steps: &[WorkflowStep],
-) -> Result<Vec<(String, String, String)>, &'static str> {
+) -> Result<ClassifiedWorkflowRuns, &'static str> {
     let mut wix = 0;
     let mut deb = 0;
     let mut appimage = 0;
     let mut arch_stage = 0;
     let mut arch_build = 0;
     let mut assembly = Vec::new();
+    let mut package_completion = BTreeMap::new();
+    let mut assembly_ordinal = None;
     for step in steps {
         let Some(run) = step.run.as_deref() else {
             continue;
@@ -734,23 +897,36 @@ fn classify_package_and_release_runs(
             {
                 return Err("unrecognized WiX package declaration");
             }
+            require_step_fields(step, &["name", "run", "env"])?;
+            package_completion.insert(step.job.clone(), step.ordinal);
         } else if run.contains("cargo deb") {
             deb += 1;
             if step.job != "build-linux" || run.trim() != "cargo deb --package server --no-build" {
                 return Err("unrecognized DEB package declaration");
             }
+            require_step_fields(step, &["name", "run"])?;
+            package_completion
+                .entry(step.job.clone())
+                .and_modify(|ordinal| *ordinal = (*ordinal).max(step.ordinal))
+                .or_insert(step.ordinal);
         } else if run.contains("PKGBUILD") {
             arch_stage += 1;
             if step.job != "build-arch" {
                 return Err("Arch staging declared outside build-arch");
             }
+            require_step_fields(step, &["name", "run"])?;
             arch_sources(run)?;
         } else if run.contains("AppDir/") || run.contains("linuxdeploy-x86_64.AppImage") {
             appimage += 1;
             if step.job != "build-linux" {
                 return Err("AppImage staging declared outside build-linux");
             }
+            require_step_fields(step, &["name", "run"])?;
             appimage_sources(run)?;
+            package_completion
+                .entry(step.job.clone())
+                .and_modify(|ordinal| *ordinal = (*ordinal).max(step.ordinal))
+                .or_insert(step.ordinal);
         } else if run.contains("makepkg") {
             arch_build += 1;
             let commands = run
@@ -769,11 +945,15 @@ fn classify_package_and_release_runs(
             {
                 return Err("unrecognized Arch package declaration");
             }
+            require_step_fields(step, &["name", "run"])?;
+            package_completion.insert(step.job.clone(), step.ordinal);
         } else if run.contains("copy_file()") || run.contains("copy_latest()") {
             if step.job != "release" || !assembly.is_empty() {
                 return Err("duplicate or misplaced release assembly declaration");
             }
+            require_step_fields(step, &["name", "run"])?;
             assembly = prepare_release_calls(run)?;
+            assembly_ordinal = Some(step.ordinal);
         } else if [
             "actions/upload-artifact",
             "actions/download-artifact",
@@ -792,10 +972,24 @@ fn classify_package_and_release_runs(
     if (wix, deb, appimage, arch_stage, arch_build) != (1, 1, 1, 1, 1) || assembly.is_empty() {
         return Err("package/release workflow declarations are incomplete or duplicated");
     }
-    Ok(assembly)
+    if package_completion
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        != ["build-arch", "build-linux", "build-windows"]
+    {
+        return Err("package completion ordinals are incomplete");
+    }
+    Ok(ClassifiedWorkflowRuns {
+        assembly,
+        package_completion,
+        assembly_ordinal: assembly_ordinal.ok_or("release assembly ordinal missing")?,
+    })
 }
 
-fn validate_post_build_gate_steps(steps: &[WorkflowStep]) -> Result<(), &'static str> {
+fn validate_post_build_gate_steps(
+    steps: &[WorkflowStep],
+) -> Result<BTreeMap<String, usize>, &'static str> {
     let test = "cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact";
     let expected = BTreeMap::from([
         (
@@ -824,13 +1018,145 @@ fn validate_post_build_gate_steps(steps: &[WorkflowStep]) -> Result<(), &'static
                     run.contains("authoritative_post_build_package_gate")
                         || run.contains("STREAM_SERVER_RELEASE_GATE_STAGE")
                 })
-                .map(|run| (step.job.as_str(), run.trim().to_owned()))
+                .map(|run| (step.job.as_str(), (run.trim().to_owned(), step.ordinal)))
         })
         .collect::<Vec<_>>();
-    let observed = observed_steps.iter().cloned().collect::<BTreeMap<_, _>>();
+    let observed = observed_steps
+        .iter()
+        .map(|(job, (run, _))| (*job, run.clone()))
+        .collect::<BTreeMap<_, _>>();
     if observed_steps.len() != expected.len() || observed != expected {
         return Err("post-build package gates are incomplete, duplicated, or changed");
     }
+    let mut ordinals = BTreeMap::new();
+    for step in steps.iter().filter(|step| {
+        step.run.as_deref().is_some_and(|run| {
+            run.contains("authoritative_post_build_package_gate")
+                || run.contains("STREAM_SERVER_RELEASE_GATE_STAGE")
+        })
+    }) {
+        require_step_fields(step, &["name", "run"])?;
+        ordinals.insert(step.job.clone(), step.ordinal);
+    }
+    Ok(ordinals)
+}
+
+const LINUX_NATIVE_PACKAGE_GATE_DEPENDENCIES: &str = "sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev";
+
+fn require_action_inputs(step: &WorkflowStep, expected: &[&str]) -> Result<(), &'static str> {
+    let expected = expected
+        .iter()
+        .map(|input| (*input).to_owned())
+        .collect::<BTreeSet<_>>();
+    (step.inputs.keys().cloned().collect::<BTreeSet<_>>() == expected)
+        .then_some(())
+        .ok_or("release-affecting action input set changed")
+}
+
+fn validate_workflow_order_and_prerequisites(
+    steps: &[WorkflowStep],
+    classified: &ClassifiedWorkflowRuns,
+    gates: &BTreeMap<String, usize>,
+) -> Result<(), &'static str> {
+    for job in ["build-windows", "build-linux", "build-arch"] {
+        let completion = classified
+            .package_completion
+            .get(job)
+            .ok_or("package completion ordinal missing")?;
+        let gate = gates.get(job).ok_or("package verifier ordinal missing")?;
+        if completion >= gate {
+            return Err("package verifier does not follow package creation");
+        }
+        for upload in steps.iter().filter(|step| {
+            step.job == job && step.uses.as_deref() == Some("actions/upload-artifact@v7")
+        }) {
+            require_step_fields(upload, &["name", "uses", "with"])?;
+            require_action_inputs(upload, &["name", "path"])?;
+            if upload.ordinal <= *gate {
+                return Err("package upload does not follow its verifier");
+            }
+        }
+    }
+
+    let release_gate = *gates
+        .get("release")
+        .ok_or("release verifier ordinal missing")?;
+    let downloads = steps
+        .iter()
+        .filter(|step| step.uses.as_deref() == Some("actions/download-artifact@v8"))
+        .collect::<Vec<_>>();
+    let publications = steps
+        .iter()
+        .filter(|step| step.uses.as_deref() == Some("softprops/action-gh-release@v3"))
+        .collect::<Vec<_>>();
+    if downloads.len() != 1 || publications.len() != 1 {
+        return Err("release action order is ambiguous");
+    }
+    let download = downloads[0];
+    let publication = publications[0];
+    require_step_fields(download, &["name", "uses", "with"])?;
+    require_action_inputs(download, &["path"])?;
+    require_step_fields(publication, &["name", "uses", "with"])?;
+    require_action_inputs(
+        publication,
+        &["files", "body_path", "generate_release_notes", "prerelease"],
+    )?;
+    if publication.inputs.get("body_path")
+        != Some(&vec!["${{ github.workspace }}/RELEASE_BODY.md".to_owned()])
+        || publication.inputs.get("generate_release_notes") != Some(&vec!["false".to_owned()])
+        || publication.inputs.get("prerelease")
+            != Some(&vec![
+                "${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}"
+                    .to_owned(),
+            ])
+    {
+        return Err("final release action semantics changed");
+    }
+    if !(download.ordinal < classified.assembly_ordinal
+        && classified.assembly_ordinal < release_gate
+        && release_gate < publication.ordinal)
+    {
+        return Err("final assembly, verifier, and publication order changed");
+    }
+
+    let linux_dependencies = steps
+        .iter()
+        .filter(|step| {
+            step.job == "build-linux" && step.name.as_deref() == Some("Install System Dependencies")
+        })
+        .collect::<Vec<_>>();
+    let release_dependencies = steps
+        .iter()
+        .filter(|step| {
+            step.job == "release"
+                && step.name.as_deref() == Some("Install package gate dependencies")
+        })
+        .collect::<Vec<_>>();
+    if linux_dependencies.len() != 1 || release_dependencies.len() != 1 {
+        return Err("Linux package gate prerequisites are incomplete");
+    }
+    for dependency in [linux_dependencies[0], release_dependencies[0]] {
+        require_step_fields(dependency, &["name", "run"])?;
+        if dependency.run.as_deref().map(str::trim) != Some(LINUX_NATIVE_PACKAGE_GATE_DEPENDENCIES)
+        {
+            return Err("Linux package gate prerequisite set changed");
+        }
+    }
+    if release_dependencies[0].ordinal >= release_gate {
+        return Err("release package gate prerequisites follow verification");
+    }
+    let rust_setup = steps
+        .iter()
+        .filter(|step| {
+            step.job == "release" && step.name.as_deref() == Some("Setup Rust for package gate")
+        })
+        .collect::<Vec<_>>();
+    if rust_setup.len() != 1 || rust_setup[0].ordinal >= release_gate {
+        return Err("release Rust prerequisite is missing or late");
+    }
+    require_step_fields(rust_setup[0], &["name", "uses"])?;
     Ok(())
 }
 
@@ -867,8 +1193,10 @@ fn enumerate_authoritative_sources(
         .ok_or("missing Arch staging step")?;
     let appimage = appimage_sources(appimage_run)?;
     let arch = arch_sources(arch_run)?;
-    let calls = classify_package_and_release_runs(&steps)?;
-    validate_post_build_gate_steps(&steps)?;
+    let classified = classify_package_and_release_runs(&steps)?;
+    let gate_ordinals = validate_post_build_gate_steps(&steps)?;
+    validate_workflow_order_and_prerequisites(&steps, &classified, &gate_ordinals)?;
+    let calls = classified.assembly;
 
     let mut artifacts = BTreeMap::<String, BTreeSet<String>>::new();
     let mut exact_sources = wix.clone();
@@ -1070,7 +1398,7 @@ fn scan_required_glob(repository: &Path, declaration: &str) -> Result<(), &'stat
             .ok_or("package glob entry is not UTF-8")?
             .to_owned();
         if package_glob_matches(pattern, &name) {
-            candidate_tree_is_safe(&entry.path())?;
+            candidate_tree_is_safe(repository, &entry.path())?;
             matches += 1;
         }
     }
@@ -1149,7 +1477,7 @@ fn validate_post_build_outputs(
         {
             return Err("required package output is not a direct regular file");
         }
-        candidate_tree_is_safe(&path)?;
+        candidate_tree_is_safe(repository, &path)?;
     }
 
     let globs = match stage {
@@ -1187,7 +1515,7 @@ fn validate_post_build_outputs(
         if !inventory.generated_trees.contains(tree) {
             return Err("post-build tree is not tied to structural inventory");
         }
-        candidate_tree_is_safe(&repository.join(tree))?;
+        candidate_tree_is_safe(repository, &repository.join(tree))?;
     }
     Ok(())
 }
@@ -1468,7 +1796,7 @@ fn candidate_tree_propagates_directory_enumeration_errors() {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     };
-    assert!(scan_candidate_tree_with(directory.path(), &mut reader).is_err());
+    assert!(scan_candidate_tree_with(directory.path(), directory.path(), &mut reader).is_err());
 }
 
 #[test]
@@ -1570,6 +1898,170 @@ fn workflow_contract_rejects_unnamed_duplicate_and_changed_release_declarations(
     }
 }
 
+fn move_named_workflow_step_after(workflow: &str, moving: &str, after: &str) -> String {
+    let mut blocks = workflow
+        .split("\n      - ")
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let moving_prefix = format!("name: {moving}\n");
+    let after_prefix = format!("name: {after}\n");
+    let moving_index = blocks
+        .iter()
+        .position(|block| block.starts_with(&moving_prefix))
+        .unwrap_or_else(|| panic!("missing workflow step {moving}"));
+    let moving_block = blocks.remove(moving_index);
+    let after_index = blocks
+        .iter()
+        .position(|block| block.starts_with(&after_prefix))
+        .unwrap_or_else(|| panic!("missing workflow step {after}"));
+    blocks.insert(after_index + 1, moving_block);
+    blocks.join("\n      - ")
+}
+
+fn round_five_compliant_workflow(workflow: &str) -> String {
+    let workflow = move_named_workflow_step_after(
+        &workflow.replace("\r\n", "\n"),
+        "Upload EXE",
+        "Verify Windows package outputs",
+    );
+    workflow.replace(
+        "      - name: Setup Rust for package gate\n        uses: dtolnay/rust-toolchain@1.98.0\n\n      - name: Download all artifacts",
+        "      - name: Setup Rust for package gate\n        uses: dtolnay/rust-toolchain@1.98.0\n\n      - name: Install package gate dependencies\n        run: |\n          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt\n          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update\n          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev\n\n      - name: Download all artifacts",
+    )
+}
+
+#[test]
+fn workflow_contract_rejects_order_and_failure_semantics_mutations() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_five_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-five compliant workflow fixture");
+
+    let mutations = [
+        (
+            "verifier before package build",
+            move_named_workflow_step_after(
+                &compliant,
+                "Build MSI Installer",
+                "Verify Windows package outputs",
+            ),
+        ),
+        (
+            "verifier after upload",
+            move_named_workflow_step_after(
+                &compliant,
+                "Verify Windows package outputs",
+                "Upload MSI",
+            ),
+        ),
+        (
+            "continue-on-error",
+            compliant.replace(
+                "      - name: Verify Windows package outputs\n",
+                "      - name: Verify Windows package outputs\n        continue-on-error: true\n",
+            ),
+        ),
+        (
+            "ignored missing upload",
+            compliant.replace(
+                "          path: target/wix/*.msi",
+                "          path: target/wix/*.msi\n          if-no-files-found: ignore",
+            ),
+        ),
+        (
+            "duplicate path input",
+            compliant.replace(
+                "          path: target/wix/*.msi",
+                "          path: target/wix/*.msi\n          path: target/wix/*.msi",
+            ),
+        ),
+        (
+            "unknown step field",
+            compliant.replace(
+                "      - name: Verify Windows package outputs\n",
+                "      - name: Verify Windows package outputs\n        risk-mode: permissive\n",
+            ),
+        ),
+        (
+            "unknown action input",
+            compliant.replace(
+                "          path: target/wix/*.msi",
+                "          path: target/wix/*.msi\n          retention-days: 1",
+            ),
+        ),
+        (
+            "unsupported YAML alias",
+            compliant.replace(
+                "      - name: Verify Windows package outputs\n",
+                "      - name: Verify Windows package outputs\n        <<: *unsafe-step\n",
+            ),
+        ),
+        (
+            "unsupported YAML alias scalar",
+            compliant.replace(
+                "          body_path: ${{ github.workspace }}/RELEASE_BODY.md",
+                "          body_path: *unsafe-body",
+            ),
+        ),
+        (
+            "unsupported YAML anchor scalar",
+            compliant.replace(
+                "          body_path: ${{ github.workspace }}/RELEASE_BODY.md",
+                "          body_path: &unsafe-body RELEASE_BODY.md",
+            ),
+        ),
+        (
+            "release verifier before assembly",
+            move_named_workflow_step_after(
+                &compliant,
+                "Prepare release files",
+                "Verify final release outputs",
+            ),
+        ),
+        (
+            "release verifier after publication",
+            move_named_workflow_step_after(
+                &compliant,
+                "Verify final release outputs",
+                "Create GitHub Release",
+            ),
+        ),
+    ];
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "unsafe workflow mutations passed: {escaped:?}"
+    );
+}
+
+#[test]
+fn release_gate_requires_exact_linux_native_prerequisites_before_verification() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_five_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("release gate has exact Linux prerequisites");
+    let mutations = [
+        move_named_workflow_step_after(
+            &compliant,
+            "Install package gate dependencies",
+            "Verify final release outputs",
+        ),
+        compliant.replace("libgtk-3-dev", "libgtk-4-dev"),
+    ];
+    assert!(
+        mutations
+            .into_iter()
+            .all(|mutation| { enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err() })
+    );
+}
+
 #[test]
 fn structural_contract_rejects_absent_renamed_payload_declarations() {
     let (_, wix, cargo, workflow) = repository_inputs();
@@ -1646,7 +2138,7 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
         }
         fs::write(&path, bytes).expect("write renamed payload");
         assert!(
-            candidate_tree_is_safe(&path).is_err(),
+            candidate_tree_is_safe(repository.path(), &path).is_err(),
             "accepted renamed payload {name}"
         );
 
@@ -1686,11 +2178,31 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
         "declared directory was accepted by the exact structural contract"
     );
     assert!(!forbidden_runtime_payload(
-        Path::new("target/x86_64-pc-windows-msvc/release/server.exe"),
+        Path::new("repository"),
+        Path::new("repository/target/x86_64-pc-windows-msvc/release/server.exe"),
         b"MZapplication"
     ));
     assert!(!forbidden_runtime_payload(
-        Path::new("vendor/native/ffmpeg_api_source.cpp"),
+        Path::new("repository"),
+        Path::new("repository/vendor/native/ffmpeg_api_source.cpp"),
         b"source only"
     ));
+}
+
+#[test]
+fn generated_tree_scans_reject_nested_application_path_suffix_spoofs() {
+    for tree in ["AppDir", "pkg", "artifacts", "release"] {
+        let repository = tempfile::tempdir().expect("nested PE suffix fixture");
+        let spoof = repository
+            .path()
+            .join(tree)
+            .join("nested/target/x86_64-pc-windows-msvc/release/server.exe");
+        fs::create_dir_all(spoof.parent().expect("spoof parent"))
+            .expect("create nested PE suffix path");
+        fs::write(&spoof, b"MZnested suffix spoof").expect("write nested PE suffix spoof");
+        assert!(
+            candidate_tree_is_safe(repository.path(), &repository.path().join(tree)).is_err(),
+            "{tree} accepted a PE whose suffix mimics an allowed application path"
+        );
+    }
 }

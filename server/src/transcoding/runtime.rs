@@ -710,8 +710,16 @@ async fn resolve_runtime_inner(
             Ok(pair) if pair.jellyfin => match provenance {
                 RuntimeProvenance::AuthenticatedManaged { receipt, rollback } => {
                     if let Some((managed_root, expected_selection)) = rollback {
-                        commit_managed_rollback(&managed_root, &expected_selection, &receipt)
-                            .await?;
+                        let rollback_commit = AcquisitionCommitControl::new();
+                        commit_managed_rollback(
+                            &managed_root,
+                            &expected_selection,
+                            &receipt,
+                            supervisor,
+                            &rollback_commit,
+                            &AcquisitionObserver::default(),
+                        )
+                        .await?;
                     }
                     return Ok(Arc::new(pair.into_runtime(
                         RuntimeKind::Jellyfin,
@@ -3528,6 +3536,9 @@ async fn commit_managed_rollback(
     root: &Path,
     expected: &ManagedSelection,
     receipt: &ManagedVersionReceipt,
+    supervisor: &ProcessSupervisor,
+    commit: &AcquisitionCommitControl,
+    observer: &AcquisitionObserver,
 ) -> Result<(), RuntimeError> {
     let (versions, _staging, _lock) = prepare_managed_root(root).await?;
     if read_managed_selection(root)?.as_ref() != Some(expected) {
@@ -3556,6 +3567,16 @@ async fn commit_managed_rollback(
         current_install_digest: receipt.install_digest.clone(),
         previous_version: failed_current,
     };
+    observer
+        .commit_checkpoint(AcquisitionStage::BeforeRollbackCommitAdmission)
+        .await;
+    if !commit.admit(supervisor) {
+        commit.cancel();
+        return Err(RuntimeError::Cancelled);
+    }
+    observer
+        .commit_checkpoint(AcquisitionStage::AfterRollbackCommitAdmission)
+        .await;
     write_managed_selection_atomically(root, &selection)?;
     cleanup_managed_versions(root, &selection);
     Ok(())
@@ -3811,6 +3832,8 @@ enum AcquisitionStage {
     PostProbe,
     BeforeCommitAdmission,
     AfterCommitAdmission,
+    BeforeRollbackCommitAdmission,
+    AfterRollbackCommitAdmission,
 }
 
 #[derive(Clone, Copy)]
@@ -4636,6 +4659,40 @@ async fn resolve_managed_runtime_for_artifact_for_test(
     artifact: &super::runtime_manifest::RuntimeArtifact,
     supervisor: &ProcessSupervisor,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
+    resolve_managed_runtime_for_artifact_with_observer(
+        root,
+        artifact,
+        supervisor,
+        &AcquisitionObserver::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn resolve_managed_runtime_for_artifact_with_observer_for_test(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    observer: Arc<AcquisitionTestObserver>,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
+    resolve_managed_runtime_for_artifact_with_observer(
+        root,
+        artifact,
+        supervisor,
+        &AcquisitionObserver {
+            test: Some(observer),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn resolve_managed_runtime_for_artifact_with_observer(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    observer: &AcquisitionObserver,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     let candidates =
         authenticated_managed_candidates(root, artifact)?.ok_or(RuntimeError::Unavailable)?;
     for (version_root, provenance) in candidates {
@@ -4658,7 +4715,16 @@ async fn resolve_managed_runtime_for_artifact_for_test(
             continue;
         }
         if let Some((managed_root, expected_selection)) = rollback {
-            commit_managed_rollback(&managed_root, &expected_selection, &receipt).await?;
+            let rollback_commit = AcquisitionCommitControl::new();
+            commit_managed_rollback(
+                &managed_root,
+                &expected_selection,
+                &receipt,
+                supervisor,
+                &rollback_commit,
+                observer,
+            )
+            .await?;
         }
         return Ok(Arc::new(pair.into_runtime(
             RuntimeKind::Jellyfin,
@@ -6201,6 +6267,100 @@ fn main() {{
             }
             assert_eq!(supervisor.active_processes(), 0);
             assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_selection_commit_admission_linearizes_supervisor_cancellation() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        for (stage, expect_switch) in [
+            (
+                super::AcquisitionStage::BeforeRollbackCommitAdmission,
+                false,
+            ),
+            (super::AcquisitionStage::AfterRollbackCommitAdmission, true),
+        ] {
+            let directory = tempfile::tempdir().expect("rollback admission fixture");
+            let root = directory.path().join("runtimes");
+            let (old_archive, old_artifact) =
+                runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+            let failure_switch = directory.path().join("fail-current-identity");
+            let executable = fake_jellyfin_executable_with_failure_switch(
+                directory.path(),
+                "7.1.4",
+                &failure_switch,
+            );
+            let (current_archive, current_artifact) =
+                runtime_archive_with_binary_and_claimed_identity(
+                    directory.path(),
+                    &executable,
+                    "7.1.4",
+                    "3",
+                );
+            let supervisor = ProcessSupervisor::new(CancellationToken::new());
+            drop(
+                super::install_archive_for_test(
+                    &root,
+                    &old_artifact,
+                    &old_archive,
+                    &supervisor,
+                    false,
+                )
+                .await
+                .expect("install rollback runtime"),
+            );
+            drop(
+                super::install_archive_for_test(
+                    &root,
+                    &current_artifact,
+                    &current_archive,
+                    &supervisor,
+                    false,
+                )
+                .await
+                .expect("install current runtime"),
+            );
+            fs::write(&failure_switch, b"fail").expect("make current runtime unhealthy");
+            let selection_before =
+                fs::read(root.join("current.json")).expect("read selection before rollback");
+            let observer = Arc::new(super::AcquisitionTestObserver::new(stage));
+            let mut resolution = Box::pin(
+                super::resolve_managed_runtime_for_artifact_with_observer_for_test(
+                    &root,
+                    &current_artifact,
+                    &supervisor,
+                    Arc::clone(&observer),
+                ),
+            );
+            tokio::select! {
+                result = &mut resolution => panic!("rollback passed admission checkpoint {stage:?}: {result:?}"),
+                _ = observer.wait_until_reached() => {}
+            }
+
+            supervisor.cancel();
+            observer.release();
+            let result = resolution.await;
+            let selection_after =
+                fs::read(root.join("current.json")).expect("read selection after rollback race");
+            if expect_switch {
+                result.expect("rollback admission winner completes selection");
+                assert_ne!(selection_after, selection_before);
+                assert_eq!(
+                    super::read_managed_selection(&root)
+                        .expect("read rollback selection")
+                        .expect("rollback selection exists")
+                        .current_version,
+                    old_artifact.source_tag()
+                );
+            } else {
+                assert_eq!(result.unwrap_err(), super::RuntimeError::Cancelled);
+                assert_eq!(selection_after, selection_before);
+            }
+            assert_eq!(supervisor.active_processes(), 0);
         }
     }
 
