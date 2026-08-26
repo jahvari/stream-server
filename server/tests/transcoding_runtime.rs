@@ -10,6 +10,37 @@ const ALLOWED_APPLICATION_PE: &[&str] = &[
     "target/x86_64-pc-windows-msvc/release/settings-gui.exe",
     "target/x86_64-pc-windows-msvc/release/stremio-runtime.exe",
     "target/x86_64-pc-windows-msvc/release/stream-server-updater.exe",
+    "artifacts/server-windows-amd64/server.exe",
+    "artifacts/server-windows-amd64/settings-gui.exe",
+    "artifacts/server-windows-amd64/stremio-runtime.exe",
+    "artifacts/server-windows-amd64/stream-server-updater.exe",
+    "release/stream-server-windows-amd64.exe",
+    "release/stream-server-settings-windows-amd64.exe",
+    "release/stremio-runtime-windows-amd64.exe",
+    "release/stream-server-updater-windows-amd64.exe",
+];
+
+const EXPECTED_EXACT_SOURCES: &[&str] = &[
+    "stream-server-linux-amd64.AppImage",
+    "target/release/server",
+    "target/release/settings-gui",
+    "target/x86_64-pc-windows-msvc/release/server.exe",
+    "target/x86_64-pc-windows-msvc/release/settings-gui.exe",
+    "target/x86_64-pc-windows-msvc/release/stremio-runtime.exe",
+    "target/x86_64-pc-windows-msvc/release/stream-server-updater.exe",
+];
+
+const EXPECTED_RELEASE_DESTINATIONS: &[&str] = &[
+    "stream-server-windows-amd64.exe",
+    "stream-server-settings-windows-amd64.exe",
+    "stremio-runtime-windows-amd64.exe",
+    "stream-server-updater-windows-amd64.exe",
+    "stream-server-windows-amd64.msi",
+    "stream-server-linux-amd64",
+    "stream-server-settings-linux-amd64",
+    "stream-server-linux-amd64.deb",
+    "stream-server-linux-amd64.AppImage",
+    "stream-server-arch-x86_64.pkg.tar.zst",
 ];
 
 fn normalized(path: &Path) -> String {
@@ -65,25 +96,37 @@ fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn candidate_tree_is_safe(path: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
+fn scan_candidate_tree_with<F>(path: &Path, read_children: &mut F) -> Result<(), &'static str>
+where
+    F: FnMut(&Path) -> std::io::Result<Vec<PathBuf>>,
+{
+    let metadata = fs::symlink_metadata(path).map_err(|_| "package input metadata unavailable")?;
     if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
-        return false;
+        return Err("package input is a link or reparse point");
     }
     if metadata.is_dir() {
-        let Ok(entries) = fs::read_dir(path) else {
-            return false;
-        };
-        entries
-            .filter_map(Result::ok)
-            .all(|entry| candidate_tree_is_safe(&entry.path()))
+        for child in read_children(path).map_err(|_| "package directory enumeration failed")? {
+            scan_candidate_tree_with(&child, read_children)?;
+        }
+        Ok(())
     } else if metadata.is_file() {
-        fs::read(path).is_ok_and(|bytes| !forbidden_runtime_payload(path, &bytes))
+        let bytes = fs::read(path).map_err(|_| "package input could not be read")?;
+        if forbidden_runtime_payload(path, &bytes) {
+            Err("forbidden runtime payload in package input")
+        } else {
+            Ok(())
+        }
     } else {
-        false
+        Err("package input is not a regular file or directory")
     }
+}
+
+fn candidate_tree_is_safe(path: &Path) -> Result<(), &'static str> {
+    scan_candidate_tree_with(path, &mut |directory| {
+        fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    })
 }
 
 fn validate_exact_source(source: &str) -> Result<String, &'static str> {
@@ -165,104 +208,274 @@ fn cargo_deb_sources(cargo: &str) -> Result<BTreeSet<String>, &'static str> {
 
 #[derive(Debug)]
 struct WorkflowStep {
-    name: String,
+    job: String,
+    name: Option<String>,
     uses: Option<String>,
     artifact_name: Option<String>,
     paths: Vec<String>,
+    release_files: Vec<String>,
     run: Option<String>,
 }
 
-fn block_value(lines: &[&str], start: usize, indent: usize) -> (String, usize) {
-    let mut value = String::new();
+fn yaml_indent(line: &str) -> Result<usize, &'static str> {
+    let whitespace = line.len() - line.trim_start().len();
+    if line[..whitespace].contains('\t') {
+        return Err("tabs are not accepted in release workflow indentation");
+    }
+    Ok(whitespace)
+}
+
+fn yaml_scalar(value: &str) -> String {
+    value.trim().trim_matches(['"', '\'']).to_owned()
+}
+
+fn yaml_field(value: &str) -> Option<(&str, &str)> {
+    let (key, value) = value.split_once(':')?;
+    (!key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then_some((key, value.trim()))
+}
+
+fn block_value(
+    lines: &[&str],
+    start: usize,
+    parent_indent: usize,
+    limit: usize,
+) -> Result<(String, usize), &'static str> {
     let mut index = start + 1;
-    while index < lines.len() {
-        let line = lines[index];
-        let leading = line.len() - line.trim_start().len();
-        if !line.trim().is_empty() && leading <= indent {
+    let mut end = index;
+    let mut content_indent = usize::MAX;
+    while end < limit {
+        let line = lines[end];
+        let indent = yaml_indent(line)?;
+        if !line.trim().is_empty() && indent <= parent_indent {
             break;
         }
-        if line.len() >= indent + 2 {
-            value.push_str(&line[indent + 2..]);
+        if !line.trim().is_empty() {
+            content_indent = content_indent.min(indent);
         }
-        value.push('\n');
+        end += 1;
+    }
+    if content_indent == usize::MAX {
+        return Err("empty workflow block scalar");
+    }
+    let mut value = String::new();
+    while index < end {
+        let line = lines[index];
+        if line.trim().is_empty() {
+            value.push('\n');
+        } else {
+            let indent = yaml_indent(line)?;
+            if indent < content_indent {
+                return Err("malformed workflow block indentation");
+            }
+            value.push_str(&line[content_indent..]);
+            value.push('\n');
+        }
         index += 1;
     }
-    (value, index)
+    Ok((value, end))
 }
 
 fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
+    if workflow.lines().any(|line| line.trim() == "---") {
+        return Err("multiple workflow documents are not accepted");
+    }
     let lines = workflow.lines().collect::<Vec<_>>();
+    let jobs = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.trim() == "jobs:").then_some((index, *line)))
+        .collect::<Vec<_>>();
+    if jobs.len() != 1 || yaml_indent(jobs[0].1)? != 0 {
+        return Err("workflow must contain one top-level jobs mapping");
+    }
+    let jobs_start = jobs[0].0;
+    let job_indent = lines[jobs_start + 1..]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| yaml_indent(line))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|indent| *indent > 0)
+        .min()
+        .ok_or("workflow jobs mapping is empty")?;
     let mut steps = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        if !line.starts_with("      - name:") {
-            index += 1;
+    let mut job_start = jobs_start + 1;
+    while job_start < lines.len() {
+        if lines[job_start].trim().is_empty() || yaml_indent(lines[job_start])? != job_indent {
+            job_start += 1;
             continue;
         }
-        let name = line
-            .split_once("name:")
-            .map(|(_, name)| name.trim().trim_matches(['"', '\'']).to_owned())
-            .ok_or("malformed workflow step name")?;
-        let start = index;
-        index += 1;
-        while index < lines.len() && !lines[index].starts_with("      - ") {
-            index += 1;
-        }
-        let end = index;
-        let mut step = WorkflowStep {
-            name,
-            uses: None,
-            artifact_name: None,
-            paths: Vec::new(),
-            run: None,
-        };
-        let mut cursor = start + 1;
-        while cursor < end {
-            let current = lines[cursor];
-            let trimmed = current.trim();
-            if let Some(value) = trimmed.strip_prefix("uses:") {
-                step.uses = Some(value.trim().to_owned());
-            } else if current.starts_with("          name:") {
-                step.artifact_name = Some(
-                    trimmed
-                        .strip_prefix("name:")
-                        .expect("prefix checked")
-                        .trim()
-                        .trim_matches(['"', '\''])
-                        .to_owned(),
-                );
-            } else if current.starts_with("          path:") {
-                let value = trimmed
-                    .strip_prefix("path:")
-                    .expect("prefix checked")
-                    .trim();
-                if value == "|" {
-                    let (block, next) = block_value(&lines, cursor, 10);
-                    step.paths.extend(
-                        block
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| !line.is_empty())
-                            .map(ToOwned::to_owned),
-                    );
-                    cursor = next;
-                    continue;
-                }
-                step.paths.push(value.to_owned());
-            } else if current.starts_with("        run:") {
-                let value = trimmed.strip_prefix("run:").expect("prefix checked").trim();
-                if value == "|" {
-                    let (block, next) = block_value(&lines, cursor, 8);
-                    step.run = Some(block);
-                    cursor = next;
-                    continue;
-                }
-                step.run = Some(value.to_owned());
+        let job = lines[job_start]
+            .trim()
+            .strip_suffix(':')
+            .filter(|job| !job.is_empty())
+            .ok_or("malformed workflow job mapping")?
+            .to_owned();
+        let mut job_end = job_start + 1;
+        while job_end < lines.len() {
+            let indent = yaml_indent(lines[job_end])?;
+            if !lines[job_end].trim().is_empty() && indent <= job_indent {
+                break;
             }
-            cursor += 1;
+            job_end += 1;
         }
-        steps.push(step);
+        let step_mappings = (job_start + 1..job_end)
+            .filter(|index| lines[*index].trim() == "steps:")
+            .collect::<Vec<_>>();
+        if step_mappings.len() != 1 {
+            return Err("workflow job must contain one steps sequence");
+        }
+        let steps_mapping = step_mappings[0];
+        let steps_indent = yaml_indent(lines[steps_mapping])?;
+        let mut sequence_end = steps_mapping + 1;
+        while sequence_end < job_end {
+            let indent = yaml_indent(lines[sequence_end])?;
+            if !lines[sequence_end].trim().is_empty() && indent <= steps_indent {
+                break;
+            }
+            sequence_end += 1;
+        }
+        let list_indent = lines[steps_mapping + 1..sequence_end]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| yaml_indent(line))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .ok_or("workflow steps sequence is empty")?;
+        let mut cursor = steps_mapping + 1;
+        while cursor < sequence_end {
+            if lines[cursor].trim().is_empty() {
+                cursor += 1;
+                continue;
+            }
+            if yaml_indent(lines[cursor])? != list_indent
+                || !lines[cursor].trim_start().starts_with('-')
+            {
+                return Err("malformed workflow step sequence");
+            }
+            let start = cursor;
+            cursor += 1;
+            while cursor < sequence_end
+                && (lines[cursor].trim().is_empty()
+                    || yaml_indent(lines[cursor])? > list_indent
+                    || !lines[cursor].trim_start().starts_with('-'))
+            {
+                cursor += 1;
+            }
+            let end = cursor;
+            let mut step = WorkflowStep {
+                job: job.clone(),
+                name: None,
+                uses: None,
+                artifact_name: None,
+                paths: Vec::new(),
+                release_files: Vec::new(),
+                run: None,
+            };
+            let first = lines[start]
+                .trim_start()
+                .strip_prefix('-')
+                .expect("step marker checked")
+                .trim();
+            let field_indent = lines[start + 1..end]
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| {
+                    let indent = yaml_indent(line).ok()?;
+                    yaml_field(line.trim()).map(|_| indent)
+                })
+                .min();
+            let mut fields = Vec::<(usize, &str, &str)>::new();
+            if !first.is_empty() {
+                let (key, value) = yaml_field(first).ok_or("malformed inline workflow step")?;
+                fields.push((start, key, value));
+            }
+            if let Some(field_indent) = field_indent {
+                for (index, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+                    if yaml_indent(line)? == field_indent
+                        && let Some((key, value)) = yaml_field(line.trim())
+                    {
+                        fields.push((index, key, value));
+                    }
+                }
+            }
+            for (index, key, value) in fields {
+                match key {
+                    "name" => {
+                        if step.name.replace(yaml_scalar(value)).is_some() {
+                            return Err("duplicate workflow step name");
+                        }
+                    }
+                    "uses" => {
+                        if step.uses.replace(yaml_scalar(value)).is_some() {
+                            return Err("duplicate workflow action declaration");
+                        }
+                    }
+                    "run" => {
+                        let value = if matches!(value, "|" | "|-") {
+                            block_value(&lines, index, yaml_indent(lines[index])?, end)?.0
+                        } else {
+                            yaml_scalar(value)
+                        };
+                        if step.run.replace(value).is_some() {
+                            return Err("duplicate workflow run declaration");
+                        }
+                    }
+                    "with" => {
+                        if !value.is_empty() {
+                            return Err("inline workflow action inputs are not accepted");
+                        }
+                        let with_indent = yaml_indent(lines[index])?;
+                        let child_indent = lines[index + 1..end]
+                            .iter()
+                            .filter(|line| !line.trim().is_empty())
+                            .map(|line| yaml_indent(line))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .filter(|indent| *indent > with_indent)
+                            .min()
+                            .ok_or("workflow action inputs are empty")?;
+                        let mut child = index + 1;
+                        while child < end {
+                            if yaml_indent(lines[child])? == child_indent
+                                && let Some((input, value)) = yaml_field(lines[child].trim())
+                            {
+                                let values = if matches!(value, "|" | "|-") {
+                                    block_value(&lines, child, yaml_indent(lines[child])?, end)?
+                                        .0
+                                        .lines()
+                                        .map(str::trim)
+                                        .filter(|line| !line.is_empty())
+                                        .map(yaml_scalar)
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    vec![yaml_scalar(value)]
+                                };
+                                match input {
+                                    "name" if values.len() == 1 => {
+                                        if step.artifact_name.replace(values[0].clone()).is_some() {
+                                            return Err("duplicate workflow artifact name");
+                                        }
+                                    }
+                                    "path" => step.paths.extend(values),
+                                    "files" => step.release_files.extend(values),
+                                    _ => {}
+                                }
+                            }
+                            child += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            steps.push(step);
+        }
+        job_start = job_end;
     }
     Ok(steps)
 }
@@ -298,7 +511,11 @@ fn appimage_sources(run: &str) -> Result<BTreeSet<String>, &'static str> {
             || line.starts_with("chmod ")
             || line.starts_with("mkdir -p AppDir/")
             || line.starts_with("convert ")
-            || line.starts_with("./linuxdeploy-x86_64.AppImage "))
+            || line == "./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage"
+            || line
+                == "generated_appimage=\"$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'linuxdeploy-x86_64.AppImage' -print -quit)\""
+            || line == "[ -n \"$generated_appimage\" ]"
+            || line == "mv \"$generated_appimage\" stream-server-linux-amd64.AppImage")
         {
             return Err("unknown AppImage staging command");
         }
@@ -453,11 +670,179 @@ fn prepare_release_calls(run: &str) -> Result<Vec<(String, String, String)>, &'s
     Ok(calls)
 }
 
+fn expected_artifacts() -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([
+        (
+            "server-windows-amd64".to_owned(),
+            BTreeSet::from([
+                "server.exe".to_owned(),
+                "settings-gui.exe".to_owned(),
+                "stremio-runtime.exe".to_owned(),
+                "stream-server-updater.exe".to_owned(),
+            ]),
+        ),
+        (
+            "server-windows-msi".to_owned(),
+            BTreeSet::from(["*.msi".to_owned()]),
+        ),
+        (
+            "server-linux-amd64".to_owned(),
+            BTreeSet::from(["server".to_owned(), "settings-gui".to_owned()]),
+        ),
+        (
+            "server-linux-deb".to_owned(),
+            BTreeSet::from(["*.deb".to_owned()]),
+        ),
+        (
+            "server-linux-appimage".to_owned(),
+            BTreeSet::from(["stream-server-linux-amd64.AppImage".to_owned()]),
+        ),
+        (
+            "server-arch-pkg".to_owned(),
+            BTreeSet::from(["*.pkg.tar.zst".to_owned()]),
+        ),
+    ])
+}
+
+fn expected_artifact_job(artifact: &str) -> Option<&'static str> {
+    match artifact {
+        "server-windows-amd64" | "server-windows-msi" => Some("build-windows"),
+        "server-linux-amd64" | "server-linux-deb" | "server-linux-appimage" => Some("build-linux"),
+        "server-arch-pkg" => Some("build-arch"),
+        _ => None,
+    }
+}
+
+fn classify_package_and_release_runs(
+    steps: &[WorkflowStep],
+) -> Result<Vec<(String, String, String)>, &'static str> {
+    let mut wix = 0;
+    let mut deb = 0;
+    let mut appimage = 0;
+    let mut arch_stage = 0;
+    let mut arch_build = 0;
+    let mut assembly = Vec::new();
+    for step in steps {
+        let Some(run) = step.run.as_deref() else {
+            continue;
+        };
+        if run.contains("cargo wix") {
+            wix += 1;
+            if step.job != "build-windows"
+                || run.trim()
+                    != "cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc"
+            {
+                return Err("unrecognized WiX package declaration");
+            }
+        } else if run.contains("cargo deb") {
+            deb += 1;
+            if step.job != "build-linux" || run.trim() != "cargo deb --package server --no-build" {
+                return Err("unrecognized DEB package declaration");
+            }
+        } else if run.contains("PKGBUILD") {
+            arch_stage += 1;
+            if step.job != "build-arch" {
+                return Err("Arch staging declared outside build-arch");
+            }
+            arch_sources(run)?;
+        } else if run.contains("AppDir/") || run.contains("linuxdeploy-x86_64.AppImage") {
+            appimage += 1;
+            if step.job != "build-linux" {
+                return Err("AppImage staging declared outside build-linux");
+            }
+            appimage_sources(run)?;
+        } else if run.contains("makepkg") {
+            arch_build += 1;
+            let commands = run
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<Vec<_>>();
+            if step.job != "build-arch"
+                || commands
+                    != [
+                        "cd pkg",
+                        "useradd -m builder",
+                        "chown -R builder:builder .",
+                        "su builder -c \"makepkg -sf --noconfirm\"",
+                    ]
+            {
+                return Err("unrecognized Arch package declaration");
+            }
+        } else if run.contains("copy_file()") || run.contains("copy_latest()") {
+            if step.job != "release" || !assembly.is_empty() {
+                return Err("duplicate or misplaced release assembly declaration");
+            }
+            assembly = prepare_release_calls(run)?;
+        } else if [
+            "actions/upload-artifact",
+            "actions/download-artifact",
+            "action-gh-release",
+            "target/wix/*.msi",
+            "target/debian/*.deb",
+            "pkg/*.pkg.tar.zst",
+            "release/*",
+        ]
+        .iter()
+        .any(|marker| run.contains(marker))
+        {
+            return Err("unrecognized package or release command");
+        }
+    }
+    if (wix, deb, appimage, arch_stage, arch_build) != (1, 1, 1, 1, 1) || assembly.is_empty() {
+        return Err("package/release workflow declarations are incomplete or duplicated");
+    }
+    Ok(assembly)
+}
+
+fn validate_post_build_gate_steps(steps: &[WorkflowStep]) -> Result<(), &'static str> {
+    let test = "cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact";
+    let expected = BTreeMap::from([
+        (
+            "build-windows",
+            format!("$env:STREAM_SERVER_RELEASE_GATE_STAGE = \"windows\"\n{test}"),
+        ),
+        (
+            "build-linux",
+            format!("STREAM_SERVER_RELEASE_GATE_STAGE=linux {test}"),
+        ),
+        (
+            "build-arch",
+            format!("STREAM_SERVER_RELEASE_GATE_STAGE=arch {test}"),
+        ),
+        (
+            "release",
+            format!("STREAM_SERVER_RELEASE_GATE_STAGE=release {test}"),
+        ),
+    ]);
+    let observed_steps = steps
+        .iter()
+        .filter_map(|step| {
+            step.run
+                .as_deref()
+                .filter(|run| {
+                    run.contains("authoritative_post_build_package_gate")
+                        || run.contains("STREAM_SERVER_RELEASE_GATE_STAGE")
+                })
+                .map(|run| (step.job.as_str(), run.trim().to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let observed = observed_steps.iter().cloned().collect::<BTreeMap<_, _>>();
+    if observed_steps.len() != expected.len() || observed != expected {
+        return Err("post-build package gates are incomplete, duplicated, or changed");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ReleaseInventory {
     exact_sources: BTreeSet<String>,
     final_sources: BTreeSet<String>,
     generated_trees: BTreeSet<String>,
+    package_globs: BTreeSet<String>,
+    artifact_exact_outputs: BTreeSet<String>,
+    artifact_glob_outputs: BTreeSet<String>,
+    release_outputs: BTreeSet<String>,
 }
 
 fn enumerate_authoritative_sources(
@@ -468,33 +853,71 @@ fn enumerate_authoritative_sources(
     let wix = wix_sources(wix)?;
     let deb = cargo_deb_sources(cargo)?;
     let steps = workflow_steps(workflow)?;
-    let appimage = steps
+    let appimage_run = steps
         .iter()
-        .find(|step| step.name == "Build AppImage")
-        .and_then(|step| step.run.as_deref())
-        .ok_or("missing AppImage build step")
-        .and_then(appimage_sources)?;
-    let arch = steps
+        .find_map(|step| {
+            step.run.as_deref().filter(|run| {
+                run.contains("AppDir/") || run.contains("linuxdeploy-x86_64.AppImage")
+            })
+        })
+        .ok_or("missing AppImage build step")?;
+    let arch_run = steps
         .iter()
-        .find(|step| step.name == "Create PKGBUILD")
-        .and_then(|step| step.run.as_deref())
-        .ok_or("missing Arch staging step")
-        .and_then(arch_sources)?;
+        .find_map(|step| step.run.as_deref().filter(|run| run.contains("PKGBUILD")))
+        .ok_or("missing Arch staging step")?;
+    let appimage = appimage_sources(appimage_run)?;
+    let arch = arch_sources(arch_run)?;
+    let calls = classify_package_and_release_runs(&steps)?;
+    validate_post_build_gate_steps(&steps)?;
 
     let mut artifacts = BTreeMap::<String, BTreeSet<String>>::new();
     let mut exact_sources = wix.clone();
+    let mut package_globs = BTreeSet::new();
+    let mut artifact_exact_outputs = BTreeSet::new();
+    let mut artifact_glob_outputs = BTreeSet::new();
     exact_sources.extend(deb.iter().cloned());
     exact_sources.extend(appimage.iter().cloned());
     exact_sources.extend(arch.iter().cloned());
-    for step in steps.iter().filter(|step| {
-        step.uses
-            .as_deref()
-            .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
-    }) {
+    let mut downloads = 0;
+    let mut releases = 0;
+    for step in &steps {
+        let Some(uses) = step.uses.as_deref() else {
+            continue;
+        };
+        if uses == "actions/download-artifact@v8" {
+            downloads += 1;
+            if step.job != "release" || step.paths != ["artifacts"] || step.artifact_name.is_some()
+            {
+                return Err("download artifact declaration changed");
+            }
+            continue;
+        }
+        if uses == "softprops/action-gh-release@v3" {
+            releases += 1;
+            if step.job != "release" || step.release_files != ["release/*"] {
+                return Err("final release publication declaration changed");
+            }
+            continue;
+        }
+        if uses != "actions/upload-artifact@v7" {
+            if step.artifact_name.is_some() || !step.release_files.is_empty() {
+                return Err("unrecognized artifact or release action inputs");
+            }
+            if uses.contains("upload-artifact")
+                || uses.contains("download-artifact")
+                || uses.contains("action-gh-release")
+            {
+                return Err("unrecognized artifact or release action");
+            }
+            continue;
+        }
         let artifact = step
             .artifact_name
             .clone()
             .ok_or("upload missing artifact name")?;
+        if expected_artifact_job(&artifact) != Some(step.job.as_str()) {
+            return Err("upload artifact declared in unexpected job");
+        }
         if step.paths.is_empty() || artifacts.contains_key(&artifact) {
             return Err("upload artifact schema changed");
         }
@@ -512,7 +935,10 @@ fn enumerate_authoritative_sources(
                 if expected_tie.is_empty() {
                     return Err("package glob has no enumerated upstream inputs");
                 }
-                members.insert(path.rsplit('/').next().expect("nonempty path").to_owned());
+                let member = path.rsplit('/').next().expect("nonempty path").to_owned();
+                package_globs.insert(path);
+                artifact_glob_outputs.insert(format!("artifacts/{artifact}/{member}"));
+                members.insert(member);
             } else {
                 let path = validate_exact_source(&path)?;
                 let member = Path::new(&path)
@@ -520,21 +946,21 @@ fn enumerate_authoritative_sources(
                     .and_then(|name| name.to_str())
                     .ok_or("upload source has no file name")?
                     .to_owned();
-                exact_sources.insert(path);
+                exact_sources.insert(path.clone());
+                artifact_exact_outputs.insert(format!("artifacts/{artifact}/{member}"));
                 members.insert(member);
             }
         }
         artifacts.insert(artifact, members);
     }
+    if downloads != 1 || releases != 1 || artifacts != expected_artifacts() {
+        return Err("artifact/release action set is incomplete or duplicated");
+    }
 
-    let calls = steps
-        .iter()
-        .find(|step| step.name == "Prepare release files")
-        .and_then(|step| step.run.as_deref())
-        .ok_or("missing release assembly step")
-        .and_then(prepare_release_calls)?;
     let mut consumed = BTreeMap::<String, BTreeSet<String>>::new();
     let mut final_sources = BTreeSet::new();
+    let mut final_destinations = BTreeSet::new();
+    let mut release_outputs = BTreeSet::new();
     for (artifact, member, destination) in calls {
         let declared = artifacts
             .get(&artifact)
@@ -559,9 +985,26 @@ fn enumerate_authoritative_sources(
         final_sources.insert(format!(
             "artifacts/{artifact}/{member} -> release/{destination}"
         ));
+        release_outputs.insert(format!("release/{destination}"));
+        if !final_destinations.insert(destination) {
+            return Err("duplicate final release destination");
+        }
     }
-    if consumed != artifacts {
+    if consumed != artifacts
+        || final_destinations
+            != EXPECTED_RELEASE_DESTINATIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+    {
         return Err("not every uploaded package input reaches final assembly");
+    }
+    let exact_sources_expected = EXPECTED_EXACT_SOURCES
+        .iter()
+        .map(|source| (*source).to_owned())
+        .collect::<BTreeSet<_>>();
+    if exact_sources != exact_sources_expected {
+        return Err("exact release source contract changed");
     }
     Ok(ReleaseInventory {
         exact_sources,
@@ -572,25 +1015,213 @@ fn enumerate_authoritative_sources(
             "artifacts".to_owned(),
             "release".to_owned(),
         ]),
+        package_globs,
+        artifact_exact_outputs,
+        artifact_glob_outputs,
+        release_outputs,
     })
 }
 
-fn resolved_sources_are_safe(repository: &Path, inventory: &ReleaseInventory) -> bool {
-    inventory.exact_sources.iter().all(|source| {
-        let path = repository.join(source);
-        if !path.exists() {
-            return true;
+#[derive(Clone, Copy, Debug)]
+enum PostBuildStage {
+    Windows,
+    Linux,
+    Arch,
+    Release,
+}
+
+fn package_glob_matches(pattern: &str, name: &str) -> bool {
+    match pattern {
+        "*.msi" => name.ends_with(".msi"),
+        "*.deb" => name.ends_with(".deb"),
+        "*.AppImage" => name.ends_with(".AppImage"),
+        "*.pkg.tar.zst" => name.ends_with(".pkg.tar.zst"),
+        "stream-server-[0-9]*.pkg.tar.zst" => name
+            .strip_prefix("stream-server-")
+            .and_then(|value| value.strip_suffix(".pkg.tar.zst"))
+            .is_some_and(|version| {
+                version
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+            }),
+        _ => false,
+    }
+}
+
+fn scan_required_glob(repository: &Path, declaration: &str) -> Result<(), &'static str> {
+    let declaration = Path::new(declaration);
+    let pattern = declaration
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("package glob has no file name")?;
+    let parent = declaration.parent().unwrap_or_else(|| Path::new(""));
+    let parent = repository.join(parent);
+    let metadata = fs::symlink_metadata(&parent).map_err(|_| "package glob parent is missing")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+        return Err("package glob parent is not a direct regular directory");
+    }
+    let mut matches = 0;
+    for entry in fs::read_dir(&parent).map_err(|_| "package glob enumeration failed")? {
+        let entry = entry.map_err(|_| "package glob entry could not be enumerated")?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or("package glob entry is not UTF-8")?
+            .to_owned();
+        if package_glob_matches(pattern, &name) {
+            candidate_tree_is_safe(&entry.path())?;
+            matches += 1;
         }
-        fs::symlink_metadata(&path).is_ok_and(|metadata| {
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && !metadata_is_reparse(&metadata)
-                && candidate_tree_is_safe(&path)
+    }
+    if matches == 0 {
+        return Err("required package output is missing");
+    }
+    Ok(())
+}
+
+fn direct_directory_members(path: &Path) -> Result<BTreeSet<String>, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "package output directory is missing")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+        return Err("package output directory is not a direct regular directory");
+    }
+    fs::read_dir(path)
+        .map_err(|_| "package output directory enumeration failed")?
+        .map(|entry| {
+            entry
+                .map_err(|_| "package output directory entry unavailable")?
+                .file_name()
+                .into_string()
+                .map_err(|_| "package output directory entry is not UTF-8")
         })
-    }) && inventory.generated_trees.iter().all(|tree| {
-        let path = repository.join(tree);
-        !path.exists() || candidate_tree_is_safe(&path)
-    })
+        .collect()
+}
+
+fn validate_post_build_outputs(
+    repository: &Path,
+    inventory: &ReleaseInventory,
+    stage: PostBuildStage,
+) -> Result<(), &'static str> {
+    if matches!(stage, PostBuildStage::Release) {
+        let expected = inventory
+            .release_outputs
+            .iter()
+            .filter_map(|path| Path::new(path).file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .chain(["SHA256SUMS.txt".to_owned()])
+            .collect::<BTreeSet<_>>();
+        if direct_directory_members(&repository.join("release"))? != expected {
+            return Err("final release directory contains an unenumerated publication");
+        }
+    }
+    let exact = match stage {
+        PostBuildStage::Windows => inventory
+            .exact_sources
+            .iter()
+            .filter(|path| path.starts_with("target/x86_64-pc-windows-msvc/"))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        PostBuildStage::Linux | PostBuildStage::Arch => inventory
+            .exact_sources
+            .iter()
+            .filter(|path| {
+                path.starts_with("target/release/")
+                    || (matches!(stage, PostBuildStage::Linux)
+                        && *path == "stream-server-linux-amd64.AppImage")
+            })
+            .cloned()
+            .collect(),
+        PostBuildStage::Release => inventory
+            .artifact_exact_outputs
+            .iter()
+            .chain(inventory.release_outputs.iter())
+            .cloned()
+            .chain(["release/SHA256SUMS.txt".to_owned()])
+            .collect(),
+    };
+    for path in exact {
+        let path = repository.join(path);
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| "required package output is missing")?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse(&metadata)
+        {
+            return Err("required package output is not a direct regular file");
+        }
+        candidate_tree_is_safe(&path)?;
+    }
+
+    let globs = match stage {
+        PostBuildStage::Windows => inventory
+            .package_globs
+            .iter()
+            .filter(|path| path.starts_with("target/wix/"))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        PostBuildStage::Linux => inventory
+            .package_globs
+            .iter()
+            .filter(|path| *path == "target/debian/*.deb" || *path == "*.AppImage")
+            .cloned()
+            .collect(),
+        PostBuildStage::Arch => inventory
+            .package_globs
+            .iter()
+            .filter(|path| path.starts_with("pkg/"))
+            .cloned()
+            .collect(),
+        PostBuildStage::Release => inventory.artifact_glob_outputs.clone(),
+    };
+    for declaration in globs {
+        scan_required_glob(repository, &declaration)?;
+    }
+
+    let trees = match stage {
+        PostBuildStage::Windows => Vec::new(),
+        PostBuildStage::Linux => vec!["AppDir"],
+        PostBuildStage::Arch => vec!["pkg"],
+        PostBuildStage::Release => vec!["artifacts", "release"],
+    };
+    for tree in trees {
+        if !inventory.generated_trees.contains(tree) {
+            return Err("post-build tree is not tied to structural inventory");
+        }
+        candidate_tree_is_safe(&repository.join(tree))?;
+    }
+    Ok(())
+}
+
+fn read_authoritative_release_workflow(workflows: &Path) -> Result<String, &'static str> {
+    let mut declarations = BTreeMap::new();
+    for entry in fs::read_dir(workflows).map_err(|_| "workflow directory unavailable")? {
+        let entry = entry.map_err(|_| "workflow directory entry unavailable")?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| "workflow metadata unavailable")?;
+        if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+            return Err("workflow declaration is a link or reparse point");
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let extension = path.extension().and_then(|value| value.to_str());
+        if !matches!(extension, Some("yml" | "yaml")) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or("workflow file name is not UTF-8")?
+            .to_owned();
+        let value = fs::read_to_string(path).map_err(|_| "workflow declaration unreadable")?;
+        declarations.insert(name, value);
+    }
+    if declarations.keys().map(String::as_str).collect::<Vec<_>>() != ["release.yml"] {
+        return Err("authoritative workflow file set changed");
+    }
+    declarations
+        .remove("release.yml")
+        .ok_or("release workflow missing")
 }
 
 fn repository_inputs() -> (PathBuf, String, String, String) {
@@ -602,19 +1233,259 @@ fn repository_inputs() -> (PathBuf, String, String, String) {
         fs::read_to_string(repository.join("server/wix/main.wxs")).expect("read WiX declaration");
     let cargo =
         fs::read_to_string(repository.join("server/Cargo.toml")).expect("read Cargo declaration");
-    let workflow = fs::read_to_string(repository.join(".github/workflows/release.yml"))
-        .expect("read release workflow");
+    let workflow = read_authoritative_release_workflow(&repository.join(".github/workflows"))
+        .expect("read closed authoritative release workflow set");
     (repository, wix, cargo, workflow)
+}
+
+fn write_safe_fixture(root: &Path, relative: &str) -> PathBuf {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
+    fs::write(&path, b"ordinary application package output").expect("write safe fixture");
+    path
+}
+
+fn materialize_glob_fixture(root: &Path, declaration: &str) -> PathBuf {
+    let declaration = Path::new(declaration);
+    let pattern = declaration
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("fixture glob name");
+    let name = match pattern {
+        "*.msi" => "stream-server.msi",
+        "*.deb" => "stream-server.deb",
+        "*.AppImage" => "stream-server.AppImage",
+        "*.pkg.tar.zst" | "stream-server-[0-9]*.pkg.tar.zst" => "stream-server-1.pkg.tar.zst",
+        _ => panic!("unexpected fixture glob {pattern}"),
+    };
+    write_safe_fixture(
+        root,
+        &declaration
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(name)
+            .to_string_lossy(),
+    )
+}
+
+fn populate_post_build_fixture(
+    root: &Path,
+    inventory: &ReleaseInventory,
+    stage: PostBuildStage,
+) -> Vec<PathBuf> {
+    let mut outputs = Vec::new();
+    let exact = match stage {
+        PostBuildStage::Windows => inventory
+            .exact_sources
+            .iter()
+            .filter(|path| path.starts_with("target/x86_64-pc-windows-msvc/"))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        PostBuildStage::Linux | PostBuildStage::Arch => inventory
+            .exact_sources
+            .iter()
+            .filter(|path| {
+                path.starts_with("target/release/")
+                    || (matches!(stage, PostBuildStage::Linux)
+                        && *path == "stream-server-linux-amd64.AppImage")
+            })
+            .cloned()
+            .collect(),
+        PostBuildStage::Release => inventory
+            .artifact_exact_outputs
+            .iter()
+            .chain(inventory.release_outputs.iter())
+            .cloned()
+            .chain(["release/SHA256SUMS.txt".to_owned()])
+            .collect(),
+    };
+    outputs.extend(exact.iter().map(|path| write_safe_fixture(root, path)));
+    let globs = match stage {
+        PostBuildStage::Windows => inventory
+            .package_globs
+            .iter()
+            .filter(|path| path.starts_with("target/wix/"))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        PostBuildStage::Linux => inventory
+            .package_globs
+            .iter()
+            .filter(|path| *path == "target/debian/*.deb" || *path == "*.AppImage")
+            .cloned()
+            .collect(),
+        PostBuildStage::Arch => inventory
+            .package_globs
+            .iter()
+            .filter(|path| path.starts_with("pkg/"))
+            .cloned()
+            .collect(),
+        PostBuildStage::Release => inventory.artifact_glob_outputs.clone(),
+    };
+    outputs.extend(
+        globs
+            .iter()
+            .map(|glob| materialize_glob_fixture(root, glob)),
+    );
+    for tree in match stage {
+        PostBuildStage::Windows => Vec::new(),
+        PostBuildStage::Linux => vec!["AppDir"],
+        PostBuildStage::Arch => vec!["pkg"],
+        PostBuildStage::Release => vec!["artifacts", "release"],
+    } {
+        let tree = root.join(tree);
+        fs::create_dir_all(&tree).expect("create generated tree");
+        if fs::read_dir(&tree)
+            .expect("read generated tree")
+            .next()
+            .is_none()
+        {
+            outputs.push(write_safe_fixture(&tree, "ordinary.txt"));
+        }
+    }
+    outputs
 }
 
 #[test]
 fn authoritative_release_declarations_structurally_enumerate_all_safe_inputs() {
-    let (repository, wix, cargo, workflow) = repository_inputs();
+    let (_, wix, cargo, workflow) = repository_inputs();
     let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
         .expect("structurally enumerate authoritative package sources");
     assert!(inventory.exact_sources.len() >= 6);
     assert_eq!(inventory.final_sources.len(), 10);
-    assert!(resolved_sources_are_safe(&repository, &inventory));
+    assert_eq!(inventory.package_globs.len(), 3);
+    assert_eq!(inventory.artifact_exact_outputs.len(), 7);
+    assert_eq!(inventory.artifact_glob_outputs.len(), 3);
+    assert_eq!(inventory.release_outputs.len(), 10);
+}
+
+#[test]
+fn workflow_directory_contract_rejects_an_extra_workflow_file() {
+    let (_, _, _, workflow) = repository_inputs();
+    let directory = tempfile::tempdir().expect("workflow directory fixture");
+    fs::write(directory.path().join("release.yml"), workflow).expect("write release workflow");
+    fs::write(
+        directory.path().join("shadow-release.yaml"),
+        "jobs:\n  shadow:\n    steps:\n      - uses: softprops/action-gh-release@v3\n",
+    )
+    .expect("write shadow workflow");
+    assert!(read_authoritative_release_workflow(directory.path()).is_err());
+}
+
+#[test]
+fn post_build_gate_requires_every_declared_output_and_scans_no_follow() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
+        .expect("enumerate post-build contract");
+    for stage in [
+        PostBuildStage::Windows,
+        PostBuildStage::Linux,
+        PostBuildStage::Arch,
+        PostBuildStage::Release,
+    ] {
+        let directory = tempfile::tempdir().expect("post-build fixture");
+        let outputs = populate_post_build_fixture(directory.path(), &inventory, stage);
+        validate_post_build_outputs(directory.path(), &inventory, stage)
+            .unwrap_or_else(|error| panic!("complete {stage:?} fixture failed: {error}"));
+        fs::remove_file(outputs.first().expect("stage has expected output"))
+            .expect("remove one expected output");
+        assert!(
+            validate_post_build_outputs(directory.path(), &inventory, stage).is_err(),
+            "missing {stage:?} output passed"
+        );
+    }
+}
+
+#[test]
+fn downloaded_linuxdeploy_tool_cannot_stand_in_for_the_built_appimage() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
+        .expect("enumerate AppImage output contract");
+    let directory = tempfile::tempdir().expect("AppImage output fixture");
+    let outputs = populate_post_build_fixture(directory.path(), &inventory, PostBuildStage::Linux);
+    let generated = outputs
+        .iter()
+        .find(|path| {
+            path.parent() == Some(directory.path())
+                && path.ends_with("stream-server-linux-amd64.AppImage")
+        })
+        .expect("generated AppImage fixture");
+    fs::remove_file(generated).expect("remove generated AppImage");
+    write_safe_fixture(directory.path(), "linuxdeploy-x86_64.AppImage");
+    assert!(
+        validate_post_build_outputs(directory.path(), &inventory, PostBuildStage::Linux).is_err(),
+        "downloaded linuxdeploy tool satisfied the application output contract"
+    );
+}
+
+#[test]
+fn release_gate_rejects_an_unenumerated_safe_publication_file() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
+        .expect("enumerate final publication contract");
+    let directory = tempfile::tempdir().expect("final publication fixture");
+    populate_post_build_fixture(directory.path(), &inventory, PostBuildStage::Release);
+    write_safe_fixture(directory.path(), "release/operator-note.txt");
+    assert!(
+        validate_post_build_outputs(directory.path(), &inventory, PostBuildStage::Release).is_err(),
+        "release wildcard admitted an unenumerated safe file"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn post_build_gate_rejects_a_dangling_reparse_input() {
+    use std::os::windows::fs::symlink_file;
+
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
+        .expect("enumerate post-build contract");
+    let directory = tempfile::tempdir().expect("dangling output fixture");
+    populate_post_build_fixture(directory.path(), &inventory, PostBuildStage::Windows);
+    let output = directory
+        .path()
+        .join("target/x86_64-pc-windows-msvc/release/server.exe");
+    fs::remove_file(&output).expect("remove regular fixture");
+    symlink_file("missing-server.exe", &output).expect("create dangling output link");
+    assert!(
+        validate_post_build_outputs(directory.path(), &inventory, PostBuildStage::Windows).is_err()
+    );
+}
+
+#[test]
+fn candidate_tree_propagates_directory_enumeration_errors() {
+    let directory = tempfile::tempdir().expect("enumeration error fixture");
+    let blocked = directory.path().join("blocked");
+    fs::create_dir(&blocked).expect("create blocked directory");
+    fs::write(blocked.join("ordinary.txt"), b"ordinary").expect("write blocked child");
+    let mut reader = |path: &Path| {
+        if path == blocked {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected directory entry failure",
+            ));
+        }
+        fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    };
+    assert!(scan_candidate_tree_with(directory.path(), &mut reader).is_err());
+}
+
+#[test]
+#[ignore = "post-build gate: set STREAM_SERVER_RELEASE_GATE_STAGE=windows|linux|arch|release after that job builds"]
+fn authoritative_post_build_package_gate() {
+    let (repository, wix, cargo, workflow) = repository_inputs();
+    let inventory = enumerate_authoritative_sources(&wix, &cargo, &workflow)
+        .expect("enumerate post-build contract");
+    let stage = match std::env::var("STREAM_SERVER_RELEASE_GATE_STAGE").as_deref() {
+        Ok("windows") => PostBuildStage::Windows,
+        Ok("linux") => PostBuildStage::Linux,
+        Ok("arch") => PostBuildStage::Arch,
+        Ok("release") => PostBuildStage::Release,
+        _ => panic!("set STREAM_SERVER_RELEASE_GATE_STAGE for the completed release job"),
+    };
+    validate_post_build_outputs(&repository, &inventory, stage)
+        .unwrap_or_else(|error| panic!("post-build package gate failed: {error}"));
 }
 
 #[test]
@@ -656,6 +1527,73 @@ fn actual_declaration_mutations_reject_directories_globs_and_unknown_staging() {
     assert!(enumerate_authoritative_sources(&wix, &cargo_directory, &workflow).is_err());
     let wix_variable = wix.replace("$(var.CargoTargetBinDir)", "$(var.UnknownBinDir)");
     assert!(enumerate_authoritative_sources(&wix_variable, &cargo, &workflow).is_err());
+}
+
+#[test]
+fn workflow_contract_rejects_unnamed_duplicate_and_changed_release_declarations() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let workflow = workflow.replace("\r\n", "\n");
+    let unnamed_upload = workflow.replacen(
+        "      - name: Build MSI Installer\n",
+        "      - uses: actions/upload-artifact@v7\n        with:\n          name: shadow-upload\n          path: payload.bin\n\n      - name: Build MSI Installer\n",
+        1,
+    );
+    let appimage_start = workflow
+        .find("      - name: Build AppImage\n")
+        .expect("AppImage step");
+    let appimage_end = workflow[appimage_start + 1..]
+        .find("\n      - name:")
+        .map(|offset| appimage_start + 1 + offset + 1)
+        .expect("step after AppImage");
+    let duplicated_appimage = format!(
+        "{}{}{}",
+        &workflow[..appimage_end],
+        &workflow[appimage_start..appimage_end],
+        &workflow[appimage_end..]
+    );
+    let changed_release_files = workflow.replace("files: release/*", "files: release/*.zip");
+    let extra_release_files = workflow.replace(
+        "files: release/*",
+        "files: |\n            release/*\n            payload/*",
+    );
+
+    for mutation in [
+        unnamed_upload,
+        duplicated_appimage,
+        changed_release_files,
+        extra_release_files,
+    ] {
+        assert!(
+            enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err(),
+            "workflow mutation escaped the closed release contract"
+        );
+    }
+}
+
+#[test]
+fn structural_contract_rejects_absent_renamed_payload_declarations() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    for absent in ["payload/renamed-codec.exe", "payload/renamed-codec.zip"] {
+        let member = Path::new(absent)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("absent payload member");
+        let mutation = workflow
+            .replacen(
+                "target/x86_64-pc-windows-msvc/release/server.exe",
+                absent,
+                1,
+            )
+            .replacen(
+                "artifacts/server-windows-amd64/server.exe",
+                &format!("artifacts/server-windows-amd64/{member}"),
+                1,
+            );
+        assert!(
+            enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err(),
+            "absent renamed payload was treated as structurally safe"
+        );
+    }
 }
 
 #[test]
@@ -708,7 +1646,7 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
         }
         fs::write(&path, bytes).expect("write renamed payload");
         assert!(
-            !candidate_tree_is_safe(&path),
+            candidate_tree_is_safe(&path).is_err(),
             "accepted renamed payload {name}"
         );
 
@@ -723,11 +1661,9 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
                 &format!("artifacts/server-windows-amd64/{file_name}"),
                 1,
             );
-        let inventory = enumerate_authoritative_sources(&wix, &cargo, &mutated)
-            .expect("mutated exact source remains structurally enumerable");
         assert!(
-            !resolved_sources_are_safe(repository.path(), &inventory),
-            "actual release declaration admitted renamed payload {name}"
+            enumerate_authoritative_sources(&wix, &cargo, &mutated).is_err(),
+            "structural contract admitted renamed payload {name}"
         );
     }
     let directory_source = repository.path().join("payload-directory");
@@ -745,11 +1681,9 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
             "artifacts/server-windows-amd64/payload-directory",
             1,
         );
-    let directory_inventory = enumerate_authoritative_sources(&wix, &cargo, &directory_workflow)
-        .expect("directory mutation remains structurally enumerable");
     assert!(
-        !resolved_sources_are_safe(repository.path(), &directory_inventory),
-        "declared directory was accepted as an exact release input"
+        enumerate_authoritative_sources(&wix, &cargo, &directory_workflow).is_err(),
+        "declared directory was accepted by the exact structural contract"
     );
     assert!(!forbidden_runtime_payload(
         Path::new("target/x86_64-pc-windows-msvc/release/server.exe"),

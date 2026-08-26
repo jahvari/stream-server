@@ -615,6 +615,7 @@ async fn run_inner(
         tokio::sync::oneshot::channel::<ShutdownSource>();
     let listen_for_ctrl_c = cfg.listen_for_ctrl_c;
     let cancellation_on_shutdown = server_cancellation.clone();
+    let supervisor_on_shutdown = Arc::clone(&process_supervisor);
     let shutdown = async move {
         let source = tokio::select! {
             _ = maybe_ctrl_c(listen_for_ctrl_c) => {
@@ -631,6 +632,9 @@ async fn run_inner(
             }
         };
 
+        // Close supervised child/selection admission synchronously before the
+        // broader server token wakes asynchronous shutdown observers.
+        supervisor_on_shutdown.cancel();
         cancellation_on_shutdown.cancel();
         let _ = shutdown_started_tx.send(source);
     };
@@ -712,6 +716,7 @@ async fn run_inner(
         }
     };
 
+    process_supervisor.cancel();
     server_cancellation.cancel();
 
     for task in background_tasks {

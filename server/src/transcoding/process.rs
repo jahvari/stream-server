@@ -853,6 +853,23 @@ impl ProcessSupervisor {
         self.inner.cancellation.cancel();
     }
 
+    pub(super) fn admit_selection_commit<F>(&self, commit: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        // Lock order is always supervisor admission gate, then the caller's
+        // non-blocking commit CAS. Cancellation never takes them in reverse.
+        let _gate = self
+            .inner
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
+            return false;
+        }
+        commit()
+    }
+
     pub fn force_terminate_registered(&self) -> Result<(), ProcessError> {
         self.inner.registry.force_terminate_all()
     }

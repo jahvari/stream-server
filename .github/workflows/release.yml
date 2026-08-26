@@ -219,6 +219,10 @@ jobs:
           VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
           PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
 
+      - name: Verify Windows package outputs
+        run: |
+          $env:STREAM_SERVER_RELEASE_GATE_STAGE = "windows"
+          cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Upload MSI
         uses: actions/upload-artifact@v7
@@ -310,7 +314,13 @@ jobs:
           convert -size 256x256 xc:steelblue -gravity center -pointsize 48 -fill white -annotate 0 "SS" AppDir/usr/share/icons/hicolor/256x256/apps/stream-server.png || echo "ImageMagick not available, using placeholder"
 
           # Build AppImage
-          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage || true
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+          generated_appimage="$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'linuxdeploy-x86_64.AppImage' -print -quit)"
+          [ -n "$generated_appimage" ]
+          mv "$generated_appimage" stream-server-linux-amd64.AppImage
+
+      - name: Verify Linux package outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=linux cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Upload Binary
         uses: actions/upload-artifact@v7
@@ -330,8 +340,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: server-linux-appimage
-          path: "*.AppImage"
-          if-no-files-found: ignore
+          path: stream-server-linux-amd64.AppImage
 
   build-arch:
     name: Build Arch Linux
@@ -402,6 +411,9 @@ jobs:
           chown -R builder:builder .
           su builder -c "makepkg -sf --noconfirm"
 
+      - name: Verify Arch package outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=arch cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
+
       - name: Upload Arch Package
         uses: actions/upload-artifact@v7
         with:
@@ -419,6 +431,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Setup Rust for package gate
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -456,11 +471,14 @@ jobs:
           copy_file artifacts/server-linux-amd64/server stream-server-linux-amd64
           copy_file artifacts/server-linux-amd64/settings-gui stream-server-settings-linux-amd64
           copy_latest artifacts/server-linux-deb "*.deb" stream-server-linux-amd64.deb
-          copy_latest artifacts/server-linux-appimage "*.AppImage" stream-server-linux-amd64.AppImage
+          copy_file artifacts/server-linux-appimage/stream-server-linux-amd64.AppImage stream-server-linux-amd64.AppImage
           # Arch
           copy_latest artifacts/server-arch-pkg "stream-server-[0-9]*.pkg.tar.zst" stream-server-arch-x86_64.pkg.tar.zst
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release/
+
+      - name: Verify final release outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=release cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Generate release description
         run: |

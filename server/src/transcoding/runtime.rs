@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -871,6 +871,7 @@ async fn probe_pair(
         AcquisitionExecution {
             cancellation: &tokio_util::sync::CancellationToken::new(),
             observer: &AcquisitionObserver::default(),
+            commit: None,
         },
     )
     .await
@@ -920,6 +921,7 @@ async fn probe_authenticated_pair(
         AcquisitionExecution {
             cancellation: &tokio_util::sync::CancellationToken::new(),
             observer: &AcquisitionObserver::default(),
+            commit: None,
         },
     )
     .await
@@ -3205,6 +3207,7 @@ async fn install_verified_archive(
     let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
     recover_managed_install_artifacts(root, &staging_root)?;
     let cancellation = tokio_util::sync::CancellationToken::new();
+    let commit = AcquisitionCommitControl::new();
     let observer = AcquisitionObserver::default();
     install_verified_archive_locked(
         (root, &versions, &staging_root),
@@ -3215,6 +3218,7 @@ async fn install_verified_archive(
         AcquisitionExecution {
             cancellation: &cancellation,
             observer: &observer,
+            commit: Some(&commit),
         },
     )
     .await
@@ -3505,9 +3509,16 @@ async fn activate_managed_version_locked(
         current_install_digest: runtime.id.install_digest.clone(),
         previous_version,
     };
-    if cancellation.is_cancelled() {
+    observer
+        .commit_checkpoint(AcquisitionStage::BeforeCommitAdmission)
+        .await;
+    let commit = execution.commit.ok_or(RuntimeError::ActivationFailed)?;
+    if !commit.admit(supervisor) {
         return Err(RuntimeError::Cancelled);
     }
+    observer
+        .commit_checkpoint(AcquisitionStage::AfterCommitAdmission)
+        .await;
     write_managed_selection_atomically(root, &selection)?;
     cleanup_managed_versions(root, &selection);
     Ok(runtime)
@@ -3687,24 +3698,16 @@ where
     F: FnOnce(PathBuf) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send + 'static,
 {
-    let caller_cancellation = tokio_util::sync::CancellationToken::new();
+    let commit = Arc::new(AcquisitionCommitControl::new());
     let mut caller_guard = AcquisitionCallerGuard {
-        cancellation: caller_cancellation.clone(),
+        commit: Arc::clone(&commit),
         armed: true,
     };
     let root = root.to_path_buf();
     let artifact = artifact.clone();
     let supervisor = supervisor.clone();
     let owner = tokio::spawn(async move {
-        ensure_managed_runtime_owner(
-            &root,
-            &artifact,
-            &supervisor,
-            fetch,
-            &caller_cancellation,
-            &observer,
-        )
-        .await
+        ensure_managed_runtime_owner(&root, &artifact, &supervisor, fetch, commit, &observer).await
     });
     let result = owner.await.map_err(|_| RuntimeError::InstallFailed)?;
     caller_guard.armed = false;
@@ -3717,7 +3720,7 @@ async fn ensure_managed_runtime_owner<F, Fut>(
     artifact: &super::runtime_manifest::RuntimeArtifact,
     supervisor: &ProcessSupervisor,
     fetch: F,
-    caller_cancellation: &tokio_util::sync::CancellationToken,
+    commit: Arc<AcquisitionCommitControl>,
     observer: &AcquisitionObserver,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError>
 where
@@ -3726,20 +3729,14 @@ where
 {
     let version = managed_version_token(artifact)?.to_owned();
     let _owner_guard = observer.owner();
-    let operation_cancellation = tokio_util::sync::CancellationToken::new();
-    let caller_signal = caller_cancellation.clone();
     let supervisor_signal = supervisor.cancellation_token();
-    if caller_signal.is_cancelled() || supervisor_signal.is_cancelled() {
-        operation_cancellation.cancel();
+    if supervisor_signal.is_cancelled() {
+        commit.cancel();
     }
-    let linked_cancellation = operation_cancellation.clone();
+    let cancellation_commit = Arc::clone(&commit);
     let cancellation_forwarder = tokio::spawn(async move {
-        tokio::select! {
-            biased;
-            _ = caller_signal.cancelled() => {},
-            _ = supervisor_signal.cancelled() => {},
-        }
-        linked_cancellation.cancel();
+        supervisor_signal.cancelled().await;
+        cancellation_commit.cancel();
     });
     let _cancellation_forwarder_guard = AcquisitionCancellationForwarder {
         task: cancellation_forwarder,
@@ -3756,8 +3753,9 @@ where
                 supervisor,
                 false,
                 AcquisitionExecution {
-                    cancellation: &operation_cancellation,
+                    cancellation: commit.cancellation(),
                     observer,
+                    commit: Some(&commit),
                 },
             )
             .await;
@@ -3766,7 +3764,7 @@ where
         _ => return Err(RuntimeError::UnsafePath),
     }
 
-    if operation_cancellation.is_cancelled() {
+    if commit.cancellation().is_cancelled() {
         return Err(RuntimeError::Cancelled);
     }
 
@@ -3777,7 +3775,7 @@ where
     };
     let download = tokio::select! {
         biased;
-        _ = operation_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        _ = commit.cancellation().cancelled() => Err(RuntimeError::Cancelled),
         result = fetch(archive_path.clone()) => result,
     };
     if let Err(error) = download {
@@ -3785,7 +3783,7 @@ where
         return Err(error);
     }
     observer
-        .checkpoint(AcquisitionStage::PostDownload, &operation_cancellation)
+        .checkpoint(AcquisitionStage::PostDownload, commit.cancellation())
         .await?;
     let result = install_verified_archive_locked(
         (root, &versions, &staging_root),
@@ -3794,8 +3792,9 @@ where
         supervisor,
         false,
         AcquisitionExecution {
-            cancellation: &operation_cancellation,
+            cancellation: commit.cancellation(),
             observer,
+            commit: Some(&commit),
         },
     )
     .await;
@@ -3810,12 +3809,66 @@ enum AcquisitionStage {
     PostExtraction,
     InProbe,
     PostProbe,
+    BeforeCommitAdmission,
+    AfterCommitAdmission,
 }
 
 #[derive(Clone, Copy)]
 struct AcquisitionExecution<'a> {
     cancellation: &'a tokio_util::sync::CancellationToken,
     observer: &'a AcquisitionObserver,
+    commit: Option<&'a AcquisitionCommitControl>,
+}
+
+const ACQUISITION_ACTIVE: u8 = 0;
+const ACQUISITION_CANCELLED: u8 = 1;
+const ACQUISITION_COMMITTED: u8 = 2;
+
+struct AcquisitionCommitControl {
+    state: AtomicU8,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl AcquisitionCommitControl {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ACQUISITION_ACTIVE),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn cancellation(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancellation
+    }
+
+    fn cancel(&self) -> bool {
+        let cancelled = self
+            .state
+            .compare_exchange(
+                ACQUISITION_ACTIVE,
+                ACQUISITION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.cancellation.cancel();
+        }
+        cancelled
+    }
+
+    fn admit(&self, supervisor: &ProcessSupervisor) -> bool {
+        supervisor.admit_selection_commit(|| {
+            self.state
+                .compare_exchange(
+                    ACQUISITION_ACTIVE,
+                    ACQUISITION_COMMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -3849,6 +3902,19 @@ impl AcquisitionObserver {
             Err(RuntimeError::Cancelled)
         } else {
             Ok(())
+        }
+    }
+
+    async fn commit_checkpoint(&self, _stage: AcquisitionStage) {
+        #[cfg(test)]
+        if let Some(test) = &self.test
+            && test.target == _stage
+        {
+            test.reached.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+            while !test.released.load(Ordering::Acquire) {
+                test.notification.notified().await;
+            }
         }
     }
 
@@ -3922,6 +3988,7 @@ struct AcquisitionTestObserver {
     notification: tokio::sync::Notify,
     active_blocking_workers: AtomicUsize,
     owner_finished: AtomicBool,
+    released: AtomicBool,
 }
 
 #[cfg(test)]
@@ -3933,6 +4000,7 @@ impl AcquisitionTestObserver {
             notification: tokio::sync::Notify::new(),
             active_blocking_workers: AtomicUsize::new(0),
             owner_finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -3951,10 +4019,15 @@ impl AcquisitionTestObserver {
             self.notification.notified().await;
         }
     }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.notification.notify_waiters();
+    }
 }
 
 struct AcquisitionCallerGuard {
-    cancellation: tokio_util::sync::CancellationToken,
+    commit: Arc<AcquisitionCommitControl>,
     armed: bool,
 }
 
@@ -3971,7 +4044,7 @@ impl Drop for AcquisitionCancellationForwarder {
 impl Drop for AcquisitionCallerGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.cancellation.cancel();
+            self.commit.cancel();
         }
     }
 }
@@ -4493,6 +4566,7 @@ where
     let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
     recover_managed_install_artifacts(root, &staging_root)?;
     let cancellation = tokio_util::sync::CancellationToken::new();
+    let commit = AcquisitionCommitControl::new();
     let observer = AcquisitionObserver::default();
     install_verified_archive_locked_with_hook(
         (root, &versions, &staging_root),
@@ -4504,6 +4578,7 @@ where
         AcquisitionExecution {
             cancellation: &cancellation,
             observer: &observer,
+            commit: Some(&commit),
         },
     )
     .await
@@ -6028,6 +6103,105 @@ fn main() {{
         assert!(!root.join("current.json").exists());
         assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
         assert_eq!(supervisor.active_processes(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selection_commit_admission_linearizes_caller_and_supervisor_cancellation() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        for (stage, cancel_caller, expect_switch) in [
+            (super::AcquisitionStage::BeforeCommitAdmission, true, false),
+            (super::AcquisitionStage::BeforeCommitAdmission, false, false),
+            (super::AcquisitionStage::AfterCommitAdmission, true, true),
+            (super::AcquisitionStage::AfterCommitAdmission, false, true),
+        ] {
+            let directory = tempfile::tempdir().expect("commit admission fixture");
+            let root = directory.path().join("runtimes");
+            let (old_archive, old_artifact) =
+                runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+            let (active_archive, active_artifact) =
+                runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+            let supervisor = ProcessSupervisor::new(CancellationToken::new());
+            drop(
+                super::install_archive_for_test(
+                    &root,
+                    &old_artifact,
+                    &old_archive,
+                    &supervisor,
+                    false,
+                )
+                .await
+                .expect("seed prior selection"),
+            );
+            let selection_before =
+                fs::read(root.join("current.json")).expect("read prior selection");
+            let observer = Arc::new(super::AcquisitionTestObserver::new(stage));
+            let copied_archive = active_archive.clone();
+            let mut acquisition = Some(Box::pin(
+                super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                    &root,
+                    &active_artifact,
+                    &supervisor,
+                    move |archive_path| async move {
+                        fs::copy(copied_archive, archive_path).expect("copy active archive");
+                        Ok(())
+                    },
+                    Arc::clone(&observer),
+                ),
+            ));
+            tokio::select! {
+                result = acquisition.as_mut().expect("acquisition").as_mut() => {
+                    panic!("acquisition passed commit checkpoint {stage:?}: {result:?}")
+                },
+                _ = observer.wait_until_reached() => {}
+            }
+
+            if cancel_caller {
+                drop(acquisition.take());
+                observer.release();
+                tokio::time::timeout(Duration::from_secs(3), observer.wait_until_owner_finished())
+                    .await
+                    .expect("durable owner finishes after caller drop");
+            } else {
+                supervisor.cancel();
+                observer.release();
+                let result = acquisition
+                    .take()
+                    .expect("acquisition after checkpoint")
+                    .await;
+                if expect_switch {
+                    result.expect("commit admission makes selection non-cancellable");
+                } else {
+                    assert_eq!(result.unwrap_err(), super::RuntimeError::Cancelled);
+                }
+            }
+
+            let selection_after =
+                fs::read(root.join("current.json")).expect("read selection after cancellation");
+            if expect_switch {
+                assert_ne!(
+                    selection_after, selection_before,
+                    "commit winner did not switch"
+                );
+                assert_eq!(
+                    super::read_managed_selection(&root)
+                        .expect("read switched selection")
+                        .expect("selection exists")
+                        .current_version,
+                    active_artifact.source_tag()
+                );
+            } else {
+                assert_eq!(
+                    selection_after, selection_before,
+                    "cancellation winner switched selection"
+                );
+            }
+            assert_eq!(supervisor.active_processes(), 0);
+            assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        }
     }
 
     #[cfg(windows)]
