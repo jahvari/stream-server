@@ -207,10 +207,12 @@ fn authenticated_managed_root(root: &Path) -> PathBuf {
     super::write_version_receipt(&version_root, &receipt).expect("write managed receipt fixture");
     let selection = super::ManagedSelection {
         schema_version: super::MANAGED_SELECTION_SCHEMA_VERSION,
+        manifest_version: artifact.source_tag().to_owned(),
+        manifest_archive_sha256: artifact.sha256().to_owned(),
         current_version: artifact.source_tag().to_owned(),
+        current_archive_sha256: artifact.sha256().to_owned(),
+        current_install_digest: install_digest,
         previous_version: None,
-        archive_sha256: artifact.sha256().to_owned(),
-        install_digest,
     };
     super::write_managed_selection_atomically(root, &selection)
         .expect("write managed selection fixture");

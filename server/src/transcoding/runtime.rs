@@ -503,6 +503,7 @@ enum CandidateFailure {
     Unsafe,
     Probe,
     Deadline,
+    Cancelled,
     Incompatible,
 }
 
@@ -529,8 +530,8 @@ fn authenticated_managed_candidates(
     let Some(selection) = read_managed_selection(root)? else {
         return Ok(None);
     };
-    if selection.current_version != artifact.source_tag()
-        || selection.archive_sha256 != artifact.sha256()
+    if selection.manifest_version != artifact.source_tag()
+        || selection.manifest_archive_sha256 != artifact.sha256()
     {
         return Ok(Some(Vec::new()));
     }
@@ -539,8 +540,9 @@ fn authenticated_managed_candidates(
     let current_root = versions.join(&selection.current_version);
     if validate_existing_local_components(&current_root).is_ok()
         && let Ok(receipt) = read_version_receipt(&current_root)
-        && receipt.matches_artifact(artifact)
-        && receipt.install_digest == selection.install_digest
+        && receipt.version == selection.current_version
+        && receipt.archive_sha256 == selection.current_archive_sha256
+        && receipt.install_digest == selection.current_install_digest
     {
         candidates.push((
             current_root,
@@ -722,6 +724,7 @@ async fn resolve_runtime_inner(
             Err(CandidateFailure::Deadline) => saw_deadline = true,
             Err(CandidateFailure::Probe) => saw_probe_failure = true,
             Err(CandidateFailure::Incompatible) => saw_incompatible = true,
+            Err(CandidateFailure::Cancelled) => return Err(RuntimeError::Cancelled),
             Err(CandidateFailure::Unsafe) if config.explicit_root.as_ref() == Some(&root) => {
                 return Err(RuntimeError::UnsafePath);
             }
@@ -782,6 +785,7 @@ fn candidate_failure_error(failure: CandidateFailure) -> RuntimeError {
         CandidateFailure::Unsafe => RuntimeError::UnsafePath,
         CandidateFailure::Probe => RuntimeError::ProbeFailed,
         CandidateFailure::Deadline => RuntimeError::ProbeDeadline,
+        CandidateFailure::Cancelled => RuntimeError::Cancelled,
         CandidateFailure::Incompatible => RuntimeError::IncompatiblePair,
     }
 }
@@ -858,13 +862,42 @@ async fn probe_pair(
     ffprobe_jellyfin_matcher: &str,
     supervisor: &ProcessSupervisor,
 ) -> Result<ProbedPair, CandidateFailure> {
+    probe_pair_with_context(
+        root,
+        required_version,
+        ffmpeg_jellyfin_matcher,
+        ffprobe_jellyfin_matcher,
+        supervisor,
+        AcquisitionExecution {
+            cancellation: &tokio_util::sync::CancellationToken::new(),
+            observer: &AcquisitionObserver::default(),
+        },
+    )
+    .await
+}
+
+async fn probe_pair_with_context(
+    root: &Path,
+    required_version: &str,
+    ffmpeg_jellyfin_matcher: &str,
+    ffprobe_jellyfin_matcher: &str,
+    supervisor: &ProcessSupervisor,
+    execution: AcquisitionExecution<'_>,
+) -> Result<ProbedPair, CandidateFailure> {
+    if execution.cancellation.is_cancelled() {
+        return Err(CandidateFailure::Cancelled);
+    }
     let opened = open_pair_lease(root.to_path_buf(), OpenMode::Full).await?;
+    if execution.cancellation.is_cancelled() {
+        return Err(CandidateFailure::Cancelled);
+    }
     probe_opened_pair(
         opened,
         required_version,
         ffmpeg_jellyfin_matcher,
         ffprobe_jellyfin_matcher,
         supervisor,
+        execution,
     )
     .await
 }
@@ -877,7 +910,37 @@ async fn probe_authenticated_pair(
     ffprobe_jellyfin_matcher: &str,
     supervisor: &ProcessSupervisor,
 ) -> Result<ProbedPair, CandidateFailure> {
+    probe_authenticated_pair_with_context(
+        root,
+        expected_install_digest,
+        required_version,
+        ffmpeg_jellyfin_matcher,
+        ffprobe_jellyfin_matcher,
+        supervisor,
+        AcquisitionExecution {
+            cancellation: &tokio_util::sync::CancellationToken::new(),
+            observer: &AcquisitionObserver::default(),
+        },
+    )
+    .await
+}
+
+async fn probe_authenticated_pair_with_context(
+    root: &Path,
+    expected_install_digest: &str,
+    required_version: &str,
+    ffmpeg_jellyfin_matcher: &str,
+    ffprobe_jellyfin_matcher: &str,
+    supervisor: &ProcessSupervisor,
+    execution: AcquisitionExecution<'_>,
+) -> Result<ProbedPair, CandidateFailure> {
+    if execution.cancellation.is_cancelled() {
+        return Err(CandidateFailure::Cancelled);
+    }
     let opened = open_pair_lease(root.to_path_buf(), OpenMode::Full).await?;
+    if execution.cancellation.is_cancelled() {
+        return Err(CandidateFailure::Cancelled);
+    }
     if pair_install_digest(&opened.lease.ffmpeg.seal, &opened.lease.ffprobe.seal)
         != expected_install_digest
     {
@@ -889,6 +952,7 @@ async fn probe_authenticated_pair(
         ffmpeg_jellyfin_matcher,
         ffprobe_jellyfin_matcher,
         supervisor,
+        execution,
     )
     .await
 }
@@ -899,6 +963,7 @@ async fn probe_opened_pair(
     ffmpeg_jellyfin_matcher: &str,
     ffprobe_jellyfin_matcher: &str,
     supervisor: &ProcessSupervisor,
+    execution: AcquisitionExecution<'_>,
 ) -> Result<ProbedPair, CandidateFailure> {
     let OpenedPair {
         root,
@@ -915,8 +980,14 @@ async fn probe_opened_pair(
         &root,
         "-version",
         supervisor,
+        execution.cancellation,
     )
     .await?;
+    execution
+        .observer
+        .checkpoint(AcquisitionStage::InProbe, execution.cancellation)
+        .await
+        .map_err(|_| CandidateFailure::Cancelled)?;
     let ffprobe_version = probe_identity_command(
         &lease.ffprobe.file,
         &ffprobe,
@@ -924,6 +995,7 @@ async fn probe_opened_pair(
         &root,
         "-version",
         supervisor,
+        execution.cancellation,
     )
     .await?;
     let ffmpeg_token = parse_version(&ffmpeg_version, "ffmpeg")?;
@@ -944,6 +1016,7 @@ async fn probe_opened_pair(
         &root,
         "-buildconf",
         supervisor,
+        execution.cancellation,
     )
     .await?;
     let ffprobe_build = probe_identity_command(
@@ -953,6 +1026,7 @@ async fn probe_opened_pair(
         &root,
         "-buildconf",
         supervisor,
+        execution.cancellation,
     )
     .await?;
     let ffmpeg_configuration = build_configuration(&ffmpeg_build)?;
@@ -983,25 +1057,30 @@ async fn probe_identity_command(
     root: &Path,
     argument: &str,
     supervisor: &ProcessSupervisor,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<u8>, CandidateFailure> {
     let executable = bound_execution_path(executable_file, executable)?;
     let root = bound_execution_path(root_file, root)?;
     let output = supervisor
-        .run_bounded(ProcessSpec {
-            executable,
-            args: vec![OsString::from(argument)],
-            environment: minimal_runtime_environment(&root),
-            current_dir: root,
-            stdin: StdinPolicy::Null,
-            stdout: StdoutPolicy::Capture {
-                byte_limit: IDENTITY_STDOUT_LIMIT,
+        .run_bounded_with_cancellation(
+            ProcessSpec {
+                executable,
+                args: vec![OsString::from(argument)],
+                environment: minimal_runtime_environment(&root),
+                current_dir: root,
+                stdin: StdinPolicy::Null,
+                stdout: StdoutPolicy::Capture {
+                    byte_limit: IDENTITY_STDOUT_LIMIT,
+                },
+                stderr_byte_limit: IDENTITY_STDERR_LIMIT,
+                wall_deadline: IDENTITY_COMMAND_DEADLINE,
             },
-            stderr_byte_limit: IDENTITY_STDERR_LIMIT,
-            wall_deadline: IDENTITY_COMMAND_DEADLINE,
-        })
+            cancellation,
+        )
         .await
         .map_err(|error| match error.code() {
             ProcessErrorCode::DeadlineExceeded => CandidateFailure::Deadline,
+            ProcessErrorCode::Cancelled => CandidateFailure::Cancelled,
             _ => CandidateFailure::Probe,
         })?;
     if !output.status.success() {
@@ -2890,7 +2969,12 @@ fn extract_managed_archive(
     output_root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
     decompressed_byte_bound: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
+    observer: &AcquisitionObserver,
 ) -> Result<(), RuntimeError> {
+    if cancellation.is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
     if output_root.exists() {
         return Err(RuntimeError::ExtractionFailed);
     }
@@ -2944,9 +3028,13 @@ fn extract_managed_archive(
 
     fs::create_dir(output_root).map_err(|_| RuntimeError::ExtractionFailed)?;
     let result = (|| {
+        observer.blocking_checkpoint(AcquisitionStage::InExtraction, cancellation)?;
         let mut copied = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         for index in 0..archive.len() {
+            if cancellation.is_cancelled() {
+                return Err(RuntimeError::Cancelled);
+            }
             let mut entry = archive
                 .by_index(index)
                 .map_err(|_| RuntimeError::ExtractionFailed)?;
@@ -2966,6 +3054,9 @@ fn extract_managed_archive(
                 .open(&destination)
                 .map_err(|_| RuntimeError::ExtractionFailed)?;
             loop {
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::Cancelled);
+                }
                 let read = entry
                     .read(&mut buffer)
                     .map_err(|_| RuntimeError::ExtractionFailed)?;
@@ -3031,7 +3122,7 @@ fn zip_central_directory_entry_count(file: &mut File) -> Result<usize, RuntimeEr
     Err(RuntimeError::UnsafeArchive)
 }
 
-const MANAGED_SELECTION_SCHEMA_VERSION: u32 = 1;
+const MANAGED_SELECTION_SCHEMA_VERSION: u32 = 2;
 const MANAGED_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MANAGED_RECEIPT_FILE: &str = ".install-receipt.json";
 
@@ -3039,10 +3130,12 @@ const MANAGED_RECEIPT_FILE: &str = ".install-receipt.json";
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ManagedSelection {
     schema_version: u32,
+    manifest_version: String,
+    manifest_archive_sha256: String,
     current_version: String,
+    current_archive_sha256: String,
+    current_install_digest: String,
     previous_version: Option<String>,
-    archive_sha256: String,
-    install_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3110,14 +3203,19 @@ async fn install_verified_archive(
     fail_before_switch: bool,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
+    recover_managed_install_artifacts(root, &staging_root)?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let observer = AcquisitionObserver::default();
     install_verified_archive_locked(
-        root,
-        &versions,
-        &staging_root,
+        (root, &versions, &staging_root),
         artifact,
         archive_path,
         supervisor,
         fail_before_switch,
+        AcquisitionExecution {
+            cancellation: &cancellation,
+            observer: &observer,
+        },
     )
     .await
 }
@@ -3182,21 +3280,21 @@ fn validate_existing_local_components(path: &Path) -> Result<(), RuntimeError> {
 }
 
 async fn install_verified_archive_locked(
-    root: &Path,
-    versions: &Path,
-    staging_root: &Path,
+    layout: (&Path, &Path, &Path),
     artifact: &super::runtime_manifest::RuntimeArtifact,
     archive_path: &Path,
     supervisor: &ProcessSupervisor,
     fail_before_switch: bool,
+    execution: AcquisitionExecution<'_>,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     install_verified_archive_locked_with_hook(
-        (root, versions, staging_root),
+        layout,
         artifact,
         archive_path,
         supervisor,
         fail_before_switch,
         || {},
+        execution,
     )
     .await
 }
@@ -3208,19 +3306,27 @@ async fn install_verified_archive_locked_with_hook<F>(
     supervisor: &ProcessSupervisor,
     fail_before_switch: bool,
     after_archive_verified: F,
+    execution: AcquisitionExecution<'_>,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError>
 where
     F: FnOnce() + Send + 'static,
 {
     let (root, versions, staging_root) = layout;
+    let cancellation = execution.cancellation;
+    let observer = execution.observer;
     let version = managed_version_token(artifact)?.to_owned();
-    recover_managed_install_artifacts(root, staging_root)?;
     let version_root = versions.join(&version);
     if !version_root.exists() {
         let staging = staging_root.join(format!("install-{version}-{}", uuid::Uuid::new_v4()));
+        let _staging_guard = OwnedStagingPathGuard {
+            staging_root: staging_root.to_path_buf(),
+            path: staging.clone(),
+        };
         let archive = archive_path.to_path_buf();
         let artifact_for_extract = artifact.clone();
         let staging_for_extract = staging.clone();
+        let cancellation_for_extract = cancellation.clone();
+        let observer_for_extract = observer.clone();
         let decompressed_bound = MAX_EXECUTABLE_BYTES
             .checked_mul(
                 u64::try_from(artifact_for_extract.required_paths().len())
@@ -3228,14 +3334,21 @@ where
             )
             .ok_or(RuntimeError::ArchiveTooLarge)?;
         let extraction = tokio::task::spawn_blocking(move || {
+            let _worker = observer_for_extract.blocking_worker();
             let mut archive = open_managed_archive(&archive)?;
-            verify_opened_archive_identity(&mut archive, &artifact_for_extract)?;
+            verify_opened_archive_identity(
+                &mut archive,
+                &artifact_for_extract,
+                &cancellation_for_extract,
+            )?;
             after_archive_verified();
             extract_managed_archive(
                 archive,
                 &staging_for_extract,
                 &artifact_for_extract,
                 decompressed_bound,
+                &cancellation_for_extract,
+                &observer_for_extract,
             )
         })
         .await
@@ -3244,16 +3357,20 @@ where
             let _ = remove_owned_staging_path(staging_root, &staging);
             return Err(error);
         }
+        observer
+            .checkpoint(AcquisitionStage::PostExtraction, cancellation)
+            .await?;
         if let Err(error) = apply_managed_root_permissions(&staging) {
             let _ = remove_owned_staging_path(staging_root, &staging);
             return Err(error);
         }
-        let pair = match probe_pair(
+        let pair = match probe_pair_with_context(
             &staging,
             artifact.ffmpeg_version(),
             artifact.version_matchers().ffmpeg(),
             artifact.version_matchers().ffprobe(),
             supervisor,
+            execution,
         )
         .await
         {
@@ -3276,11 +3393,18 @@ where
         }
         validate_existing_local_components(versions)?;
         validate_existing_local_components(&staging)?;
+        if cancellation.is_cancelled() {
+            let _ = remove_owned_staging_path(staging_root, &staging);
+            return Err(RuntimeError::Cancelled);
+        }
         if version_root.exists()
             || atomic_publish_version(&staging, &version_root, versions).is_err()
         {
             let _ = remove_owned_staging_path(staging_root, &staging);
             return Err(RuntimeError::InstallFailed);
+        }
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
         }
     } else {
         validate_existing_local_components(&version_root)?;
@@ -3296,6 +3420,7 @@ where
         artifact,
         supervisor,
         fail_before_switch,
+        execution,
     )
     .await
 }
@@ -3306,35 +3431,48 @@ async fn activate_managed_version_locked(
     artifact: &super::runtime_manifest::RuntimeArtifact,
     supervisor: &ProcessSupervisor,
     fail_before_switch: bool,
+    execution: AcquisitionExecution<'_>,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
+    let cancellation = execution.cancellation;
+    let observer = execution.observer;
     let version = managed_version_token(artifact)?.to_owned();
     validate_existing_local_components(version_root)?;
     let receipt = read_version_receipt(version_root)?;
     if !receipt.matches_artifact(artifact) {
         return Err(RuntimeError::InstallFailed);
     }
-    let pair = probe_authenticated_pair(
+    let pair = probe_authenticated_pair_with_context(
         version_root,
         &receipt.install_digest,
         artifact.ffmpeg_version(),
         artifact.version_matchers().ffmpeg(),
         artifact.version_matchers().ffprobe(),
         supervisor,
+        execution,
     )
     .await
     .map_err(candidate_failure_error)?;
+    if cancellation.is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
     if !pair.jellyfin {
         return Err(RuntimeError::IncompatiblePair);
     }
     let runtime =
         Arc::new(pair.into_runtime(RuntimeKind::Jellyfin, Some(artifact.jellyfin_revision())));
+    observer
+        .checkpoint(AcquisitionStage::PostProbe, cancellation)
+        .await?;
     if fail_before_switch {
         return Err(RuntimeError::ActivationFailed);
     }
 
     let prior = read_managed_selection(root)?;
+    if cancellation.is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
     let previous_version = if let Some(selection) = &prior {
-        if selection.current_version == version {
+        let previous = if selection.current_version == version {
             match &selection.previous_version {
                 Some(previous) => authenticate_managed_version_digest(root, previous, None, None)
                     .await
@@ -3345,22 +3483,31 @@ async fn activate_managed_version_locked(
             authenticate_managed_version_digest(
                 root,
                 &selection.current_version,
-                Some(&selection.archive_sha256),
-                Some(&selection.install_digest),
+                Some(&selection.current_archive_sha256),
+                Some(&selection.current_install_digest),
             )
             .await
             .map(|_| selection.current_version.clone())
+        };
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
         }
+        previous
     } else {
         None
     };
     let selection = ManagedSelection {
         schema_version: MANAGED_SELECTION_SCHEMA_VERSION,
+        manifest_version: version.clone(),
+        manifest_archive_sha256: artifact.sha256().to_owned(),
         current_version: version,
+        current_archive_sha256: artifact.sha256().to_owned(),
+        current_install_digest: runtime.id.install_digest.clone(),
         previous_version,
-        archive_sha256: artifact.sha256().to_owned(),
-        install_digest: runtime.id.install_digest.clone(),
     };
+    if cancellation.is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
     write_managed_selection_atomically(root, &selection)?;
     cleanup_managed_versions(root, &selection);
     Ok(runtime)
@@ -3384,17 +3531,19 @@ async fn commit_managed_rollback(
     let failed_current = authenticate_managed_version_digest(
         root,
         &expected.current_version,
-        Some(&expected.archive_sha256),
-        Some(&expected.install_digest),
+        Some(&expected.current_archive_sha256),
+        Some(&expected.current_install_digest),
     )
     .await
     .map(|_| expected.current_version.clone());
     let selection = ManagedSelection {
         schema_version: MANAGED_SELECTION_SCHEMA_VERSION,
+        manifest_version: expected.manifest_version.clone(),
+        manifest_archive_sha256: expected.manifest_archive_sha256.clone(),
         current_version: receipt.version.clone(),
+        current_archive_sha256: receipt.archive_sha256.clone(),
+        current_install_digest: receipt.install_digest.clone(),
         previous_version: failed_current,
-        archive_sha256: receipt.archive_sha256.clone(),
-        install_digest: receipt.install_digest.clone(),
     };
     write_managed_selection_atomically(root, &selection)?;
     cleanup_managed_versions(root, &selection);
@@ -3476,24 +3625,31 @@ pub(crate) async fn ensure_managed_runtime(
     supervisor: &ProcessSupervisor,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     let host = current_runtime_host().ok_or(RuntimeError::ManagedRuntimeUnsupported)?;
+    let download_artifact = artifact.clone();
+    let download_cancellation = supervisor.cancellation_token();
     run_managed_acquisition_for_host(host, || {
-        ensure_managed_runtime_with_fetch(root, artifact, supervisor, |archive_path| async move {
-            let client = build_managed_download_client()?;
-            download_archive(
-                &client,
-                artifact.url().clone(),
-                &archive_path,
-                artifact.sha256(),
-                artifact.max_bytes(),
-                DownloadPolicy {
-                    validate_url: validate_managed_download_url,
-                    idle_deadline: MANAGED_DOWNLOAD_IDLE_DEADLINE,
-                    overall_deadline: MANAGED_DOWNLOAD_OVERALL_DEADLINE,
-                    cancellation: supervisor.cancellation_token(),
-                },
-            )
-            .await
-        })
+        ensure_managed_runtime_with_fetch(
+            root,
+            artifact,
+            supervisor,
+            move |archive_path| async move {
+                let client = build_managed_download_client()?;
+                download_archive(
+                    &client,
+                    download_artifact.url().clone(),
+                    &archive_path,
+                    download_artifact.sha256(),
+                    download_artifact.max_bytes(),
+                    DownloadPolicy {
+                        validate_url: validate_managed_download_url,
+                        idle_deadline: MANAGED_DOWNLOAD_IDLE_DEADLINE,
+                        overall_deadline: MANAGED_DOWNLOAD_OVERALL_DEADLINE,
+                        cancellation: download_cancellation,
+                    },
+                )
+                .await
+            },
+        )
     })
     .await
 }
@@ -3506,10 +3662,88 @@ async fn ensure_managed_runtime_with_fetch<F, Fut>(
     fetch: F,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError>
 where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send + 'static,
+{
+    ensure_managed_runtime_with_fetch_and_observer(
+        root,
+        artifact,
+        supervisor,
+        fetch,
+        AcquisitionObserver::default(),
+    )
+    .await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+async fn ensure_managed_runtime_with_fetch_and_observer<F, Fut>(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    fetch: F,
+    observer: AcquisitionObserver,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError>
+where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send + 'static,
+{
+    let caller_cancellation = tokio_util::sync::CancellationToken::new();
+    let mut caller_guard = AcquisitionCallerGuard {
+        cancellation: caller_cancellation.clone(),
+        armed: true,
+    };
+    let root = root.to_path_buf();
+    let artifact = artifact.clone();
+    let supervisor = supervisor.clone();
+    let owner = tokio::spawn(async move {
+        ensure_managed_runtime_owner(
+            &root,
+            &artifact,
+            &supervisor,
+            fetch,
+            &caller_cancellation,
+            &observer,
+        )
+        .await
+    });
+    let result = owner.await.map_err(|_| RuntimeError::InstallFailed)?;
+    caller_guard.armed = false;
+    result
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+async fn ensure_managed_runtime_owner<F, Fut>(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    fetch: F,
+    caller_cancellation: &tokio_util::sync::CancellationToken,
+    observer: &AcquisitionObserver,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError>
+where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<(), RuntimeError>>,
 {
     let version = managed_version_token(artifact)?.to_owned();
+    let _owner_guard = observer.owner();
+    let operation_cancellation = tokio_util::sync::CancellationToken::new();
+    let caller_signal = caller_cancellation.clone();
+    let supervisor_signal = supervisor.cancellation_token();
+    if caller_signal.is_cancelled() || supervisor_signal.is_cancelled() {
+        operation_cancellation.cancel();
+    }
+    let linked_cancellation = operation_cancellation.clone();
+    let cancellation_forwarder = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = caller_signal.cancelled() => {},
+            _ = supervisor_signal.cancelled() => {},
+        }
+        linked_cancellation.cancel();
+    });
+    let _cancellation_forwarder_guard = AcquisitionCancellationForwarder {
+        task: cancellation_forwarder,
+    };
     let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
     recover_managed_install_artifacts(root, &staging_root)?;
     let version_root = versions.join(&version);
@@ -3521,6 +3755,10 @@ where
                 artifact,
                 supervisor,
                 false,
+                AcquisitionExecution {
+                    cancellation: &operation_cancellation,
+                    observer,
+                },
             )
             .await;
         }
@@ -3528,7 +3766,7 @@ where
         _ => return Err(RuntimeError::UnsafePath),
     }
 
-    if supervisor.cancellation_token().is_cancelled() {
+    if operation_cancellation.is_cancelled() {
         return Err(RuntimeError::Cancelled);
     }
 
@@ -3537,23 +3775,205 @@ where
         staging_root: staging_root.clone(),
         path: archive_path.clone(),
     };
-    let download = fetch(archive_path.clone()).await;
+    let download = tokio::select! {
+        biased;
+        _ = operation_cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        result = fetch(archive_path.clone()) => result,
+    };
     if let Err(error) = download {
         let _ = remove_owned_staging_path(&staging_root, &archive_path);
         return Err(error);
     }
+    observer
+        .checkpoint(AcquisitionStage::PostDownload, &operation_cancellation)
+        .await?;
     let result = install_verified_archive_locked(
-        root,
-        &versions,
-        &staging_root,
+        (root, &versions, &staging_root),
         artifact,
         &archive_path,
         supervisor,
         false,
+        AcquisitionExecution {
+            cancellation: &operation_cancellation,
+            observer,
+        },
     )
     .await;
     let _ = remove_owned_staging_path(&staging_root, &archive_path);
     result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcquisitionStage {
+    PostDownload,
+    InExtraction,
+    PostExtraction,
+    InProbe,
+    PostProbe,
+}
+
+#[derive(Clone, Copy)]
+struct AcquisitionExecution<'a> {
+    cancellation: &'a tokio_util::sync::CancellationToken,
+    observer: &'a AcquisitionObserver,
+}
+
+#[derive(Clone, Default)]
+struct AcquisitionObserver {
+    #[cfg(test)]
+    test: Option<Arc<AcquisitionTestObserver>>,
+}
+
+impl AcquisitionObserver {
+    fn owner(&self) -> AcquisitionOwnerGuard {
+        AcquisitionOwnerGuard {
+            #[cfg(test)]
+            observer: self.clone(),
+        }
+    }
+
+    async fn checkpoint(
+        &self,
+        _stage: AcquisitionStage,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        if let Some(test) = &self.test
+            && test.target == _stage
+        {
+            test.reached.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+            cancellation.cancelled().await;
+        }
+        if cancellation.is_cancelled() {
+            Err(RuntimeError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn blocking_checkpoint(
+        &self,
+        _stage: AcquisitionStage,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        if let Some(test) = &self.test
+            && test.target == _stage
+        {
+            test.reached.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if cancellation.is_cancelled() {
+            Err(RuntimeError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn blocking_worker(&self) -> AcquisitionBlockingWorkerGuard {
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.active_blocking_workers.fetch_add(1, Ordering::AcqRel);
+        }
+        AcquisitionBlockingWorkerGuard {
+            #[cfg(test)]
+            test: self.test.clone(),
+        }
+    }
+}
+
+struct AcquisitionOwnerGuard {
+    #[cfg(test)]
+    observer: AcquisitionObserver,
+}
+
+impl Drop for AcquisitionOwnerGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(test) = &self.observer.test {
+            test.owner_finished.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+        }
+    }
+}
+
+struct AcquisitionBlockingWorkerGuard {
+    #[cfg(test)]
+    test: Option<Arc<AcquisitionTestObserver>>,
+}
+
+impl Drop for AcquisitionBlockingWorkerGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.active_blocking_workers.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[cfg(test)]
+struct AcquisitionTestObserver {
+    target: AcquisitionStage,
+    reached: AtomicBool,
+    notification: tokio::sync::Notify,
+    active_blocking_workers: AtomicUsize,
+    owner_finished: AtomicBool,
+}
+
+#[cfg(test)]
+impl AcquisitionTestObserver {
+    fn new(target: AcquisitionStage) -> Self {
+        Self {
+            target,
+            reached: AtomicBool::new(false),
+            notification: tokio::sync::Notify::new(),
+            active_blocking_workers: AtomicUsize::new(0),
+            owner_finished: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        while !self.reached.load(Ordering::Acquire) {
+            self.notification.notified().await;
+        }
+    }
+
+    fn active_blocking_workers(&self) -> usize {
+        self.active_blocking_workers.load(Ordering::Acquire)
+    }
+
+    async fn wait_until_owner_finished(&self) {
+        while !self.owner_finished.load(Ordering::Acquire) {
+            self.notification.notified().await;
+        }
+    }
+}
+
+struct AcquisitionCallerGuard {
+    cancellation: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+struct AcquisitionCancellationForwarder {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AcquisitionCancellationForwarder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for AcquisitionCallerGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
 }
 
 struct OwnedStagingPathGuard {
@@ -3631,6 +4051,7 @@ fn open_managed_archive(archive_path: &Path) -> Result<File, RuntimeError> {
 fn verify_opened_archive_identity(
     file: &mut File,
     artifact: &super::runtime_manifest::RuntimeArtifact,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), RuntimeError> {
     let metadata = file.metadata().map_err(|_| RuntimeError::InstallFailed)?;
     if !metadata.is_file() || metadata.len() != artifact.max_bytes() {
@@ -3640,6 +4061,9 @@ fn verify_opened_archive_identity(
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|_| RuntimeError::InstallFailed)?;
@@ -3839,8 +4263,10 @@ fn read_managed_selection(root: &Path) -> Result<Option<ManagedSelection>, Runti
             .previous_version
             .as_deref()
             .is_some_and(|version| !is_managed_version_token(version))
-        || !is_lowercase_sha256(&selection.archive_sha256)
-        || !is_lowercase_sha256(&selection.install_digest)
+        || !is_managed_version_token(&selection.manifest_version)
+        || !is_lowercase_sha256(&selection.manifest_archive_sha256)
+        || !is_lowercase_sha256(&selection.current_archive_sha256)
+        || !is_lowercase_sha256(&selection.current_install_digest)
     {
         return Err(RuntimeError::ActivationFailed);
     }
@@ -4065,6 +4491,9 @@ where
     F: FnOnce() + Send + 'static,
 {
     let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
+    recover_managed_install_artifacts(root, &staging_root)?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let observer = AcquisitionObserver::default();
     install_verified_archive_locked_with_hook(
         (root, &versions, &staging_root),
         artifact,
@@ -4072,6 +4501,10 @@ where
         supervisor,
         false,
         after_archive_verified,
+        AcquisitionExecution {
+            cancellation: &cancellation,
+            observer: &observer,
+        },
     )
     .await
 }
@@ -4084,10 +4517,34 @@ async fn ensure_managed_runtime_with_fetch_for_test<F, Fut>(
     fetch: F,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError>
 where
-    F: FnOnce(PathBuf) -> Fut,
-    Fut: std::future::Future<Output = Result<(), RuntimeError>>,
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send + 'static,
 {
     ensure_managed_runtime_with_fetch(root, artifact, supervisor, fetch).await
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+async fn ensure_managed_runtime_with_fetch_and_observer_for_test<F, Fut>(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    fetch: F,
+    observer: Arc<AcquisitionTestObserver>,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError>
+where
+    F: FnOnce(PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send + 'static,
+{
+    ensure_managed_runtime_with_fetch_and_observer(
+        root,
+        artifact,
+        supervisor,
+        fetch,
+        AcquisitionObserver {
+            test: Some(observer),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4144,7 +4601,14 @@ fn extract_managed_archive_for_test(
     decompressed_byte_bound: u64,
 ) -> Result<(), RuntimeError> {
     let archive = open_managed_archive(archive_path)?;
-    extract_managed_archive(archive, output_root, artifact, decompressed_byte_bound)
+    extract_managed_archive(
+        archive,
+        output_root,
+        artifact,
+        decompressed_byte_bound,
+        &tokio_util::sync::CancellationToken::new(),
+        &AcquisitionObserver::default(),
+    )
 }
 
 #[cfg(test)]
@@ -4487,13 +4951,23 @@ fn main() {{
             "switchable-jellyfin{}",
             std::env::consts::EXE_SUFFIX
         ));
+        let failure_attempt = format!(
+            "{:?}",
+            failure_switch
+                .with_extension("attempted")
+                .as_os_str()
+                .to_string_lossy()
+        );
         let failure_switch = format!("{:?}", failure_switch.as_os_str().to_string_lossy());
         fs::write(
             &source,
             format!(
                 r#"
 fn main() {{
-    if std::path::Path::new({failure_switch}).exists() {{ std::process::exit(91); }}
+    if std::path::Path::new({failure_switch}).exists() {{
+        std::fs::write({failure_attempt}, b"attempted").unwrap();
+        std::process::exit(91);
+    }}
     let role = if std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().to_ascii_lowercase().contains("ffprobe") {{ "ffprobe" }} else {{ "ffmpeg" }};
     match std::env::args().nth(1).as_deref() {{
         Some("-version") => println!("{{role}} version {version}-Jellyfin"),
@@ -4514,6 +4988,40 @@ fn main() {{
             .expect("compile switchable Jellyfin executable");
         assert!(status.success(), "switchable compilation failed");
         fs::read(executable).expect("read switchable Jellyfin executable")
+    }
+
+    fn fake_jellyfin_executable_stalling_with_marker(
+        directory: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> Vec<u8> {
+        let source = directory.join("stalling_jellyfin.rs");
+        let executable =
+            directory.join(format!("stalling-jellyfin{}", std::env::consts::EXE_SUFFIX));
+        let marker = format!("{:?}", marker.as_os_str().to_string_lossy());
+        fs::write(
+            &source,
+            format!(
+                r#"
+fn main() {{
+    if std::env::args().nth(1).as_deref() == Some("-version") {{
+        std::fs::write({marker}, b"spawned").unwrap();
+        loop {{ std::thread::sleep(std::time::Duration::from_secs(1)); }}
+    }}
+    std::process::exit(82);
+}}
+"#
+            ),
+        )
+        .expect("write stalling Jellyfin source");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-O"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("compile stalling Jellyfin executable");
+        assert!(status.success(), "stalling compilation failed");
+        fs::read(executable).expect("read stalling Jellyfin executable")
     }
 
     fn runtime_archive_and_artifact(
@@ -5162,7 +5670,7 @@ fn main() {{
         assert_eq!(resolved.id(), new_runtime.id());
 
         let mut tampered = current;
-        tampered["installDigest"] = serde_json::Value::String("00".repeat(32));
+        tampered["currentInstallDigest"] = serde_json::Value::String("00".repeat(32));
         fs::write(
             root.join("current.json"),
             serde_json::to_vec(&tampered).expect("serialize tampered selection"),
@@ -5438,8 +5946,304 @@ fn main() {{
         }
         assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 1);
         drop(acquisition);
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fs::read_dir(root.join("staging")).unwrap().count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached durable owner completes archive cleanup");
 
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_caller_cannot_release_install_lock_before_owner_cleanup() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        struct SlowFetchDrop;
+        impl Drop for SlowFetchDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("durable acquisition owner fixture");
+        let root = directory.path().join("runtimes");
+        let (archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_archive = archive.clone();
+        let mut first = Box::pin(super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &artifact,
+            &supervisor,
+            move |archive_path| async move {
+                fs::copy(first_archive, archive_path).expect("copy first archive fixture");
+                let _slow_cleanup = SlowFetchDrop;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+                unreachable!("pending first fetch resumed")
+            },
+        ));
+        tokio::select! {
+            result = &mut first => panic!("first acquisition completed early: {result:?}"),
+            result = started_rx => result.expect("first fetch start signal"),
+        }
+
+        let dropped_at = std::time::Instant::now();
+        drop(first);
+        assert!(
+            dropped_at.elapsed() < Duration::from_millis(100),
+            "caller drop synchronously owned durable cleanup"
+        );
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let mut second = Box::pin(super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &artifact,
+            &supervisor,
+            move |_| async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(super::RuntimeError::DownloadFailed)
+            },
+        ));
+        tokio::select! {
+            result = &mut second => panic!("second installer entered before owner cleanup: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(75)) => {}
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut second)
+            .await
+            .expect("second installer eventually enters")
+            .expect_err("second fetch fixture fails");
+        assert_eq!(error, super::RuntimeError::DownloadFailed);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!root.join("current.json").exists());
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_at_install_checkpoints_never_switches_selection() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        for stage in [
+            super::AcquisitionStage::PostDownload,
+            super::AcquisitionStage::InExtraction,
+            super::AcquisitionStage::PostExtraction,
+            super::AcquisitionStage::InProbe,
+            super::AcquisitionStage::PostProbe,
+        ] {
+            let directory = tempfile::tempdir().expect("checkpoint cancellation fixture");
+            let root = directory.path().join("runtimes");
+            let (old_archive, old_artifact) =
+                runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+            let (active_archive, active_artifact) =
+                runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+            let supervisor = ProcessSupervisor::new(CancellationToken::new());
+            drop(
+                super::install_archive_for_test(
+                    &root,
+                    &old_artifact,
+                    &old_archive,
+                    &supervisor,
+                    false,
+                )
+                .await
+                .expect("seed prior selection"),
+            );
+            let selection_before =
+                fs::read(root.join("current.json")).expect("read prior selection");
+            let observer = Arc::new(super::AcquisitionTestObserver::new(stage));
+            let copied_archive = active_archive.clone();
+            let mut acquisition = Box::pin(
+                super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                    &root,
+                    &active_artifact,
+                    &supervisor,
+                    move |archive_path| async move {
+                        fs::copy(copied_archive, archive_path).expect("copy active archive");
+                        Ok(())
+                    },
+                    Arc::clone(&observer),
+                ),
+            );
+            tokio::select! {
+                result = &mut acquisition => panic!("acquisition passed checkpoint {stage:?}: {result:?}"),
+                _ = observer.wait_until_reached() => {}
+            }
+            drop(acquisition);
+
+            tokio::time::timeout(Duration::from_secs(3), observer.wait_until_owner_finished())
+                .await
+                .expect("durable owner finishes cancellation cleanup");
+            assert_eq!(
+                fs::read(root.join("current.json")).expect("read unchanged selection"),
+                selection_before,
+                "cancelled owner changed selection at {stage:?}"
+            );
+            assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+            assert_eq!(observer.active_blocking_workers(), 0);
+            assert_eq!(supervisor.active_processes(), 0);
+
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::ensure_managed_runtime_with_fetch_for_test(
+                    &root,
+                    &active_artifact,
+                    &supervisor,
+                    move |_| async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Err(super::RuntimeError::DownloadFailed)
+                    },
+                ),
+            )
+            .await
+            .expect("durable owner releases lock after cancellation");
+            if stage == super::AcquisitionStage::PostProbe {
+                let runtime = result.expect("activate published receipt-backed version");
+                assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("3"));
+                assert_eq!(requests.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(result.unwrap_err(), super::RuntimeError::DownloadFailed);
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+            assert_eq!(supervisor.active_processes(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_caller_cancels_and_reaps_an_in_probe_child_before_unlock() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("in-probe cancellation fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+        let marker = directory.path().join("probe-started");
+        let stalled = fake_jellyfin_executable_stalling_with_marker(directory.path(), &marker);
+        let (active_archive, active_artifact) = runtime_archive_with_binary_and_claimed_identity(
+            directory.path(),
+            &stalled,
+            "7.1.4",
+            "3",
+        );
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("seed prior selection"),
+        );
+        let selection_before = fs::read(root.join("current.json")).expect("read prior selection");
+        let copied_archive = active_archive.clone();
+        let mut acquisition = Box::pin(super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &active_artifact,
+            &supervisor,
+            move |archive_path| async move {
+                fs::copy(copied_archive, archive_path).expect("copy stalled archive");
+                Ok(())
+            },
+        ));
+        tokio::select! {
+            result = &mut acquisition => panic!("stalled acquisition completed: {result:?}"),
+            _ = async {
+                while !marker.exists() { tokio::task::yield_now().await; }
+            } => {}
+        }
+        assert_eq!(supervisor.active_processes(), 1);
+        drop(acquisition);
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let error = tokio::time::timeout(
+            Duration::from_secs(4),
+            super::ensure_managed_runtime_with_fetch_for_test(
+                &root,
+                &active_artifact,
+                &supervisor,
+                move |_| async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+            ),
+        )
+        .await
+        .expect("probe cancellation fully reaps before unlock")
+        .expect_err("follow-up fetch fixture fails");
+        assert_eq!(error, super::RuntimeError::DownloadFailed);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.active_processes(), 0);
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(root.join("current.json")).expect("read unchanged selection"),
+            selection_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_cancellation_during_identity_probe_stays_typed_and_reaps_child() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("typed in-probe cancellation fixture");
+        let root = directory.path().join("runtimes");
+        let marker = directory.path().join("probe-started");
+        let stalled = fake_jellyfin_executable_stalling_with_marker(directory.path(), &marker);
+        let (archive, artifact) = runtime_archive_with_binary_and_claimed_identity(
+            directory.path(),
+            &stalled,
+            "7.1.4",
+            "3",
+        );
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let selection_before = root.join("current.json");
+        let copied_archive = archive.clone();
+        let mut acquisition = Box::pin(super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &artifact,
+            &supervisor,
+            move |archive_path| async move {
+                fs::copy(copied_archive, archive_path).expect("copy stalled archive");
+                Ok(())
+            },
+        ));
+        tokio::select! {
+            result = &mut acquisition => panic!("stalled acquisition completed: {result:?}"),
+            _ = async {
+                while !marker.exists() { tokio::task::yield_now().await; }
+            } => {}
+        }
+        assert_eq!(supervisor.active_processes(), 1);
+        supervisor.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(4), &mut acquisition)
+            .await
+            .expect("supervisor cancellation reaps identity child")
+            .expect_err("cancelled acquisition must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        assert_eq!(supervisor.active_processes(), 0);
+        assert!(!selection_before.exists());
         assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
     }
 
@@ -5577,6 +6381,97 @@ fn main() {{
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_selection_survives_restart_under_the_same_active_manifest() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("restart-stable rollback fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+        let failure_switch = directory.path().join("fail-restart-current");
+        let failure_attempt = failure_switch.with_extension("attempted");
+        let executable = fake_jellyfin_executable_with_failure_switch(
+            directory.path(),
+            "7.1.4",
+            &failure_switch,
+        );
+        let (active_archive, active_artifact) = runtime_archive_with_binary_and_claimed_identity(
+            directory.path(),
+            &executable,
+            "7.1.4",
+            "3",
+        );
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("install rollback runtime"),
+        );
+        drop(
+            super::install_archive_for_test(
+                &root,
+                &active_artifact,
+                &active_archive,
+                &supervisor,
+                false,
+            )
+            .await
+            .expect("install active runtime"),
+        );
+        fs::write(&failure_switch, b"fail").expect("make active identity unhealthy");
+        drop(
+            super::resolve_managed_runtime_for_artifact_for_test(
+                &root,
+                &active_artifact,
+                &supervisor,
+            )
+            .await
+            .expect("perform initial rollback"),
+        );
+        fs::remove_file(&failure_attempt).expect("clear initial unhealthy probe marker");
+        let selection_before =
+            fs::read(root.join("current.json")).expect("read rollback selection");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+
+        let restarted = match super::resolve_managed_runtime_for_artifact_for_test(
+            &root,
+            &active_artifact,
+            &supervisor,
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(super::RuntimeError::Unavailable) => {
+                super::ensure_managed_runtime_with_fetch_for_test(
+                    &root,
+                    &active_artifact,
+                    &supervisor,
+                    move |_| async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Err(super::RuntimeError::DownloadFailed)
+                    },
+                )
+                .await
+                .expect("restart must select the persisted rollback")
+            }
+            Err(error) => panic!("restart resolution failed: {error:?}"),
+        };
+
+        assert_eq!(restarted.id().jellyfin_revision.as_deref(), Some("1"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!failure_attempt.exists(), "unhealthy active child retried");
+        assert_eq!(
+            fs::read(root.join("current.json")).expect("read restarted selection"),
+            selection_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn changed_prior_current_is_not_retained_by_new_activation() {
         use crate::transcoding::process::ProcessSupervisor;
         use tokio_util::sync::CancellationToken;
@@ -5659,6 +6554,60 @@ fn main() {{
         )
         .expect("parse stale selection");
         assert_eq!(selection["currentVersion"], "v7.1.3-2");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn app_update_acquires_and_anchors_the_new_embedded_artifact() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("app update acquisition fixture");
+        let root = directory.path().join("runtimes");
+        let (stale_archive, stale_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "2");
+        let (active_archive, active_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(
+                &root,
+                &stale_artifact,
+                &stale_archive,
+                &supervisor,
+                false,
+            )
+            .await
+            .expect("install stale app artifact"),
+        );
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let archive = active_archive.clone();
+
+        let runtime = super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &active_artifact,
+            &supervisor,
+            move |destination| async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                fs::copy(archive, destination).expect("copy new embedded artifact");
+                Ok(())
+            },
+        )
+        .await
+        .expect("app update acquires newly pinned runtime");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("3"));
+        let selection: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("current.json")).expect("read updated selection"),
+        )
+        .expect("parse updated selection");
+        assert_eq!(selection["manifestVersion"], "v7.1.4-3");
+        assert_eq!(selection["currentVersion"], "v7.1.4-3");
+        assert_eq!(selection["manifestArchiveSha256"], active_artifact.sha256());
     }
 
     #[cfg(windows)]

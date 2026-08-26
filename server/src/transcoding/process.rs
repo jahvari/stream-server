@@ -887,28 +887,46 @@ impl ProcessSupervisor {
     }
 
     pub async fn run_bounded(&self, spec: ProcessSpec) -> Result<BoundedOutput, ProcessError> {
+        self.run_bounded_with_cancellation(spec, &CancellationToken::new())
+            .await
+    }
+
+    pub(super) async fn run_bounded_with_cancellation(
+        &self,
+        spec: ProcessSpec,
+        operation_cancellation: &CancellationToken,
+    ) -> Result<BoundedOutput, ProcessError> {
         validate_common_spec(&spec)?;
+        if operation_cancellation.is_cancelled() {
+            return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+        }
         if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
             self.cancel();
             return Err(ProcessError::new(ProcessErrorCode::Cancelled));
         }
         let permit = tokio::select! {
             biased;
+            _ = operation_cancellation.cancelled() => {
+                return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+            },
             _ = self.inner.cancellation.cancelled() => {
                 self.cancel();
                 return Err(ProcessError::new(ProcessErrorCode::Cancelled));
             },
             permit = self.inner.permits.clone().acquire_owned() => permit.map_err(|_| ProcessError::new(ProcessErrorCode::Cancelled))?,
         };
+        if operation_cancellation.is_cancelled() {
+            return Err(ProcessError::new(ProcessErrorCode::Cancelled));
+        }
         if self.inner.cancellation.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
             self.cancel();
             return Err(ProcessError::new(ProcessErrorCode::Cancelled));
         }
 
         #[cfg(windows)]
-        let result = self.run_windows(spec, permit).await;
+        let result = self.run_windows(spec, permit, operation_cancellation).await;
         #[cfg(unix)]
-        let result = self.run_unix(spec, permit).await;
+        let result = self.run_unix(spec, permit, operation_cancellation).await;
         #[cfg(not(any(windows, unix)))]
         let result = Err(ProcessError::new(ProcessErrorCode::SpawnFailed));
 
@@ -934,6 +952,7 @@ impl ProcessSupervisor {
         &self,
         spec: ProcessSpec,
         permit: OwnedSemaphorePermit,
+        operation_cancellation: &CancellationToken,
     ) -> Result<BoundedOutput, ProcessError> {
         use std::os::windows::process::ExitStatusExt;
         let wall_expires = tokio::time::Instant::now() + spec.wall_deadline;
@@ -949,13 +968,17 @@ impl ProcessSupervisor {
             }
         };
         let inner = self.inner.clone();
+        let operation_cancellation_for_spawn = operation_cancellation.clone();
         let owner_runtime = tokio::runtime::Handle::current();
         let (spec, spawned) = tokio::task::spawn_blocking(move || {
             let _gate = inner
                 .admission_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if inner.cancellation.is_cancelled() || !inner.accepting.load(Ordering::Acquire) {
+            if operation_cancellation_for_spawn.is_cancelled()
+                || inner.cancellation.is_cancelled()
+                || !inner.accepting.load(Ordering::Acquire)
+            {
                 return (spec, Err(ProcessError::new(ProcessErrorCode::Cancelled)));
             }
             let mut spawned = windows::spawn(&spec, inner.registry.clone(), failure_point);
@@ -1036,6 +1059,8 @@ impl ProcessSupervisor {
             Completion::Stop(code)
         } else {
             tokio::select! {
+                biased;
+                _ = operation_cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
                 wait = &mut wait_process => Completion::Exited(wait),
                 _ = self.inner.cancellation.cancelled() => Completion::Stop(ProcessErrorCode::Cancelled),
                 _ = &mut deadline => Completion::Stop(ProcessErrorCode::DeadlineExceeded),
@@ -1130,6 +1155,7 @@ impl ProcessSupervisor {
         &self,
         spec: ProcessSpec,
         permit: OwnedSemaphorePermit,
+        operation_cancellation: &CancellationToken,
     ) -> Result<BoundedOutput, ProcessError> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
@@ -1159,7 +1185,8 @@ impl ProcessSupervisor {
                 .admission_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.inner.cancellation.is_cancelled()
+            if operation_cancellation.is_cancelled()
+                || self.inner.cancellation.is_cancelled()
                 || !self.inner.accepting.load(Ordering::Acquire)
             {
                 return Err(ProcessError::new(ProcessErrorCode::Cancelled));
@@ -1206,12 +1233,14 @@ impl ProcessSupervisor {
         let setup_failed = stdout_setup_failed || stderr_setup_failed;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let cancellation = self.inner.cancellation.clone();
+        let operation_cancellation = operation_cancellation.clone();
         let owner_state = Arc::new(Mutex::new(Some((
             owner,
             stdout_reader,
             stderr_reader,
             limit_rx,
             cancellation,
+            operation_cancellation,
             wall_expires,
             setup_failed,
             result_tx,
@@ -1301,6 +1330,7 @@ type UnixOwnerArguments = (
     DurableUnixReader,
     std::sync::mpsc::Receiver<ProcessErrorCode>,
     CancellationToken,
+    CancellationToken,
     std::time::Instant,
     bool,
     tokio::sync::oneshot::Sender<Result<BoundedOutput, ProcessError>>,
@@ -1314,6 +1344,7 @@ fn own_unix_process(arguments: UnixOwnerArguments) {
         stderr_reader,
         limit_rx,
         cancellation,
+        operation_cancellation,
         wall_expires,
         setup_failed,
         result_tx,
@@ -1332,7 +1363,10 @@ fn own_unix_process(arguments: UnixOwnerArguments) {
             Ok(false) => {}
             Err(_) => break Completion::Stop(ProcessErrorCode::WaitFailed),
         }
-        if cancellation.is_cancelled() || result_tx.is_closed() {
+        if cancellation.is_cancelled()
+            || operation_cancellation.is_cancelled()
+            || result_tx.is_closed()
+        {
             break Completion::Stop(ProcessErrorCode::Cancelled);
         }
         if std::time::Instant::now() >= wall_expires {

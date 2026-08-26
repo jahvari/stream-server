@@ -143,3 +143,6 @@ eula = false
 [build-dependencies]
 winres = "0.1.12"
 chrono = "0.4.45"
+
+[dev-dependencies]
+toml = "1.1.4"
