@@ -529,6 +529,11 @@ fn authenticated_managed_candidates(
     let Some(selection) = read_managed_selection(root)? else {
         return Ok(None);
     };
+    if selection.current_version != artifact.source_tag()
+        || selection.archive_sha256 != artifact.sha256()
+    {
+        return Ok(Some(Vec::new()));
+    }
     let versions = root.join("versions");
     let mut candidates = Vec::new();
     let current_root = versions.join(&selection.current_version);
@@ -536,7 +541,6 @@ fn authenticated_managed_candidates(
         && let Ok(receipt) = read_version_receipt(&current_root)
         && receipt.matches_artifact(artifact)
         && receipt.install_digest == selection.install_digest
-        && selection.archive_sha256 == artifact.sha256()
     {
         candidates.push((
             current_root,
@@ -609,18 +613,6 @@ async fn resolve_runtime_inner(
                     .into_iter()
                     .map(|(path, provenance)| (path, CandidateSource::ManagedCurrent, provenance)),
             );
-        } else {
-            let legacy_current = root.join("current");
-            let unproven_root = if legacy_current.is_dir() {
-                legacy_current
-            } else {
-                root.clone()
-            };
-            candidates.push((
-                unproven_root,
-                CandidateSource::ManagedCurrent,
-                RuntimeProvenance::Unproven,
-            ));
         }
     }
     candidates.extend(config.system_roots.iter().cloned().map(|root| {
@@ -2689,7 +2681,11 @@ async fn download_archive(
 ) -> Result<(), RuntimeError> {
     let partial = destination.with_extension("download.part");
     let _ = remove_local_regular_file(&partial);
-    let result = tokio::time::timeout(policy.overall_deadline, async {
+    let mut partial_guard = PartialDownloadGuard {
+        path: partial.clone(),
+        armed: true,
+    };
+    let operation = tokio::time::timeout(policy.overall_deadline, async {
         let response =
             follow_validated_redirects(initial_url, policy.validate_url, |url| async move {
                 let response =
@@ -2764,13 +2760,32 @@ async fn download_archive(
         tokio::fs::rename(&partial, destination)
             .await
             .map_err(|_| RuntimeError::DownloadFailed)
-    })
-    .await
-    .map_err(|_| RuntimeError::DownloadDeadline)?;
+    });
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        _ = policy.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        completed = &mut operation => completed.map_err(|_| RuntimeError::DownloadDeadline)?,
+    };
     if result.is_err() {
         let _ = remove_local_regular_file(&partial);
+    } else {
+        partial_guard.armed = false;
     }
     result
+}
+
+struct PartialDownloadGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PartialDownloadGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_local_regular_file(&self.path);
+        }
+    }
 }
 
 fn remove_local_regular_file(path: &Path) -> Result<(), RuntimeError> {
@@ -2787,11 +2802,12 @@ fn remove_local_regular_file(path: &Path) -> Result<(), RuntimeError> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DownloadPolicy {
     validate_url: fn(&url::Url, usize) -> Result<(), RuntimeError>,
     idle_deadline: Duration,
     overall_deadline: Duration,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(test)]
@@ -2812,6 +2828,7 @@ async fn download_archive_for_test(
             validate_url: validate_loopback_download_url_for_test,
             idle_deadline: Duration::from_secs(1),
             overall_deadline: Duration::from_secs(3),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         },
     )
     .await
@@ -2837,6 +2854,32 @@ async fn download_archive_with_deadlines_for_test(
             validate_url: validate_loopback_download_url_for_test,
             idle_deadline,
             overall_deadline,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn download_archive_with_cancellation_for_test(
+    client: &reqwest::Client,
+    url: url::Url,
+    destination: &Path,
+    expected_sha256: &str,
+    exact_bytes: u64,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<(), RuntimeError> {
+    download_archive(
+        client,
+        url,
+        destination,
+        expected_sha256,
+        exact_bytes,
+        DownloadPolicy {
+            validate_url: validate_loopback_download_url_for_test,
+            idle_deadline: Duration::from_secs(5),
+            overall_deadline: Duration::from_secs(30),
+            cancellation,
         },
     )
     .await
@@ -3290,13 +3333,27 @@ async fn activate_managed_version_locked(
     }
 
     let prior = read_managed_selection(root)?;
-    let previous_version = prior.as_ref().and_then(|selection| {
+    let previous_version = if let Some(selection) = &prior {
         if selection.current_version == version {
-            selection.previous_version.clone()
+            match &selection.previous_version {
+                Some(previous) => authenticate_managed_version_digest(root, previous, None, None)
+                    .await
+                    .map(|_| previous.clone()),
+                None => None,
+            }
         } else {
-            Some(selection.current_version.clone())
+            authenticate_managed_version_digest(
+                root,
+                &selection.current_version,
+                Some(&selection.archive_sha256),
+                Some(&selection.install_digest),
+            )
+            .await
+            .map(|_| selection.current_version.clone())
         }
-    });
+    } else {
+        None
+    };
     let selection = ManagedSelection {
         schema_version: MANAGED_SELECTION_SCHEMA_VERSION,
         current_version: version,
@@ -3324,16 +3381,49 @@ async fn commit_managed_rollback(
     if current_receipt != *receipt {
         return Err(RuntimeError::ActivationFailed);
     }
+    let failed_current = authenticate_managed_version_digest(
+        root,
+        &expected.current_version,
+        Some(&expected.archive_sha256),
+        Some(&expected.install_digest),
+    )
+    .await
+    .map(|_| expected.current_version.clone());
     let selection = ManagedSelection {
         schema_version: MANAGED_SELECTION_SCHEMA_VERSION,
         current_version: receipt.version.clone(),
-        previous_version: Some(expected.current_version.clone()),
+        previous_version: failed_current,
         archive_sha256: receipt.archive_sha256.clone(),
         install_digest: receipt.install_digest.clone(),
     };
     write_managed_selection_atomically(root, &selection)?;
     cleanup_managed_versions(root, &selection);
     Ok(())
+}
+
+async fn authenticate_managed_version_digest(
+    root: &Path,
+    version: &str,
+    expected_archive_sha256: Option<&str>,
+    expected_install_digest: Option<&str>,
+) -> Option<ManagedVersionReceipt> {
+    if !is_managed_version_token(version) {
+        return None;
+    }
+    let version_root = root.join("versions").join(version);
+    validate_existing_local_components(&version_root).ok()?;
+    let receipt = read_version_receipt(&version_root).ok()?;
+    if receipt.version != version
+        || !receipt.is_self_consistent()
+        || expected_archive_sha256.is_some_and(|expected| receipt.archive_sha256 != expected)
+        || expected_install_digest.is_some_and(|expected| receipt.install_digest != expected)
+    {
+        return None;
+    }
+    let opened = open_pair_lease(version_root, OpenMode::Full).await.ok()?;
+    (pair_install_digest(&opened.lease.ffmpeg.seal, &opened.lease.ffprobe.seal)
+        == receipt.install_digest)
+        .then_some(receipt)
 }
 
 #[cfg(windows)]
@@ -3379,18 +3469,52 @@ fn atomic_publish_version(
         .map_err(|_| RuntimeError::InstallFailed)
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) async fn ensure_managed_runtime(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
     supervisor: &ProcessSupervisor,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
     let host = current_runtime_host().ok_or(RuntimeError::ManagedRuntimeUnsupported)?;
-    run_managed_acquisition_for_host(host, || async {
-        let version = managed_version_token(artifact)?.to_owned();
-        let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
-        recover_managed_install_artifacts(root, &staging_root)?;
-        let version_root = versions.join(&version);
-        if version_root.is_dir() {
+    run_managed_acquisition_for_host(host, || {
+        ensure_managed_runtime_with_fetch(root, artifact, supervisor, |archive_path| async move {
+            let client = build_managed_download_client()?;
+            download_archive(
+                &client,
+                artifact.url().clone(),
+                &archive_path,
+                artifact.sha256(),
+                artifact.max_bytes(),
+                DownloadPolicy {
+                    validate_url: validate_managed_download_url,
+                    idle_deadline: MANAGED_DOWNLOAD_IDLE_DEADLINE,
+                    overall_deadline: MANAGED_DOWNLOAD_OVERALL_DEADLINE,
+                    cancellation: supervisor.cancellation_token(),
+                },
+            )
+            .await
+        })
+    })
+    .await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+async fn ensure_managed_runtime_with_fetch<F, Fut>(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    fetch: F,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>>,
+{
+    let version = managed_version_token(artifact)?.to_owned();
+    let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
+    recover_managed_install_artifacts(root, &staging_root)?;
+    let version_root = versions.join(&version);
+    match fs::symlink_metadata(&version_root) {
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => {
             return activate_managed_version_locked(
                 root,
                 &version_root,
@@ -3400,41 +3524,47 @@ pub(crate) async fn ensure_managed_runtime(
             )
             .await;
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(RuntimeError::UnsafePath),
+    }
 
-        let archive_path =
-            staging_root.join(format!("archive-{version}-{}.zip", uuid::Uuid::new_v4()));
-        let client = build_managed_download_client()?;
-        let download = download_archive(
-            &client,
-            artifact.url().clone(),
-            &archive_path,
-            artifact.sha256(),
-            artifact.max_bytes(),
-            DownloadPolicy {
-                validate_url: validate_managed_download_url,
-                idle_deadline: MANAGED_DOWNLOAD_IDLE_DEADLINE,
-                overall_deadline: MANAGED_DOWNLOAD_OVERALL_DEADLINE,
-            },
-        )
-        .await;
-        if let Err(error) = download {
-            let _ = remove_owned_staging_path(&staging_root, &archive_path);
-            return Err(error);
-        }
-        let result = install_verified_archive_locked(
-            root,
-            &versions,
-            &staging_root,
-            artifact,
-            &archive_path,
-            supervisor,
-            false,
-        )
-        .await;
+    if supervisor.cancellation_token().is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
+
+    let archive_path = staging_root.join(format!("archive-{version}-{}.zip", uuid::Uuid::new_v4()));
+    let _archive_guard = OwnedStagingPathGuard {
+        staging_root: staging_root.clone(),
+        path: archive_path.clone(),
+    };
+    let download = fetch(archive_path.clone()).await;
+    if let Err(error) = download {
         let _ = remove_owned_staging_path(&staging_root, &archive_path);
-        result
-    })
-    .await
+        return Err(error);
+    }
+    let result = install_verified_archive_locked(
+        root,
+        &versions,
+        &staging_root,
+        artifact,
+        &archive_path,
+        supervisor,
+        false,
+    )
+    .await;
+    let _ = remove_owned_staging_path(&staging_root, &archive_path);
+    result
+}
+
+struct OwnedStagingPathGuard {
+    staging_root: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for OwnedStagingPathGuard {
+    fn drop(&mut self) {
+        let _ = remove_owned_staging_path(&self.staging_root, &self.path);
+    }
 }
 
 fn managed_version_token(
@@ -3539,8 +3669,11 @@ fn split_owned_version_uuid(value: &str) -> Option<(&str, &str)> {
     }
     let (version, uuid) = value.split_at(split);
     let uuid = uuid.strip_prefix('-')?;
-    (is_managed_version_token(version) && uuid::Uuid::parse_str(uuid).is_ok())
-        .then_some((version, uuid))
+    (is_managed_version_token(version) && is_canonical_uuid(uuid)).then_some((version, uuid))
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
 }
 
 fn is_owned_staging_name(name: &str, is_directory: bool) -> bool {
@@ -3561,7 +3694,7 @@ fn is_owned_staging_name(name: &str, is_directory: bool) -> bool {
 fn is_owned_selection_temporary(name: &str) -> bool {
     name.strip_prefix(".current-")
         .and_then(|value| value.strip_suffix(".tmp"))
-        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+        .is_some_and(is_canonical_uuid)
 }
 
 fn remove_owned_staging_path(staging_root: &Path, path: &Path) -> Result<(), RuntimeError> {
@@ -3941,6 +4074,20 @@ where
         after_archive_verified,
     )
     .await
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+async fn ensure_managed_runtime_with_fetch_for_test<F, Fut>(
+    root: &Path,
+    artifact: &super::runtime_manifest::RuntimeArtifact,
+    supervisor: &ProcessSupervisor,
+    fetch: F,
+) -> Result<Arc<FfmpegRuntime>, RuntimeError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>>,
+{
+    ensure_managed_runtime_with_fetch(root, artifact, supervisor, fetch).await
 }
 
 #[cfg(test)]
@@ -4330,6 +4477,45 @@ fn main() {{
         fs::read(executable).expect("read side-effect Jellyfin executable")
     }
 
+    fn fake_jellyfin_executable_with_failure_switch(
+        directory: &std::path::Path,
+        version: &str,
+        failure_switch: &std::path::Path,
+    ) -> Vec<u8> {
+        let source = directory.join("switchable_jellyfin.rs");
+        let executable = directory.join(format!(
+            "switchable-jellyfin{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let failure_switch = format!("{:?}", failure_switch.as_os_str().to_string_lossy());
+        fs::write(
+            &source,
+            format!(
+                r#"
+fn main() {{
+    if std::path::Path::new({failure_switch}).exists() {{ std::process::exit(91); }}
+    let role = if std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().to_ascii_lowercase().contains("ffprobe") {{ "ffprobe" }} else {{ "ffmpeg" }};
+    match std::env::args().nth(1).as_deref() {{
+        Some("-version") => println!("{{role}} version {version}-Jellyfin"),
+        Some("-buildconf") => println!("configuration: --enable-managed-fixture"),
+        _ => std::process::exit(82),
+    }}
+}}
+"#
+            ),
+        )
+        .expect("write switchable Jellyfin source");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-O"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("compile switchable Jellyfin executable");
+        assert!(status.success(), "switchable compilation failed");
+        fs::read(executable).expect("read switchable Jellyfin executable")
+    }
+
     fn runtime_archive_and_artifact(
         directory: &std::path::Path,
         version: &str,
@@ -4344,14 +4530,27 @@ fn main() {{
         claimed_version: &str,
         revision: &str,
     ) -> (PathBuf, super::super::runtime_manifest::RuntimeArtifact) {
+        runtime_archive_with_binary_and_claimed_identity(
+            directory,
+            &fake_jellyfin_executable(executable_version),
+            claimed_version,
+            revision,
+        )
+    }
+
+    fn runtime_archive_with_binary_and_claimed_identity(
+        directory: &std::path::Path,
+        executable: &[u8],
+        claimed_version: &str,
+        revision: &str,
+    ) -> (PathBuf, super::super::runtime_manifest::RuntimeArtifact) {
         let version = claimed_version;
         let archive = directory.join(format!("v{version}-{revision}.zip"));
-        let executable = fake_jellyfin_executable(executable_version);
         write_zip_fixture(
             &archive,
             &[
-                ("ffmpeg.exe", &executable, None),
-                ("ffprobe.exe", &executable, None),
+                ("ffmpeg.exe", executable, None),
+                ("ffprobe.exe", executable, None),
             ],
         );
         let archive_bytes = fs::read(&archive).expect("read runtime archive fixture");
@@ -4557,6 +4756,86 @@ fn main() {{
         ));
         server.abort();
         assert!(!overall_destination.exists());
+    }
+
+    #[tokio::test]
+    async fn mid_download_supervisor_cancellation_aborts_promptly_and_cleans_files() {
+        use tokio_util::sync::CancellationToken;
+
+        let payload = vec![b'x'; 64];
+        let digest = hex::encode(sha2::Sha256::digest(&payload));
+        let directory = tempfile::tempdir().expect("cancelled download directory");
+        let destination = directory.path().join("cancelled.zip");
+        let (url, server) = spawn_delayed_archive_fixture(
+            payload.clone(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let client = test_download_client();
+        let download = super::download_archive_with_cancellation_for_test(
+            &client,
+            url,
+            &destination,
+            &digest,
+            payload.len() as u64,
+            cancellation,
+        );
+        tokio::pin!(download);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cancelled.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut download)
+            .await
+            .expect("cancellation must not wait for the overall deadline")
+            .expect_err("cancelled download must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        server.abort();
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("download.part").exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_download_future_cannot_leave_a_partial_file() {
+        use tokio_util::sync::CancellationToken;
+
+        let payload = vec![b'x'; 64];
+        let digest = hex::encode(sha2::Sha256::digest(&payload));
+        let directory = tempfile::tempdir().expect("dropped download directory");
+        let destination = directory.path().join("dropped.zip");
+        let partial = destination.with_extension("download.part");
+        let (url, server) = spawn_delayed_archive_fixture(
+            payload.clone(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        let client = test_download_client();
+        let mut download = Box::pin(super::download_archive_with_cancellation_for_test(
+            &client,
+            url,
+            &destination,
+            &digest,
+            payload.len() as u64,
+            CancellationToken::new(),
+        ));
+        tokio::select! {
+            result = &mut download => panic!("download completed before drop: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+        assert!(
+            partial.exists(),
+            "fixture never reached partial-file creation"
+        );
+        drop(download);
+        tokio::task::yield_now().await;
+
+        server.abort();
+        assert!(!destination.exists());
+        assert!(!partial.exists());
     }
 
     #[tokio::test]
@@ -4779,8 +5058,15 @@ fn main() {{
         fs::create_dir(staging.join(operator[1])).expect("seed similarly prefixed directory");
         fs::write(staging.join(operator[2]), b"operator").expect("seed operator archive");
         fs::write(staging.join(operator[3]), b"operator").expect("seed operator notes");
+        let uppercase_uuid = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+        let uppercase_install = format!("install-v7.1.4-3-{uppercase_uuid}");
+        fs::create_dir(staging.join(&uppercase_install))
+            .expect("seed noncanonical uppercase operator directory");
         let current_temp = format!(".current-{uuid}.tmp");
         fs::write(root.join(&current_temp), b"selection").expect("seed selection temporary");
+        let uppercase_current = format!(".current-{uppercase_uuid}.tmp");
+        fs::write(root.join(&uppercase_current), b"operator")
+            .expect("seed noncanonical uppercase selection-like file");
         fs::write(root.join(".current-operator.tmp"), b"operator")
             .expect("seed operator selection-like file");
 
@@ -4794,6 +5080,8 @@ fn main() {{
         for name in operator {
             assert!(staging.join(name).exists(), "operator entry was removed");
         }
+        assert!(staging.join(uppercase_install).exists());
+        assert!(root.join(uppercase_current).exists());
         assert!(root.join(".current-operator.tmp").exists());
     }
 
@@ -4950,6 +5238,37 @@ fn main() {{
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_managed_root_without_selection_never_spawns() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("legacy managed fixture");
+        let managed = directory.path().join("runtimes/current");
+        fs::create_dir_all(&managed).expect("create legacy managed root");
+        let marker = directory.path().join("legacy-managed-spawned");
+        let executable =
+            fake_jellyfin_executable_with_side_effect(directory.path(), "7.1.4", &marker);
+        fs::write(managed.join("ffmpeg.exe"), &executable).expect("seed legacy ffmpeg");
+        fs::write(managed.join("ffprobe.exe"), &executable).expect("seed legacy ffprobe");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let config = super::RuntimeConfig {
+            explicit_root: None,
+            managed_current_root: Some(directory.path().join("runtimes")),
+            system_roots: Vec::new(),
+            search_path: None,
+        };
+
+        assert!(matches!(
+            super::resolve_runtime(&config, &supervisor).await,
+            Err(super::RuntimeError::Unavailable)
+        ));
+        assert!(!marker.exists(), "legacy managed executable was spawned");
+        assert_eq!(supervisor.active_processes(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn archive_path_swap_after_hash_neither_extracts_nor_executes_substituted_bytes() {
         use crate::transcoding::process::ProcessSupervisor;
         use tokio_util::sync::CancellationToken;
@@ -5024,6 +5343,108 @@ fn main() {{
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_directory_version_collision_fails_before_any_acquisition_request() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("version collision request fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        fs::create_dir_all(root.join("versions")).expect("create versions root");
+        fs::write(root.join("versions/v7.1.4-3"), b"operator collision")
+            .expect("seed regular-file collision");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+
+        assert!(
+            super::ensure_managed_runtime_with_fetch_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |_| async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn precancelled_supervisor_issues_zero_acquisition_requests() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("pre-cancel acquisition fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let supervisor = ProcessSupervisor::new(cancellation);
+
+        let error = super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &artifact,
+            &supervisor,
+            move |_| async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(super::RuntimeError::DownloadFailed)
+            },
+        )
+        .await
+        .expect_err("pre-cancelled acquisition must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_acquisition_after_archive_creation_cleans_the_owned_archive() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("dropped acquisition fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let mut acquisition = Box::pin(super::ensure_managed_runtime_with_fetch_for_test(
+            &root,
+            &artifact,
+            &supervisor,
+            move |archive_path| async move {
+                fs::write(&archive_path, b"owned archive").expect("create owned archive");
+                let _ = created_tx.send(());
+                std::future::pending::<()>().await;
+                unreachable!("pending fetch unexpectedly resumed")
+            },
+        ));
+
+        tokio::select! {
+            result = &mut acquisition => panic!("acquisition completed before drop: {result:?}"),
+            result = created_rx => result.expect("archive creation signal"),
+        }
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 1);
+        drop(acquisition);
+        tokio::task::yield_now().await;
+
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn colliding_version_child_reparse_is_rejected_before_pair_execution() {
         use crate::transcoding::process::ProcessSupervisor;
         use std::os::windows::fs::symlink_dir;
@@ -5093,7 +5514,151 @@ fn main() {{
         )
         .expect("parse rolled-back selection");
         assert_eq!(selection["currentVersion"], "v7.1.3-1");
+        assert!(selection["previousVersion"].is_null());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_but_unhealthy_current_is_retained_as_rollback_previous() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("authenticated unhealthy rollback fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+        let failure_switch = directory.path().join("fail-current-identity");
+        let executable = fake_jellyfin_executable_with_failure_switch(
+            directory.path(),
+            "7.1.4",
+            &failure_switch,
+        );
+        let (current_archive, current_artifact) = runtime_archive_with_binary_and_claimed_identity(
+            directory.path(),
+            &executable,
+            "7.1.4",
+            "3",
+        );
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("install rollback runtime"),
+        );
+        drop(
+            super::install_archive_for_test(
+                &root,
+                &current_artifact,
+                &current_archive,
+                &supervisor,
+                false,
+            )
+            .await
+            .expect("install switchable current runtime"),
+        );
+        fs::write(&failure_switch, b"fail").expect("make current identity temporarily unhealthy");
+
+        let runtime = super::resolve_managed_runtime_for_artifact_for_test(
+            &root,
+            &current_artifact,
+            &supervisor,
+        )
+        .await
+        .expect("rollback after authenticated current probe failure");
+        assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("1"));
+        let selection: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("current.json")).expect("read rollback selection"),
+        )
+        .expect("parse rollback selection");
+        assert_eq!(selection["currentVersion"], "v7.1.3-1");
         assert_eq!(selection["previousVersion"], "v7.1.4-3");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changed_prior_current_is_not_retained_by_new_activation() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("changed prior activation fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+        let (new_archive, new_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("install prior runtime"),
+        );
+        let changed = fake_jellyfin_executable("7.1.2");
+        fs::write(root.join("versions/v7.1.3-1/ffmpeg.exe"), &changed)
+            .expect("change prior ffmpeg");
+        fs::write(root.join("versions/v7.1.3-1/ffprobe.exe"), &changed)
+            .expect("change prior ffprobe");
+
+        drop(
+            super::install_archive_for_test(&root, &new_artifact, &new_archive, &supervisor, false)
+                .await
+                .expect("activate new runtime"),
+        );
+        let selection: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("current.json")).expect("read activation selection"),
+        )
+        .expect("parse activation selection");
+        assert!(selection["previousVersion"].is_null());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_manifest_selection_cannot_promote_its_previous_receipt() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("stale manifest rollback fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.2", "1");
+        let (stale_archive, stale_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "2");
+        let (_active_archive, active_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("install previous stale runtime"),
+        );
+        drop(
+            super::install_archive_for_test(
+                &root,
+                &stale_artifact,
+                &stale_archive,
+                &supervisor,
+                false,
+            )
+            .await
+            .expect("install stale current runtime"),
+        );
+
+        assert!(matches!(
+            super::resolve_managed_runtime_for_artifact_for_test(
+                &root,
+                &active_artifact,
+                &supervisor,
+            )
+            .await,
+            Err(super::RuntimeError::Unavailable)
+        ));
+        let selection: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("current.json")).expect("read stale selection"),
+        )
+        .expect("parse stale selection");
+        assert_eq!(selection["currentVersion"], "v7.1.3-2");
     }
 
     #[cfg(windows)]

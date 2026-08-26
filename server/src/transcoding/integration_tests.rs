@@ -15,6 +15,8 @@ use crate::transcoding::runtime::{
     RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService, resolve_runtime,
 };
 use crate::transcoding::runtime_manifest::RuntimeError;
+#[cfg(windows)]
+use sha2::Digest;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -182,6 +184,39 @@ fn jellyfin_root(base: &Path, name: &str) -> PathBuf {
     )
 }
 
+#[cfg(windows)]
+fn authenticated_managed_root(root: &Path) -> PathBuf {
+    let manifest = crate::transcoding::runtime_manifest::RuntimeManifest::embedded()
+        .expect("embedded runtime manifest");
+    let artifact = manifest
+        .artifact_for_host(crate::transcoding::runtime_manifest::RuntimeHost::WindowsX64)
+        .expect("embedded Windows runtime artifact");
+    let version_root = jellyfin_root(&root.join("versions"), artifact.source_tag());
+    let ffmpeg = fs::read(version_root.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)))
+        .expect("read managed ffmpeg fixture");
+    let ffprobe = fs::read(version_root.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX)))
+        .expect("read managed ffprobe fixture");
+    let mut pair_hasher = sha2::Sha256::new();
+    pair_hasher.update(b"ffmpeg\0");
+    pair_hasher.update(sha2::Sha256::digest(ffmpeg));
+    pair_hasher.update(b"ffprobe\0");
+    pair_hasher.update(sha2::Sha256::digest(ffprobe));
+    let install_digest = hex::encode(pair_hasher.finalize());
+    let receipt = super::ManagedVersionReceipt::from_artifact(artifact, install_digest.clone())
+        .expect("build managed receipt fixture");
+    super::write_version_receipt(&version_root, &receipt).expect("write managed receipt fixture");
+    let selection = super::ManagedSelection {
+        schema_version: super::MANAGED_SELECTION_SCHEMA_VERSION,
+        current_version: artifact.source_tag().to_owned(),
+        previous_version: None,
+        archive_sha256: artifact.sha256().to_owned(),
+        install_digest,
+    };
+    super::write_managed_selection_atomically(root, &selection)
+        .expect("write managed selection fixture");
+    version_root
+}
+
 fn isolated_config() -> RuntimeConfig {
     RuntimeConfig::isolated()
 }
@@ -213,6 +248,7 @@ async fn setup_ffmpeg_compatibility_adapter_returns_the_exact_explicit_pair_with
     assert_eq!(std::env::var_os("PATH"), original_path);
 }
 
+#[cfg(windows)]
 #[test]
 fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutdown()
 -> anyhow::Result<()> {
@@ -220,7 +256,8 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
     let config_parent = tempfile::tempdir()?;
     let cache_parent = tempfile::tempdir()?;
     let config_dir = config_parent.path().join("config");
-    let managed_root = jellyfin_root(&config_dir.join("runtimes"), "current");
+    let managed_root = config_dir.join("runtimes");
+    let _expected_version_root = authenticated_managed_root(&managed_root);
     let expected_managed_root = managed_root.clone();
 
     let handle = crate::start(crate::ServerConfig {
@@ -259,14 +296,16 @@ fn startup_publishes_one_shared_managed_pair_and_cancels_its_supervisor_on_shutd
         .build()?
         .block_on(async {
             let expected = resolve_runtime(
-                &isolated_config().with_explicit_root(expected_managed_root),
+                &isolated_config().with_managed_current_root(expected_managed_root),
                 &service.supervisor,
             )
             .await?;
             let actual = service.current().await.ok_or(RuntimeError::Unavailable)?;
             anyhow::ensure!(
                 actual.id() == expected.id(),
-                "startup selected wrong runtime pair"
+                "startup selected wrong runtime pair: actual={:?}, expected={:?}",
+                actual.id(),
+                expected.id()
             );
             Ok::<_, anyhow::Error>(())
         })?;
@@ -797,11 +836,13 @@ async fn windows_rejects_nul_invalid_or_duplicate_environment_and_oversized_bloc
     );
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_mutating_path() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let explicit = jellyfin_root(directory.path(), "explicit");
-    let managed = jellyfin_root(directory.path(), "managed");
+    let managed = directory.path().join("managed");
+    let expected_managed = authenticated_managed_root(&managed);
     let system = jellyfin_root(directory.path(), "system");
     let path = jellyfin_root(directory.path(), "path");
     let search_path = std::env::join_paths([path.clone()]).expect("fake search path");
@@ -815,25 +856,22 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
                 .with_managed_current_root(managed.clone())
                 .with_system_roots(vec![system.clone()])
                 .with_search_path(Some(search_path.clone())),
-            "explicit",
+            explicit,
         ),
         (
             isolated_config()
                 .with_managed_current_root(managed.clone())
                 .with_system_roots(vec![system.clone()])
                 .with_search_path(Some(search_path.clone())),
-            "managed",
+            expected_managed,
         ),
         (
             isolated_config()
-                .with_system_roots(vec![system])
+                .with_system_roots(vec![system.clone()])
                 .with_search_path(Some(search_path.clone())),
-            "system",
+            system,
         ),
-        (
-            isolated_config().with_search_path(Some(search_path)),
-            "path",
-        ),
+        (isolated_config().with_search_path(Some(search_path)), path),
     ];
 
     for (config, expected_root) in cases {
@@ -841,7 +879,7 @@ async fn resolution_prefers_explicit_then_managed_then_system_then_path_without_
             .await
             .expect("resolve ordered runtime");
         let expected = resolve_runtime(
-            &isolated_config().with_explicit_root(directory.path().join(expected_root)),
+            &isolated_config().with_explicit_root(expected_root),
             &supervisor,
         )
         .await
@@ -1120,21 +1158,19 @@ async fn arbitrary_explicit_system_and_path_jellyfin_pairs_are_not_hardware_qual
 }
 
 #[tokio::test]
-async fn managed_candidate_without_authenticated_activation_proof_stays_software_only() {
+async fn managed_candidate_without_authenticated_activation_proof_is_not_executed() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let managed = jellyfin_root(directory.path(), "managed-provenance");
     let supervisor = ProcessSupervisor::new(CancellationToken::new());
 
-    let runtime = resolve_runtime(
+    let error = resolve_runtime(
         &isolated_config().with_managed_current_root(managed),
         &supervisor,
     )
     .await
-    .expect("resolve app-managed pair");
+    .expect_err("unreceipted managed pair must not execute");
 
-    assert_eq!(runtime.kind(), RuntimeKind::SoftwareCompatible);
-    assert_eq!(runtime.id().jellyfin_revision, None);
-    assert!(!runtime.kind().hardware_allowed());
+    assert!(matches!(error, RuntimeError::Unavailable));
 }
 
 #[tokio::test]
