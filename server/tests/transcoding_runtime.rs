@@ -401,7 +401,7 @@ fn block_value(
 
 fn allowed_action_inputs(action: &str) -> Option<&'static [&'static str]> {
     match action {
-        "actions/checkout@v7" => Some(&["fetch-depth"]),
+        "actions/checkout@v7" => Some(&["fetch-depth", "persist-credentials"]),
         "dtolnay/rust-toolchain@1.98.0" => Some(&["components", "targets"]),
         "taiki-e/install-action@v2" => Some(&["tool"]),
         "actions/cache@v6" => Some(&["path", "key", "restore-keys"]),
@@ -454,17 +454,21 @@ fn validate_workflow_step_shape(step: &WorkflowStep) -> Result<(), &'static str>
     Ok(())
 }
 
-fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
+fn validate_workflow_digest(workflow: &str) -> Result<(), &'static str> {
     // The structural parser below assigns semantics to every mapping entry. This reviewed-source
     // fingerprint is the final full-consumption guard for comments, blank-line placement, and
     // nested text that YAML treats as non-semantic or that a bounded grammar could otherwise skip.
     // It authenticates repository declaration text only, not mutable marketplace action tags.
     const EXPECTED_WORKFLOW_SHA256: &str =
-        "654bf0da63cb8cb22899fcef86ce70c162fee7b78ad1f62a1502a5cea1ef759f";
+        "2e0678847a80f3d55b4135f266ae32219e75a64cb9912518338f0599a42ec162";
     let normalized_workflow = workflow.replace("\r\n", "\n");
     if hex::encode(Sha256::digest(normalized_workflow.as_bytes())) != EXPECTED_WORKFLOW_SHA256 {
-        return Err("complete release workflow declaration changed");
+        return Err("release workflow declaration digest changed");
     }
+    Ok(())
+}
+
+fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
     let lines = workflow.lines().collect::<Vec<_>>();
     if lines
         .iter()
@@ -649,44 +653,52 @@ fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
                             .ok_or("workflow action inputs are empty")?;
                         let mut child = index + 1;
                         while child < with_end {
-                            if yaml_indent(lines[child])? == child_indent {
-                                let (input, value) = yaml_field(lines[child].trim())
-                                    .ok_or("unsupported workflow action input shape")?;
-                                let values = if value == "|" {
-                                    block_value(
-                                        &lines,
-                                        child,
-                                        yaml_indent(lines[child])?,
-                                        with_end,
-                                    )?
-                                    .0
-                                    .lines()
-                                    .map(str::trim)
-                                    .filter(|line| !line.is_empty())
-                                    .map(yaml_scalar)
-                                    .collect::<Result<Vec<_>, _>>()?
-                                } else {
-                                    vec![yaml_scalar(value)?]
-                                };
-                                if step
-                                    .inputs
-                                    .insert(input.to_owned(), values.clone())
-                                    .is_some()
-                                {
-                                    return Err("duplicate workflow action input");
-                                }
-                                match input {
-                                    "name" if values.len() == 1 => {
-                                        if step.artifact_name.replace(values[0].clone()).is_some() {
-                                            return Err("duplicate workflow artifact name");
-                                        }
-                                    }
-                                    "path" => step.paths.extend(values),
-                                    "files" => step.release_files.extend(values),
-                                    _ => {}
-                                }
+                            if lines[child].trim().is_empty() {
+                                child += 1;
+                                continue;
                             }
-                            child += 1;
+                            if yaml_indent(lines[child])? != child_indent {
+                                return Err("unconsumed workflow action input content");
+                            }
+                            let (input, value) = yaml_field(lines[child].trim())
+                                .ok_or("unsupported workflow action input shape")?;
+                            let (values, next_child) = if value == "|" {
+                                let (block, block_end) = block_value(
+                                    &lines,
+                                    child,
+                                    yaml_indent(lines[child])?,
+                                    with_end,
+                                )?;
+                                (
+                                    block
+                                        .lines()
+                                        .map(str::trim)
+                                        .filter(|line| !line.is_empty())
+                                        .map(yaml_scalar)
+                                        .collect::<Result<Vec<_>, _>>()?,
+                                    block_end,
+                                )
+                            } else {
+                                (vec![yaml_scalar(value)?], child + 1)
+                            };
+                            if step
+                                .inputs
+                                .insert(input.to_owned(), values.clone())
+                                .is_some()
+                            {
+                                return Err("duplicate workflow action input");
+                            }
+                            match input {
+                                "name" if values.len() == 1 => {
+                                    if step.artifact_name.replace(values[0].clone()).is_some() {
+                                        return Err("duplicate workflow artifact name");
+                                    }
+                                }
+                                "path" => step.paths.extend(values),
+                                "files" => step.release_files.extend(values),
+                                _ => {}
+                            }
+                            child = next_child;
                         }
                     }
                     "env" => {
@@ -703,8 +715,11 @@ fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
                         let mut variables = BTreeSet::new();
                         for line in lines.iter().take(env_end).skip(index + 1) {
                             let trimmed = line.trim();
-                            if trimmed.is_empty() || trimmed.starts_with('#') {
+                            if trimmed.is_empty() {
                                 continue;
+                            }
+                            if trimmed.starts_with('#') {
+                                return Err("workflow environment comments are not accepted");
                             }
                             let (variable, value) = yaml_field(trimmed)
                                 .ok_or("unsupported workflow environment shape")?;
@@ -1234,7 +1249,14 @@ const WINDOWS_BUILD_ENV: &[(&str, &str)] = &[
 ];
 
 fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
-    let checkout = || action_contract(None, &["uses"], "actions/checkout@v7", &[]);
+    let checkout = || {
+        action_contract(
+            None,
+            &["uses", "with"],
+            "actions/checkout@v7",
+            &[("persist-credentials", &["false"])],
+        )
+    };
     let cargo_chef_cache = || {
         action_contract(
             Some("Cargo Chef Cache"),
@@ -1251,6 +1273,113 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
         )
     };
     match job {
+        "check" => Some(vec![
+            checkout(),
+            action_contract(
+                Some("Setup Rust"),
+                &["name", "uses", "with"],
+                "dtolnay/rust-toolchain@1.98.0",
+                &[("components", &["clippy"])],
+            ),
+            action_contract(
+                Some("Install cargo-chef"),
+                &["name", "uses", "with"],
+                "taiki-e/install-action@v2",
+                &[("tool", &["cargo-chef"])],
+            ),
+            run_contract(
+                "Install System Dependencies",
+                &["name", "run"],
+                "dec83f6f9886e3baa4cf53f471988cbffadf7996108ddca581eccf981fbd7b8d",
+            ),
+            run_contract(
+                "Install libtorrent 2.1.1",
+                &["name", "run"],
+                "76f3af92afe15b45fe9102a4947fb200dd9d3fd0511f5575fa35ea5c0dfed7d3",
+            ),
+            run_contract(
+                "Cargo Chef Prepare",
+                &["name", "run"],
+                "c6b1ac40a713e18000d525ae4eb8e6cab4377d32f90c2a5cf58ab378d2a1f14e",
+            ),
+            action_contract(
+                Some("Cargo Chef Cache"),
+                &["name", "uses", "with"],
+                "actions/cache@v6",
+                &[
+                    (
+                        "key",
+                        &["${{ runner.os }}-check-cargo-chef-${{ hashFiles('recipe.json') }}"],
+                    ),
+                    ("path", &["target"]),
+                    ("restore-keys", &["${{ runner.os }}-check-cargo-chef-"]),
+                ],
+            ),
+            run_contract(
+                "Cargo Chef Cook",
+                &["name", "run"],
+                "0acd01d41da6c5bf2e3166f9058eeb286d35371d9f1f574e36bcc568d390e2cc",
+            ),
+            run_contract(
+                "Restore Source Code",
+                &["name", "run"],
+                "4bda61bee0859f911423f15bfc2b6334a840095263d3a611eea746fbb6b29230",
+            ),
+            run_contract(
+                "Check libtorrent and native FFI targets",
+                &["name", "run"],
+                "c0b994a70f6239bbbb6bd6f1d7f32130ecb88600dbe253c03bbd3fede6142fbc",
+            ),
+            run_contract(
+                "Run Clippy for libtorrent and native FFI targets",
+                &["name", "run"],
+                "cafac56c536c9835b5f17ac91b72230c539d95e998624e7a059b4a910166b802",
+            ),
+            run_contract(
+                "Check librqbit and native FFI targets",
+                &["name", "run"],
+                "04a4ae3b677fd4e7df8ade2dc6903e9db9dc016bae8b4c74173b75cac6f42ca5",
+            ),
+            run_contract(
+                "Run Clippy for librqbit backend",
+                &["name", "run"],
+                "70b53af1e4c740f80e061fce6b50f240b215e8e1c5df1c7bde3c08839a8468e4",
+            ),
+            run_contract(
+                "Run Tests",
+                &["name", "run"],
+                "ebedc1f3dd5003292f91380ba144e9a733e950174c656739d032035f22295fa3",
+            ),
+            run_contract(
+                "Test librqbit backend",
+                &["name", "run"],
+                "b3876eb1195ee67af7f3e186192dc1fb186d364d26153a243f4335f81dbb78cb",
+            ),
+        ]),
+        "check-windows" => Some(vec![
+            checkout(),
+            action_contract(
+                Some("Setup Rust"),
+                &["name", "uses", "with"],
+                "dtolnay/rust-toolchain@1.98.0",
+                &[("components", &["clippy"])],
+            ),
+            run_contract(
+                "Check librqbit and native FFI targets",
+                &["name", "run"],
+                "04a4ae3b677fd4e7df8ade2dc6903e9db9dc016bae8b4c74173b75cac6f42ca5",
+            ),
+            run_contract(
+                "Run Clippy for librqbit and native FFI targets",
+                &["name", "run"],
+                "70b53af1e4c740f80e061fce6b50f240b215e8e1c5df1c7bde3c08839a8468e4",
+            ),
+            run_contract(
+                "Test repeated Windows shutdown",
+                &["name", "run"],
+                "ee3e3c4b6c32e558d06f0826d727768a9de61582de2f76f702642d86641b28d8",
+            ),
+        ]),
         "build-windows" => {
             let mut setup_vcpkg = action_contract(
                 Some("Setup vcpkg"),
@@ -1576,7 +1705,7 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
                 None,
                 &["uses", "with"],
                 "actions/checkout@v7",
-                &[("fetch-depth", &["0"])],
+                &[("fetch-depth", &["0"]), ("persist-credentials", &["false"])],
             ),
             action_contract(
                 Some("Setup Rust for package gate"),
@@ -1713,51 +1842,6 @@ fn expected_packaging_job_metadata(job: &str) -> Option<&'static str> {
     }
 }
 
-fn validate_check_job_authority(step: &WorkflowStep) -> Result<(), &'static str> {
-    if step.id.is_some() || step.condition.is_some() || !step.environment.is_empty() {
-        return Err("check step gained token-bearing execution metadata");
-    }
-    if let Some(action) = step.uses.as_deref()
-        && !matches!(
-            action,
-            "actions/checkout@v7"
-                | "dtolnay/rust-toolchain@1.98.0"
-                | "taiki-e/install-action@v2"
-                | "actions/cache@v6"
-        )
-    {
-        return Err("check job gained a publication-capable action");
-    }
-    let token_or_publication = [
-        "github.token",
-        "github_token",
-        "secrets.github_token",
-        "gh api",
-        "api.github.com",
-        "uploads.github.com",
-        "authorization:",
-    ];
-    let values = step
-        .run
-        .iter()
-        .map(String::as_str)
-        .chain(
-            step.inputs
-                .values()
-                .flat_map(|values| values.iter().map(String::as_str)),
-        )
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    if values.iter().any(|value| {
-        token_or_publication
-            .iter()
-            .any(|marker| value.contains(marker))
-    }) {
-        return Err("check job gained token-bearing publication behavior");
-    }
-    Ok(())
-}
-
 fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'static str> {
     for job in [
         "check",
@@ -1775,12 +1859,6 @@ fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'stat
         if Some(metadata.metadata.as_str()) != expected_packaging_job_metadata(job) {
             return Err("packaging workflow job metadata changed");
         }
-        if matches!(job, "check" | "check-windows") {
-            for step in parsed.steps.iter().filter(|step| step.job == job) {
-                validate_check_job_authority(step)?;
-            }
-            continue;
-        }
         let actual = parsed
             .steps
             .iter()
@@ -1795,6 +1873,12 @@ fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'stat
         }
     }
     Ok(())
+}
+
+fn validate_workflow_semantics(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
+    let parsed = workflow_steps(workflow)?;
+    validate_packaging_job_contract(&parsed)?;
+    Ok(parsed)
 }
 
 fn expected_package_upload_suffix(job: &str) -> Option<&'static [&'static str]> {
@@ -1974,10 +2058,18 @@ fn enumerate_authoritative_sources(
     cargo: &str,
     workflow: &str,
 ) -> Result<ReleaseInventory, &'static str> {
+    validate_workflow_digest(workflow)?;
+    enumerate_authoritative_sources_semantically(wix, cargo, workflow)
+}
+
+fn enumerate_authoritative_sources_semantically(
+    wix: &str,
+    cargo: &str,
+    workflow: &str,
+) -> Result<ReleaseInventory, &'static str> {
     let wix = wix_sources(wix)?;
     let deb = cargo_deb_sources(cargo)?;
-    let parsed = workflow_steps(workflow)?;
-    validate_packaging_job_contract(&parsed)?;
+    let parsed = validate_workflow_semantics(workflow)?;
     let steps = parsed.steps;
     let appimage_run = steps
         .iter()
@@ -2649,7 +2741,7 @@ fn actual_declaration_mutations_reject_directories_globs_and_unknown_staging() {
             "mkdir -p release\n          cp payload/codec release/codec",
         ),
     ] {
-        assert!(enumerate_authoritative_sources(&wix, &cargo, &mutated).is_err());
+        assert!(enumerate_authoritative_sources_semantically(&wix, &cargo, &mutated).is_err());
     }
     let cargo_directory = cargo.replace("target/release/server\"", "target/release/\"");
     assert!(enumerate_authoritative_sources(&wix, &cargo_directory, &workflow).is_err());
@@ -2692,7 +2784,7 @@ fn workflow_contract_rejects_unnamed_duplicate_and_changed_release_declarations(
         extra_release_files,
     ] {
         assert!(
-            enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err(),
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation).is_err(),
             "workflow mutation escaped the closed release contract"
         );
     }
@@ -2865,7 +2957,7 @@ fn workflow_contract_rejects_order_and_failure_semantics_mutations() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -2890,11 +2982,9 @@ fn release_gate_requires_exact_linux_native_prerequisites_before_verification() 
         ),
         compliant.replace("libgtk-3-dev", "libgtk-4-dev"),
     ];
-    assert!(
-        mutations
-            .into_iter()
-            .all(|mutation| { enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err() })
-    );
+    assert!(mutations.into_iter().all(|mutation| {
+        enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation).is_err()
+    }));
 }
 
 #[test]
@@ -3001,7 +3091,7 @@ fn workflow_contract_rejects_every_post_verifier_mutation_path() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3066,7 +3156,7 @@ fn workflow_contract_allows_only_the_exact_post_upload_diagnostic_tail() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3209,7 +3299,7 @@ fn packaging_jobs_reject_extra_duplicate_or_mutated_pre_verifier_steps() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3322,7 +3412,7 @@ fn packaging_jobs_reject_changed_or_duplicate_job_level_semantics() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3395,7 +3485,7 @@ fn workflow_authority_contract_rejects_global_mapping_bypasses() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3497,7 +3587,7 @@ fn workflow_authority_contract_rejects_job_mapping_and_token_bypasses() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3553,7 +3643,7 @@ fn workflow_authority_contract_rejects_every_unconsumed_document_line() {
     let escaped = mutations
         .into_iter()
         .filter_map(|(name, mutation)| {
-            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation)
                 .is_ok()
                 .then_some(name)
         })
@@ -3561,6 +3651,158 @@ fn workflow_authority_contract_rejects_every_unconsumed_document_line() {
     assert!(
         escaped.is_empty(),
         "unconsumed workflow lines escaped: {escaped:?}"
+    );
+}
+
+#[test]
+fn workflow_digest_is_distinct_from_semantic_validation() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let byte_only_change = format!("{workflow}\n");
+
+    validate_workflow_semantics(&byte_only_change)
+        .expect("a trailing blank line must remain semantically valid");
+    assert_eq!(
+        enumerate_authoritative_sources(&wix, &cargo, &byte_only_change).unwrap_err(),
+        "release workflow declaration digest changed"
+    );
+}
+
+#[test]
+fn check_jobs_require_exact_ordered_steps_and_values() {
+    let (_, _, _, workflow) = repository_inputs();
+    let replace_nth = |source: &str, pattern: &str, replacement: &str, occurrence: usize| {
+        let start = source
+            .match_indices(pattern)
+            .nth(occurrence)
+            .map(|(index, _)| index)
+            .expect("workflow mutation target");
+        let mut mutated = source.to_owned();
+        mutated.replace_range(start..start + pattern.len(), replacement);
+        mutated
+    };
+    let mutations = [
+        (
+            "check bracket PAT release",
+            insert_workflow_step_after(
+                &workflow,
+                "Run Tests",
+                "name: Publish with bracket PAT\n        run: gh release create unsafe --repo ${{ secrets['RELEASE_PAT'] }}",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check split API host",
+            insert_workflow_step_after(
+                &workflow,
+                "Run Tests",
+                "name: Publish through split host\n        run: host=api.github; host=$host.com; curl https://$host/repos/$GITHUB_REPOSITORY/releases",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check cache release paths",
+            workflow.replacen(
+                "          path: target",
+                "          path: |\n            target\n            .git\n            release",
+                1,
+            ),
+            "packaging workflow action contract changed",
+        ),
+        (
+            "check changed toolchain input",
+            workflow.replacen("          components: clippy", "          components: rustfmt", 1),
+            "packaging workflow action contract changed",
+        ),
+        (
+            "check extra run",
+            insert_workflow_step_after(
+                &workflow,
+                "Run Tests",
+                "name: Extra check command\n        run: echo extra",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check duplicate checkout",
+            workflow.replacen(
+                "      - uses: actions/checkout@v7",
+                "      - uses: actions/checkout@v7\n\n      - name: Duplicate checkout\n        uses: actions/checkout@v7",
+                1,
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check-windows bracket PAT release",
+            insert_workflow_step_after(
+                &workflow,
+                "Test repeated Windows shutdown",
+                "name: Publish with bracket PAT\n        run: gh release create unsafe --repo ${{ secrets['RELEASE_PAT'] }}",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check-windows split API host",
+            insert_workflow_step_after(
+                &workflow,
+                "Test repeated Windows shutdown",
+                "name: Publish through split host\n        run: $host = 'api.github' + '.com'; curl https://$host/repos/$env:GITHUB_REPOSITORY/releases",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check-windows dangerous cache",
+            insert_workflow_step_after(
+                &workflow,
+                "Setup Rust",
+                "name: Cache release authority\n        uses: actions/cache@v6\n        with:\n          path: |\n            .git\n            release\n          key: unsafe-release",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check-windows changed toolchain input",
+            replace_nth(
+                &workflow,
+                "          components: clippy",
+                "          components: rustfmt",
+                1,
+            ),
+            "packaging workflow action contract changed",
+        ),
+        (
+            "check-windows extra run",
+            insert_workflow_step_after(
+                &workflow,
+                "Test repeated Windows shutdown",
+                "name: Extra Windows check command\n        run: echo extra",
+            ),
+            "packaging workflow step count changed",
+        ),
+        (
+            "check-windows duplicate checkout",
+            replace_nth(
+                &workflow,
+                "      - uses: actions/checkout@v7",
+                "      - uses: actions/checkout@v7\n\n      - name: Duplicate checkout\n        uses: actions/checkout@v7",
+                1,
+            ),
+            "packaging workflow step count changed",
+        ),
+    ];
+
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation, expected)| {
+            let result = validate_workflow_semantics(&mutation).map(|_| ());
+            match result {
+                Err(actual) if actual == expected => None,
+                Err(actual) => Some(format!("{name}: expected {expected:?}, got {actual:?}")),
+                Ok(()) => Some(format!("{name}: escaped semantic validation")),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "check-job semantic mutations escaped: {escaped:?}"
     );
 }
 
@@ -3584,7 +3826,7 @@ fn structural_contract_rejects_absent_renamed_payload_declarations() {
                 1,
             );
         assert!(
-            enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err(),
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutation).is_err(),
             "absent renamed payload was treated as structurally safe"
         );
     }
@@ -3611,7 +3853,7 @@ fn every_final_assembly_source_is_tied_to_an_upstream_upload() {
             workflow.replacen(member, "renamed-runtime.bin", 1)
         };
         assert!(
-            enumerate_authoritative_sources(&wix, &cargo, &mutated).is_err(),
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutated).is_err(),
             "accepted untied final assembly mutation for {source}"
         );
     }
@@ -3656,7 +3898,7 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
                 1,
             );
         assert!(
-            enumerate_authoritative_sources(&wix, &cargo, &mutated).is_err(),
+            enumerate_authoritative_sources_semantically(&wix, &cargo, &mutated).is_err(),
             "structural contract admitted renamed payload {name}"
         );
     }
@@ -3676,7 +3918,7 @@ fn renamed_pe_and_archive_magic_fail_while_application_and_vendor_controls_pass(
             1,
         );
     assert!(
-        enumerate_authoritative_sources(&wix, &cargo, &directory_workflow).is_err(),
+        enumerate_authoritative_sources_semantically(&wix, &cargo, &directory_workflow).is_err(),
         "declared directory was accepted by the exact structural contract"
     );
     assert!(!forbidden_runtime_payload(

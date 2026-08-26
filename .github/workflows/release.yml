@@ -26,6 +26,8 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
@@ -90,6 +92,8 @@ jobs:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
@@ -113,6 +117,8 @@ jobs:
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
@@ -163,8 +169,6 @@ jobs:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
           VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release
           VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
-          # The overlay pins libtorrent 2.1.1 and carries the complete official
-          # vcpkg port for that release, including its verified source checksum.
           VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlays
 
       - name: Cargo Chef Prepare
@@ -249,6 +253,8 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
@@ -355,6 +361,8 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -434,6 +442,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Rust for package gate
         uses: dtolnay/rust-toolchain@1.98.0
