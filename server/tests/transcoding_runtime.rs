@@ -3,7 +3,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc::{self, TryRecvError},
+    thread,
+    time::{Duration, Instant},
 };
 
 const ALLOWED_APPLICATION_PE: &[&str] = &[
@@ -43,6 +48,8 @@ const EXPECTED_RELEASE_DESTINATIONS: &[&str] = &[
     "stream-server-linux-amd64.AppImage",
     "stream-server-arch-x86_64.pkg.tar.zst",
 ];
+const MAX_WORKFLOW_OBJECT_BYTES: usize = 1024 * 1024;
+const WORKFLOW_GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn normalized(path: &Path) -> String {
     path.to_string_lossy()
@@ -460,7 +467,7 @@ fn validate_workflow_digest(workflow: &str) -> Result<(), &'static str> {
     // nested text that YAML treats as non-semantic or that a bounded grammar could otherwise skip.
     // It authenticates repository declaration text only, not mutable marketplace action tags.
     const EXPECTED_WORKFLOW_SHA256: &str =
-        "2e0678847a80f3d55b4135f266ae32219e75a64cb9912518338f0599a42ec162";
+        "76d04e105cab2a09b1ef9ac504e31044153217b5718925043e68263b3c189bfc";
     let normalized_workflow = workflow.replace("\r\n", "\n");
     if hex::encode(Sha256::digest(normalized_workflow.as_bytes())) != EXPECTED_WORKFLOW_SHA256 {
         return Err("release workflow declaration digest changed");
@@ -1254,6 +1261,14 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
             None,
             &["uses", "with"],
             "actions/checkout@v7",
+            &[("fetch-depth", &["0"]), ("persist-credentials", &["false"])],
+        )
+    };
+    let shallow_checkout = || {
+        action_contract(
+            None,
+            &["uses", "with"],
+            "actions/checkout@v7",
             &[("persist-credentials", &["false"])],
         )
     };
@@ -1357,7 +1372,7 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
             ),
         ]),
         "check-windows" => Some(vec![
-            checkout(),
+            shallow_checkout(),
             action_contract(
                 Some("Setup Rust"),
                 &["name", "uses", "with"],
@@ -1879,6 +1894,166 @@ fn validate_workflow_semantics(workflow: &str) -> Result<ParsedWorkflow, &'stati
     let parsed = workflow_steps(workflow)?;
     validate_packaging_job_contract(&parsed)?;
     Ok(parsed)
+}
+
+fn validate_authoritative_workflow_with_loader<F>(
+    workspace: &str,
+    github_actions: Option<&str>,
+    post_build_stage: Option<&str>,
+    workflow_sha: Option<&str>,
+    loader: F,
+) -> Result<String, &'static str>
+where
+    F: FnOnce(&str) -> Result<Vec<u8>, &'static str>,
+{
+    if github_actions != Some("true") && post_build_stage.is_none() {
+        return Ok(workspace.to_owned());
+    }
+    let workflow_sha = workflow_sha.ok_or("GITHUB_WORKFLOW_SHA is required")?;
+    let workflow_sha = normalize_workflow_sha(workflow_sha)?;
+    let immutable_bytes = loader(&workflow_sha)?;
+    if immutable_bytes.len() > MAX_WORKFLOW_OBJECT_BYTES {
+        return Err("release workflow commit object exceeds size limit");
+    }
+    let immutable = String::from_utf8(immutable_bytes)
+        .map_err(|_| "release workflow commit object is not UTF-8")?;
+    validate_workflow_digest(&immutable)?;
+    validate_workflow_semantics(&immutable)?;
+    if workspace.replace("\r\n", "\n") != immutable.replace("\r\n", "\n") {
+        return Err("workspace release workflow differs from commit object");
+    }
+    Ok(immutable)
+}
+
+fn normalize_workflow_sha(workflow_sha: &str) -> Result<String, &'static str> {
+    if workflow_sha.len() != 40 || !workflow_sha.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err("GITHUB_WORKFLOW_SHA must be 40 hexadecimal characters");
+    }
+    Ok(workflow_sha.to_ascii_lowercase())
+}
+
+fn run_bounded_workflow_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<Vec<u8>, &'static str> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "workflow Git tool unavailable")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("workflow Git stdout unavailable");
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((MAX_WORKFLOW_OBJECT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+            .map_err(|_| "workflow Git object read failed");
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    let mut output = None;
+    loop {
+        match receiver.try_recv() {
+            Ok(Ok(bytes)) if bytes.len() > MAX_WORKFLOW_OBJECT_BYTES => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("release workflow commit object exceeds size limit");
+            }
+            Ok(Ok(bytes)) => output = Some(bytes),
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) if output.is_none() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("workflow Git object read failed");
+            }
+            Err(TryRecvError::Disconnected) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let result = match output {
+                    Some(bytes) => Ok(bytes),
+                    None => match receiver.recv() {
+                        Ok(result) => result,
+                        Err(_) => Err("workflow Git object read failed"),
+                    },
+                };
+                let _ = reader.join();
+                if !status.success() {
+                    return Err("workflow Git object command failed");
+                }
+                let bytes = result?;
+                if bytes.len() > MAX_WORKFLOW_OBJECT_BYTES {
+                    return Err("release workflow commit object exceeds size limit");
+                }
+                return Ok(bytes);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("workflow Git object command failed");
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err("workflow Git object command timed out");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn load_git_workflow_object(
+    repository: &Path,
+    workflow_sha: &str,
+) -> Result<Vec<u8>, &'static str> {
+    let workflow_sha = normalize_workflow_sha(workflow_sha)?;
+    let object = format!("{workflow_sha}:.github/workflows/release.yml");
+    let command = &mut Command::new("git");
+    command
+        .current_dir(repository)
+        .args(["cat-file", "blob", &object])
+        .stdin(Stdio::null());
+    run_bounded_workflow_command(command, WORKFLOW_GIT_TIMEOUT)
+}
+
+fn authoritative_workflow_for_current_environment(
+    repository: &Path,
+    workspace: &str,
+) -> Result<String, &'static str> {
+    let github_actions = std::env::var_os("GITHUB_ACTIONS");
+    let post_build_stage = std::env::var_os("STREAM_SERVER_RELEASE_GATE_STAGE");
+    let workflow_sha = if github_actions.is_some() || post_build_stage.is_some() {
+        std::env::var("GITHUB_WORKFLOW_SHA").ok()
+    } else {
+        None
+    };
+    validate_authoritative_workflow_with_loader(
+        workspace,
+        github_actions.as_ref().map(|_| "true"),
+        post_build_stage.as_ref().map(|_| "set"),
+        workflow_sha.as_deref(),
+        |sha| load_git_workflow_object(repository, sha),
+    )
 }
 
 fn expected_package_upload_suffix(job: &str) -> Option<&'static [&'static str]> {
@@ -2453,8 +2628,11 @@ fn repository_inputs() -> (PathBuf, String, String, String) {
         fs::read_to_string(repository.join("server/wix/main.wxs")).expect("read WiX declaration");
     let cargo =
         fs::read_to_string(repository.join("server/Cargo.toml")).expect("read Cargo declaration");
-    let workflow = read_authoritative_release_workflow(&repository.join(".github/workflows"))
-        .expect("read closed authoritative release workflow set");
+    let workspace_workflow =
+        read_authoritative_release_workflow(&repository.join(".github/workflows"))
+            .expect("read closed authoritative release workflow set");
+    let workflow = authoritative_workflow_for_current_environment(&repository, &workspace_workflow)
+        .expect("authenticate authoritative release workflow identity");
     (repository, wix, cargo, workflow)
 }
 
@@ -3665,6 +3843,293 @@ fn workflow_digest_is_distinct_from_semantic_validation() {
         enumerate_authoritative_sources(&wix, &cargo, &byte_only_change).unwrap_err(),
         "release workflow declaration digest changed"
     );
+}
+
+#[test]
+fn authoritative_ci_validates_the_immutable_workflow_object() {
+    let (_, _, _, workspace) = repository_inputs();
+    let malicious_commit = insert_workflow_step_after(
+        &workspace.replace("persist-credentials: false", "persist-credentials: true"),
+        "Verify Windows package outputs",
+        "name: Mutate verified release\n        run: echo payload > release/renamed-runtime.exe",
+    );
+    let loaded = validate_authoritative_workflow_with_loader(
+        &workspace,
+        Some("true"),
+        None,
+        Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01"),
+        |sha| {
+            assert_eq!(sha, "abcdef0123456789abcdef0123456789abcdef01");
+            Ok(malicious_commit.into_bytes())
+        },
+    );
+
+    assert_eq!(
+        loaded.unwrap_err(),
+        "release workflow declaration digest changed"
+    );
+}
+
+#[test]
+fn authoritative_identity_is_required_valid_and_workspace_bound() {
+    let (_, _, _, workspace) = repository_inputs();
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+
+    let safe = validate_authoritative_workflow_with_loader(
+        &workspace,
+        Some("true"),
+        None,
+        Some(sha),
+        |actual| {
+            assert_eq!(actual, sha);
+            Ok(workspace.as_bytes().to_vec())
+        },
+    )
+    .expect("matching immutable workflow");
+    assert_eq!(safe.replace("\r\n", "\n"), workspace.replace("\r\n", "\n"));
+
+    let changed_workspace = format!("{workspace}\n");
+    assert_eq!(
+        validate_authoritative_workflow_with_loader(
+            &changed_workspace,
+            Some("true"),
+            None,
+            Some(sha),
+            |_| Ok(workspace.as_bytes().to_vec()),
+        )
+        .unwrap_err(),
+        "workspace release workflow differs from commit object"
+    );
+
+    for invalid in [
+        "",
+        "0123456789abcdef0123456789abcdef0123456",
+        "0123456789abcdef0123456789abcdef012345678",
+        "0123456789abcdef0123456789abcdef0123456g",
+    ] {
+        assert_eq!(
+            validate_authoritative_workflow_with_loader(
+                &workspace,
+                Some("true"),
+                None,
+                Some(invalid),
+                |_| Err("loader reached for invalid SHA"),
+            )
+            .unwrap_err(),
+            "GITHUB_WORKFLOW_SHA must be 40 hexadecimal characters"
+        );
+    }
+    assert_eq!(
+        validate_authoritative_workflow_with_loader(&workspace, Some("true"), None, None, |_| Err(
+            "loader reached without SHA"
+        ),)
+        .unwrap_err(),
+        "GITHUB_WORKFLOW_SHA is required"
+    );
+    assert_eq!(
+        validate_authoritative_workflow_with_loader(
+            &workspace,
+            None,
+            Some("windows"),
+            None,
+            |_| Err("loader reached without SHA"),
+        )
+        .unwrap_err(),
+        "GITHUB_WORKFLOW_SHA is required"
+    );
+    validate_authoritative_workflow_with_loader(&workspace, None, None, None, |_| {
+        Err("local fixture attempted immutable loading")
+    })
+    .expect("local fixture bytes do not require CI identity");
+}
+
+#[test]
+fn authoritative_commit_object_is_size_bounded() {
+    let (_, _, _, workspace) = repository_inputs();
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let result = validate_authoritative_workflow_with_loader(
+        &workspace,
+        Some("true"),
+        None,
+        Some(sha),
+        |_| Ok(vec![b'x'; 1024 * 1024 + 1]),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "release workflow commit object exceeds size limit"
+    );
+    assert_eq!(
+        validate_authoritative_workflow_with_loader(
+            &workspace,
+            Some("true"),
+            None,
+            Some(sha),
+            |_| Ok(vec![0xff, 0xfe]),
+        )
+        .unwrap_err(),
+        "release workflow commit object is not UTF-8"
+    );
+    for error in [
+        "workflow Git tool unavailable",
+        "workflow Git object command failed",
+        "workflow Git object read failed",
+        "workflow Git object command timed out",
+    ] {
+        assert_eq!(
+            validate_authoritative_workflow_with_loader(
+                &workspace,
+                Some("true"),
+                None,
+                Some(sha),
+                |_| Err(error),
+            )
+            .unwrap_err(),
+            error
+        );
+    }
+}
+
+#[test]
+fn workflow_object_command_is_bounded_timed_and_reaped() {
+    let unavailable = &mut Command::new("stream-server-definitely-missing-git-tool");
+    assert_eq!(
+        run_bounded_workflow_command(unavailable, Duration::from_millis(100)).unwrap_err(),
+        "workflow Git tool unavailable"
+    );
+
+    let (repository, _, _, _) = repository_inputs();
+    let missing_object = &mut Command::new("git");
+    missing_object.current_dir(&repository).args([
+        "cat-file",
+        "blob",
+        "0000000000000000000000000000000000000000:.github/workflows/release.yml",
+    ]);
+    assert_eq!(
+        run_bounded_workflow_command(missing_object, Duration::from_secs(2)).unwrap_err(),
+        "workflow Git object command failed"
+    );
+
+    let blocked = &mut Command::new("git");
+    blocked
+        .current_dir(&repository)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped());
+    let started = Instant::now();
+    assert_eq!(
+        run_bounded_workflow_command(blocked, Duration::from_millis(100)).unwrap_err(),
+        "workflow Git object command timed out"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let temporary = tempfile::tempdir().expect("temporary Git object store");
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(temporary.path())
+            .status()
+            .expect("initialize temporary Git object store")
+            .success()
+    );
+    let oversized_path = temporary.path().join("oversized-workflow");
+    fs::write(&oversized_path, vec![b'x'; 1024 * 1024 + 1]).expect("oversized object fixture");
+    let hash = Command::new("git")
+        .current_dir(temporary.path())
+        .args(["hash-object", "-w", "oversized-workflow"])
+        .output()
+        .expect("hash oversized object");
+    assert!(hash.status.success());
+    let hash = std::str::from_utf8(&hash.stdout)
+        .expect("object hash UTF-8")
+        .trim();
+    let oversized = &mut Command::new("git");
+    oversized
+        .current_dir(temporary.path())
+        .args(["cat-file", "blob", hash]);
+    assert_eq!(
+        run_bounded_workflow_command(oversized, Duration::from_secs(2)).unwrap_err(),
+        "release workflow commit object exceeds size limit"
+    );
+}
+
+#[test]
+fn git_workflow_loader_reads_the_fixed_commit_path() {
+    let (_, _, _, workflow) = repository_inputs();
+    let temporary = tempfile::tempdir().expect("temporary committed workflow repository");
+    let workflow_path = temporary.path().join(".github/workflows/release.yml");
+    fs::create_dir_all(workflow_path.parent().expect("workflow fixture parent"))
+        .expect("create workflow fixture parent");
+    fs::write(&workflow_path, workflow.as_bytes()).expect("write committed workflow fixture");
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", ".github/workflows/release.yml"],
+        vec![
+            "-c",
+            "user.name=Workflow Fixture",
+            "-c",
+            "user.email=workflow@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(temporary.path())
+                .args(args)
+                .status()
+                .expect("prepare committed workflow fixture")
+                .success()
+        );
+    }
+    let head = Command::new("git")
+        .current_dir(temporary.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve workflow fixture HEAD");
+    assert!(head.status.success());
+    let head = std::str::from_utf8(&head.stdout)
+        .expect("fixture HEAD UTF-8")
+        .trim();
+
+    let committed = load_git_workflow_object(temporary.path(), head)
+        .expect("load fixed committed workflow path");
+    assert_eq!(
+        String::from_utf8(committed)
+            .expect("committed workflow UTF-8")
+            .replace("\r\n", "\n"),
+        workflow.replace("\r\n", "\n")
+    );
+}
+
+#[test]
+fn authoritative_jobs_fetch_the_workflow_identity_object() {
+    let (_, _, _, workflow) = repository_inputs();
+    let parsed = workflow_steps(&workflow).expect("parse authoritative workflow checkout policy");
+    for job in [
+        "check",
+        "build-windows",
+        "build-linux",
+        "build-arch",
+        "release",
+    ] {
+        let checkout = parsed
+            .steps
+            .iter()
+            .find(|step| step.job == job && step.ordinal == 0)
+            .expect("authoritative job checkout");
+        assert_eq!(
+            checkout.inputs.get("fetch-depth"),
+            Some(&vec!["0".to_owned()]),
+            "{job} must fetch the GITHUB_WORKFLOW_SHA object"
+        );
+    }
+    let embed_only_checkout = parsed
+        .steps
+        .iter()
+        .find(|step| step.job == "check-windows" && step.ordinal == 0)
+        .expect("embed-only Windows checkout");
+    assert!(!embed_only_checkout.inputs.contains_key("fetch-depth"));
 }
 
 #[test]
