@@ -1,4 +1,5 @@
 use quick_xml::{Reader, XmlVersion, events::Event};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -226,8 +227,22 @@ struct WorkflowStep {
     release_files: Vec<String>,
     run: Option<String>,
     condition: Option<String>,
+    id: Option<String>,
+    environment: BTreeMap<String, String>,
     fields: BTreeSet<String>,
     inputs: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug)]
+struct WorkflowJob {
+    name: String,
+    metadata: String,
+}
+
+#[derive(Debug)]
+struct ParsedWorkflow {
+    jobs: Vec<WorkflowJob>,
+    steps: Vec<WorkflowStep>,
 }
 
 fn yaml_indent(line: &str) -> Result<usize, &'static str> {
@@ -366,7 +381,7 @@ fn validate_workflow_step_shape(step: &WorkflowStep) -> Result<(), &'static str>
     Ok(())
 }
 
-fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
+fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
     if workflow.lines().any(|line| line.trim() == "---") {
         return Err("multiple workflow documents are not accepted");
     }
@@ -389,6 +404,8 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
         .filter(|indent| *indent > 0)
         .min()
         .ok_or("workflow jobs mapping is empty")?;
+    let mut jobs_seen = BTreeSet::new();
+    let mut parsed_jobs = Vec::new();
     let mut steps = Vec::new();
     let mut job_start = jobs_start + 1;
     while job_start < lines.len() {
@@ -402,6 +419,9 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
             .filter(|job| !job.is_empty())
             .ok_or("malformed workflow job mapping")?
             .to_owned();
+        if !jobs_seen.insert(job.clone()) {
+            return Err("duplicate workflow job key");
+        }
         let mut job_end = job_start + 1;
         while job_end < lines.len() {
             let indent = yaml_indent(lines[job_end])?;
@@ -418,6 +438,23 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
         }
         let steps_mapping = step_mappings[0];
         let steps_indent = yaml_indent(lines[steps_mapping])?;
+        let metadata_indent = job_indent + 2;
+        let metadata = lines[job_start + 1..steps_mapping]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let indent = yaml_indent(line)?;
+                if indent < metadata_indent {
+                    return Err("workflow job metadata escaped its mapping");
+                }
+                Ok(line[metadata_indent..].trim_end())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        parsed_jobs.push(WorkflowJob {
+            name: job.clone(),
+            metadata,
+        });
         let mut sequence_end = steps_mapping + 1;
         while sequence_end < job_end {
             let indent = yaml_indent(lines[sequence_end])?;
@@ -466,6 +503,8 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                 release_files: Vec::new(),
                 run: None,
                 condition: None,
+                id: None,
+                environment: BTreeMap::new(),
                 fields: BTreeSet::new(),
                 inputs: BTreeMap::new(),
             };
@@ -609,11 +648,14 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             if !variables.insert(variable) {
                                 return Err("duplicate workflow environment key");
                             }
-                            yaml_scalar(value)?;
+                            step.environment
+                                .insert(variable.to_owned(), yaml_scalar(value)?);
                         }
                     }
                     "id" => {
-                        yaml_scalar(value)?;
+                        if step.id.replace(yaml_scalar(value)?).is_some() {
+                            return Err("duplicate workflow step id");
+                        }
                     }
                     "if" => {
                         if step.condition.replace(yaml_scalar(value)?).is_some() {
@@ -628,7 +670,10 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
         }
         job_start = job_end;
     }
-    Ok(steps)
+    Ok(ParsedWorkflow {
+        jobs: parsed_jobs,
+        steps,
+    })
 }
 
 fn shell_words(line: &str) -> Vec<String> {
@@ -1061,6 +1106,593 @@ fn require_action_inputs(step: &WorkflowStep, expected: &[&str]) -> Result<(), &
         .ok_or("release-affecting action input set changed")
 }
 
+enum ExpectedWorkflowStepKind {
+    Action {
+        uses: &'static str,
+        inputs: &'static [(&'static str, &'static [&'static str])],
+    },
+    Run {
+        sha256: &'static str,
+    },
+}
+
+// These exact refs and body digests detect reviewed workflow changes. Marketplace tags remain
+// mutable upstream references; this contract is not a substitute for pinning actions to commits.
+struct ExpectedWorkflowStep {
+    name: Option<&'static str>,
+    fields: &'static [&'static str],
+    id: Option<&'static str>,
+    condition: Option<&'static str>,
+    environment: &'static [(&'static str, &'static str)],
+    kind: ExpectedWorkflowStepKind,
+}
+
+fn action_contract(
+    name: Option<&'static str>,
+    fields: &'static [&'static str],
+    uses: &'static str,
+    inputs: &'static [(&'static str, &'static [&'static str])],
+) -> ExpectedWorkflowStep {
+    ExpectedWorkflowStep {
+        name,
+        fields,
+        id: None,
+        condition: None,
+        environment: &[],
+        kind: ExpectedWorkflowStepKind::Action { uses, inputs },
+    }
+}
+
+fn run_contract(
+    name: &'static str,
+    fields: &'static [&'static str],
+    sha256: &'static str,
+) -> ExpectedWorkflowStep {
+    ExpectedWorkflowStep {
+        name: Some(name),
+        fields,
+        id: None,
+        condition: None,
+        environment: &[],
+        kind: ExpectedWorkflowStepKind::Run { sha256 },
+    }
+}
+
+const WINDOWS_BUILD_ENV: &[(&str, &str)] = &[
+    (
+        "PKG_CONFIG_PATH",
+        "${{ github.workspace }}\\vcpkg_installed\\x64-windows-v3-static-md-release\\lib\\pkgconfig",
+    ),
+    ("VCPKGRS_TRIPLET", "x64-windows-v3-static-md-release"),
+    (
+        "VCPKG_INSTALLED_DIR",
+        "${{ github.workspace }}\\vcpkg_installed",
+    ),
+    ("VCPKG_ROOT", "${{ github.workspace }}\\vcpkg"),
+];
+
+fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
+    let checkout = || action_contract(None, &["uses"], "actions/checkout@v7", &[]);
+    let cargo_chef_cache = || {
+        action_contract(
+            Some("Cargo Chef Cache"),
+            &["name", "uses", "with"],
+            "actions/cache@v6",
+            &[
+                (
+                    "key",
+                    &["${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}"],
+                ),
+                ("path", &["target"]),
+                ("restore-keys", &["${{ runner.os }}-cargo-chef-"]),
+            ],
+        )
+    };
+    match job {
+        "build-windows" => {
+            let mut setup_vcpkg = action_contract(
+                Some("Setup vcpkg"),
+                &["env", "if", "name", "uses", "with"],
+                "lukka/run-vcpkg@v11",
+                &[
+                    ("runVcpkgInstall", &["true"]),
+                    ("vcpkgDirectory", &["${{ github.workspace }}/vcpkg"]),
+                    (
+                        "vcpkgGitCommitId",
+                        &["9e593bb18ea69cc5095e012465dcd675a822ed0d"],
+                    ),
+                    ("vcpkgJsonGlob", &["vcpkg.json"]),
+                ],
+            );
+            setup_vcpkg.condition = Some("steps.vcpkg-cache.outputs.cache-hit != 'true'");
+            setup_vcpkg.environment = &[
+                ("VCPKG_DEFAULT_TRIPLET", "x64-windows-v3-static-md-release"),
+                (
+                    "VCPKG_INSTALLED_DIR",
+                    "${{ github.workspace }}/vcpkg_installed",
+                ),
+                (
+                    "VCPKG_OVERLAY_PORTS",
+                    "${{ github.workspace }}/vcpkg-overlays",
+                ),
+                ("VCPKG_OVERLAY_TRIPLETS", "${{ github.workspace }}/triplets"),
+            ];
+            let mut vcpkg_cache = action_contract(
+                Some("Cache vcpkg installed packages"),
+                &["id", "name", "uses", "with"],
+                "actions/cache@v6",
+                &[
+                    (
+                        "key",
+                        &[
+                            "Windows-vcpkg-x86-64-v3-static-md-release-v1-${{ hashFiles('vcpkg.json','triplets/**','vcpkg-overlays/**') }}",
+                        ],
+                    ),
+                    ("path", &["vcpkg_installed"]),
+                    (
+                        "restore-keys",
+                        &[
+                            "Windows-vcpkg-x86-64-v3-static-md-release-v1-",
+                            "Windows-vcpkg-x86-64-v3-static-md-release-",
+                        ],
+                    ),
+                ],
+            );
+            vcpkg_cache.id = Some("vcpkg-cache");
+            let mut chef_cook = run_contract(
+                "Cargo Chef Cook",
+                &["env", "name", "run"],
+                "29f29d0535c8f3c137489672ae7d7a0529354cf3332d69b478dbeae9bd41cb76",
+            );
+            chef_cook.environment = WINDOWS_BUILD_ENV;
+            let mut build_release = run_contract(
+                "Build Release",
+                &["env", "name", "run"],
+                "f1517d35b1a3ebba293eb7e94e148f19cd618605fd21da52b356ddda5f1422fa",
+            );
+            build_release.environment = WINDOWS_BUILD_ENV;
+            let mut wix = run_contract(
+                "Build MSI Installer",
+                &["env", "name", "run"],
+                "9ea8fa24c7d6e4a3ba4b8e32bd26230ed34866603547726b376d3374e977bf76",
+            );
+            wix.environment = WINDOWS_BUILD_ENV;
+            let mut diagnostic = run_contract(
+                "Debug VCPKG Location",
+                &["if", "name", "run"],
+                "85010132de2cc626799258201c395bc9f79074614862335de05948b81edc3d44",
+            );
+            diagnostic.condition = Some("always()");
+            Some(vec![
+                checkout(),
+                action_contract(
+                    Some("Setup Rust"),
+                    &["name", "uses", "with"],
+                    "dtolnay/rust-toolchain@1.98.0",
+                    &[("targets", &["x86_64-pc-windows-msvc"])],
+                ),
+                action_contract(
+                    Some("Install cargo-chef and cargo-wix"),
+                    &["name", "uses", "with"],
+                    "taiki-e/install-action@v2",
+                    &[("tool", &["cargo-chef,cargo-wix"])],
+                ),
+                action_contract(
+                    Some("Cargo Registry Cache"),
+                    &["name", "uses", "with"],
+                    "actions/cache@v6",
+                    &[
+                        (
+                            "key",
+                            &["Windows-cargo-registry-${{ hashFiles('**/Cargo.lock') }}"],
+                        ),
+                        (
+                            "path",
+                            &[
+                                "C:\\Users\\runneradmin\\.cargo\\registry",
+                                "C:\\Users\\runneradmin\\.cargo\\git",
+                            ],
+                        ),
+                        ("restore-keys", &["Windows-cargo-registry-"]),
+                    ],
+                ),
+                action_contract(
+                    Some("Export GitHub Actions cache env for vcpkg"),
+                    &["name", "uses", "with"],
+                    "actions/github-script@v9",
+                    &[(
+                        "script",
+                        &[
+                            "core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);",
+                            "core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);",
+                        ],
+                    )],
+                ),
+                vcpkg_cache,
+                setup_vcpkg,
+                run_contract(
+                    "Cargo Chef Prepare",
+                    &["name", "run"],
+                    "c6b1ac40a713e18000d525ae4eb8e6cab4377d32f90c2a5cf58ab378d2a1f14e",
+                ),
+                cargo_chef_cache(),
+                chef_cook,
+                run_contract(
+                    "Restore Source Code",
+                    &["name", "run"],
+                    "4bda61bee0859f911423f15bfc2b6334a840095263d3a611eea746fbb6b29230",
+                ),
+                build_release,
+                wix,
+                run_contract(
+                    "Verify Windows package outputs",
+                    &["name", "run"],
+                    "a67e81930f427e8135ba6499edb06664aeb9bb5d72f8a7c6af4eecd9b007536d",
+                ),
+                action_contract(
+                    Some("Upload EXE"),
+                    &["name", "uses", "with"],
+                    "actions/upload-artifact@v7",
+                    &[
+                        ("name", &["server-windows-amd64"]),
+                        (
+                            "path",
+                            &[
+                                "target/x86_64-pc-windows-msvc/release/server.exe",
+                                "target/x86_64-pc-windows-msvc/release/settings-gui.exe",
+                                "target/x86_64-pc-windows-msvc/release/stremio-runtime.exe",
+                                "target/x86_64-pc-windows-msvc/release/stream-server-updater.exe",
+                            ],
+                        ),
+                    ],
+                ),
+                action_contract(
+                    Some("Upload MSI"),
+                    &["name", "uses", "with"],
+                    "actions/upload-artifact@v7",
+                    &[
+                        ("name", &["server-windows-msi"]),
+                        ("path", &["target/wix/*.msi"]),
+                    ],
+                ),
+                diagnostic,
+            ])
+        }
+        "build-linux" => Some(vec![
+            checkout(),
+            action_contract(
+                Some("Setup Rust"),
+                &["name", "uses"],
+                "dtolnay/rust-toolchain@1.98.0",
+                &[],
+            ),
+            action_contract(
+                Some("Install cargo-chef and cargo-deb"),
+                &["name", "uses", "with"],
+                "taiki-e/install-action@v2",
+                &[("tool", &["cargo-chef,cargo-deb"])],
+            ),
+            run_contract(
+                "Install System Dependencies",
+                &["name", "run"],
+                "dec83f6f9886e3baa4cf53f471988cbffadf7996108ddca581eccf981fbd7b8d",
+            ),
+            run_contract(
+                "Install libtorrent 2.1.1",
+                &["name", "run"],
+                "76f3af92afe15b45fe9102a4947fb200dd9d3fd0511f5575fa35ea5c0dfed7d3",
+            ),
+            run_contract(
+                "Cargo Chef Prepare",
+                &["name", "run"],
+                "c6b1ac40a713e18000d525ae4eb8e6cab4377d32f90c2a5cf58ab378d2a1f14e",
+            ),
+            cargo_chef_cache(),
+            run_contract(
+                "Cargo Chef Cook",
+                &["name", "run"],
+                "92886be0eb5912f4d712014a8671b43f6361124b847a6ebe39bb5abe7979479e",
+            ),
+            run_contract(
+                "Restore Source Code",
+                &["name", "run"],
+                "0f70544612144d3e9b62a52af72a97af1b786b7fe1f1fe9eccbb5c39520971ff",
+            ),
+            run_contract(
+                "Build Release",
+                &["name", "run"],
+                "1aa014a51366982f83476ef476780ba696a884b6222c043410b194f19af979a0",
+            ),
+            run_contract(
+                "Build DEB Package",
+                &["name", "run"],
+                "40bdac12b73ccf8a82832a96f761a267a54d4248bd98b71b200729516d6eed10",
+            ),
+            run_contract(
+                "Build AppImage",
+                &["name", "run"],
+                "d7f06905910d4852347f69d1e994ba90631af02db2dc6b6b14d6bdd9037dbff8",
+            ),
+            run_contract(
+                "Verify Linux package outputs",
+                &["name", "run"],
+                "b001aa192422dde960d2d22810b06869bd7ab4c2d9cef041837a0d5f0092d072",
+            ),
+            action_contract(
+                Some("Upload Binary"),
+                &["name", "uses", "with"],
+                "actions/upload-artifact@v7",
+                &[
+                    ("name", &["server-linux-amd64"]),
+                    (
+                        "path",
+                        &["target/release/server", "target/release/settings-gui"],
+                    ),
+                ],
+            ),
+            action_contract(
+                Some("Upload DEB"),
+                &["name", "uses", "with"],
+                "actions/upload-artifact@v7",
+                &[
+                    ("name", &["server-linux-deb"]),
+                    ("path", &["target/debian/*.deb"]),
+                ],
+            ),
+            action_contract(
+                Some("Upload AppImage"),
+                &["name", "uses", "with"],
+                "actions/upload-artifact@v7",
+                &[
+                    ("name", &["server-linux-appimage"]),
+                    ("path", &["stream-server-linux-amd64.AppImage"]),
+                ],
+            ),
+        ]),
+        "build-arch" => Some(vec![
+            checkout(),
+            run_contract(
+                "Install dependencies",
+                &["name", "run"],
+                "ee970bab560461f7a944fc9279961b66f116984a5df63bfb1b670197fb0e5587",
+            ),
+            run_contract(
+                "Install Rust 1.98.0",
+                &["name", "run"],
+                "4c98b0be1963212e20387ed4a5f4f5925a18715c5ac0da14bfd01b60dcc62b6e",
+            ),
+            run_contract(
+                "Install libtorrent 2.1.1",
+                &["name", "run"],
+                "76f3af92afe15b45fe9102a4947fb200dd9d3fd0511f5575fa35ea5c0dfed7d3",
+            ),
+            action_contract(
+                Some("Cargo Cache"),
+                &["name", "uses", "with"],
+                "actions/cache@v6",
+                &[
+                    ("key", &["arch-cargo-${{ hashFiles('**/Cargo.lock') }}"]),
+                    (
+                        "path",
+                        &["target", "/root/.cargo/registry", "/root/.cargo/git"],
+                    ),
+                    ("restore-keys", &["arch-cargo-"]),
+                ],
+            ),
+            run_contract(
+                "Build binary",
+                &["name", "run"],
+                "1aa014a51366982f83476ef476780ba696a884b6222c043410b194f19af979a0",
+            ),
+            run_contract(
+                "Create PKGBUILD",
+                &["name", "run"],
+                "5e7a98c4d64256f1652e657aa04129e9488f1198d2f6b4e1d3ffff2da51dba67",
+            ),
+            run_contract(
+                "Build package",
+                &["name", "run"],
+                "78aa73723705b9ec25fbcd8cf0487216a069011b320ee9c7bf7e2ede468738bd",
+            ),
+            run_contract(
+                "Verify Arch package outputs",
+                &["name", "run"],
+                "c4350327d83d977d6369bba4c71170c6754c2138497fae6790d25adea586ab01",
+            ),
+            action_contract(
+                Some("Upload Arch Package"),
+                &["name", "uses", "with"],
+                "actions/upload-artifact@v7",
+                &[
+                    ("name", &["server-arch-pkg"]),
+                    ("path", &["pkg/*.pkg.tar.zst"]),
+                ],
+            ),
+        ]),
+        "release" => Some(vec![
+            action_contract(
+                None,
+                &["uses", "with"],
+                "actions/checkout@v7",
+                &[("fetch-depth", &["0"])],
+            ),
+            action_contract(
+                Some("Setup Rust for package gate"),
+                &["name", "uses"],
+                "dtolnay/rust-toolchain@1.98.0",
+                &[],
+            ),
+            run_contract(
+                "Install package gate dependencies",
+                &["name", "run"],
+                "dec83f6f9886e3baa4cf53f471988cbffadf7996108ddca581eccf981fbd7b8d",
+            ),
+            action_contract(
+                Some("Download all artifacts"),
+                &["name", "uses", "with"],
+                "actions/download-artifact@v8",
+                &[("path", &["artifacts"])],
+            ),
+            run_contract(
+                "Prepare release files",
+                &["name", "run"],
+                "dce2b7f66919e560183eb0f43e553bf54e62a15f86bf222de03521e57372c97b",
+            ),
+            run_contract(
+                "Generate release description",
+                &["name", "run"],
+                "15a262dd2230df45fa633bc211eb7659ff2670824d6e30a6d5b41287557bb5ab",
+            ),
+            run_contract(
+                "Verify final release outputs",
+                &["name", "run"],
+                "0f3550f13b64796dee5e5e9f9bbd91af05138c049c274e5dbb1339da1bb05a12",
+            ),
+            action_contract(
+                Some("Create GitHub Release"),
+                &["name", "uses", "with"],
+                "softprops/action-gh-release@v3",
+                &[
+                    ("body_path", &["${{ github.workspace }}/RELEASE_BODY.md"]),
+                    ("files", &["release/*"]),
+                    ("generate_release_notes", &["false"]),
+                    (
+                        "prerelease",
+                        &[
+                            "${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}",
+                        ],
+                    ),
+                ],
+            ),
+        ]),
+        _ => None,
+    }
+}
+
+fn exact_string_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect()
+}
+
+fn exact_values_map(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+    entries
+        .iter()
+        .map(|(key, values)| {
+            (
+                (*key).to_owned(),
+                values.iter().map(|value| (*value).to_owned()).collect(),
+            )
+        })
+        .collect()
+}
+
+fn validate_exact_packaging_step(
+    actual: &WorkflowStep,
+    expected: &ExpectedWorkflowStep,
+) -> Result<(), &'static str> {
+    let expected_fields = expected
+        .fields
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual.name.as_deref() != expected.name
+        || actual.fields != expected_fields
+        || actual.id.as_deref() != expected.id
+        || actual.condition.as_deref() != expected.condition
+        || actual.environment != exact_string_map(expected.environment)
+    {
+        return Err("packaging workflow step metadata changed");
+    }
+    match &expected.kind {
+        ExpectedWorkflowStepKind::Action { uses, inputs } => {
+            if actual.uses.as_deref() != Some(*uses)
+                || actual.run.is_some()
+                || actual.inputs != exact_values_map(inputs)
+            {
+                return Err("packaging workflow action contract changed");
+            }
+        }
+        ExpectedWorkflowStepKind::Run { sha256 } => {
+            let run = actual.run.as_deref().ok_or("packaging run step missing")?;
+            if actual.uses.is_some()
+                || !actual.inputs.is_empty()
+                || hex::encode(Sha256::digest(run.trim().as_bytes())) != *sha256
+            {
+                return Err("packaging workflow run contract changed");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_packaging_job_metadata(job: &str) -> Option<&'static str> {
+    match job {
+        "build-windows" => Some(
+            "name: Build Windows\nruns-on: windows-2022\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\nenv:\n  VCPKG_BINARY_SOURCES: \"clear;x-gha,readwrite\"",
+        ),
+        "build-linux" => Some(
+            "name: Build Linux\nruns-on: ubuntu-24.04\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\nenv:\n  LIBTORRENT_STATIC: \"1\"\n  PKG_CONFIG_PATH: /usr/local/lib/pkgconfig",
+        ),
+        "build-arch" => Some(
+            "name: Build Arch Linux\nruns-on: ubuntu-latest\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\ncontainer: archlinux:latest\nenv:\n  LIBTORRENT_STATIC: \"1\"\n  PKG_CONFIG_PATH: /usr/local/lib/pkgconfig",
+        ),
+        "release" => Some(
+            "name: Create Release\nneeds: [build-windows, build-linux, build-arch]\nruns-on: ubuntu-latest\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\npermissions:\n  contents: write",
+        ),
+        _ => None,
+    }
+}
+
+fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'static str> {
+    for job in ["build-windows", "build-linux", "build-arch", "release"] {
+        let metadata = parsed
+            .jobs
+            .iter()
+            .find(|candidate| candidate.name == job)
+            .ok_or("packaging workflow job missing")?;
+        if Some(metadata.metadata.as_str()) != expected_packaging_job_metadata(job) {
+            return Err("packaging workflow job metadata changed");
+        }
+        let actual = parsed
+            .steps
+            .iter()
+            .filter(|step| step.job == job)
+            .collect::<Vec<_>>();
+        let expected = expected_packaging_steps(job).ok_or("packaging step contract missing")?;
+        if actual.len() != expected.len() {
+            return Err("packaging workflow step count changed");
+        }
+        for (actual, expected) in actual.into_iter().zip(&expected) {
+            validate_exact_packaging_step(actual, expected)?;
+        }
+    }
+    for job in parsed.jobs.iter().filter(|job| {
+        !matches!(
+            job.name.as_str(),
+            "check" | "check-windows" | "build-windows" | "build-linux" | "build-arch" | "release"
+        )
+    }) {
+        if job
+            .metadata
+            .lines()
+            .any(|line| line.trim_start().starts_with("permissions:"))
+            || parsed.steps.iter().any(|step| {
+                step.job == job.name
+                    && step.uses.as_deref().is_some_and(|action| {
+                        action.contains("upload-artifact")
+                            || action.contains("download-artifact")
+                            || action.contains("action-gh-release")
+                    })
+            })
+        {
+            return Err("additional workflow job can affect release publication");
+        }
+    }
+    Ok(())
+}
+
 fn expected_package_upload_suffix(job: &str) -> Option<&'static [&'static str]> {
     match job {
         "build-windows" => Some(&["server-windows-amd64", "server-windows-msi"]),
@@ -1107,8 +1739,8 @@ fn validate_workflow_order_and_prerequisites(
             .get(job)
             .ok_or("package completion ordinal missing")?;
         let gate = gates.get(job).ok_or("package verifier ordinal missing")?;
-        if completion >= gate {
-            return Err("package verifier does not follow package creation");
+        if completion + 1 != *gate {
+            return Err("package verifier does not immediately follow package creation");
         }
         let job_steps = steps
             .iter()
@@ -1240,7 +1872,9 @@ fn enumerate_authoritative_sources(
 ) -> Result<ReleaseInventory, &'static str> {
     let wix = wix_sources(wix)?;
     let deb = cargo_deb_sources(cargo)?;
-    let steps = workflow_steps(workflow)?;
+    let parsed = workflow_steps(workflow)?;
+    validate_packaging_job_contract(&parsed)?;
+    let steps = parsed.steps;
     let appimage_run = steps
         .iter()
         .find_map(|step| {
@@ -2324,6 +2958,262 @@ fn workflow_contract_allows_only_the_exact_post_upload_diagnostic_tail() {
     assert!(
         escaped.is_empty(),
         "post-upload tail mutations escaped the contract: {escaped:?}"
+    );
+}
+
+#[test]
+fn packaging_jobs_reject_extra_duplicate_or_mutated_pre_verifier_steps() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_six_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-seven ordered-step baseline");
+
+    let mut mutations = vec![
+        (
+            "duplicate github-script",
+            insert_workflow_step_after(
+                &compliant,
+                "Build Release",
+                "name: Replace verified source\n        uses: actions/github-script@v9\n        with:\n          script: |\n            require('fs').writeFileSync('target/x86_64-pc-windows-msvc/release/server.exe', 'MZ')",
+            ),
+        ),
+        (
+            "changed github-script body",
+            compliant.replace(
+                "core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);",
+                "require('fs').writeFileSync('target/x86_64-pc-windows-msvc/release/server.exe', 'MZ');",
+            ),
+        ),
+        (
+            "changed cache path",
+            compliant.replace("          path: target\n", "          path: payload\n"),
+        ),
+        (
+            "changed cache key",
+            compliant.replace(
+                "          key: arch-cargo-${{ hashFiles('**/Cargo.lock') }}",
+                "          key: attacker-controlled-cache",
+            ),
+        ),
+        (
+            "changed cache restore key",
+            compliant.replace("            arch-cargo-", "            attacker-cache-"),
+        ),
+        (
+            "changed toolchain target",
+            compliant.replace("          targets: x86_64-pc-windows-msvc", "          targets: aarch64-pc-windows-msvc"),
+        ),
+        (
+            "changed checkout fetch depth",
+            compliant.replace("          fetch-depth: 0", "          fetch-depth: 1"),
+        ),
+        (
+            "changed install-action tool list",
+            compliant.replace("          tool: cargo-chef,cargo-wix", "          tool: cargo-chef"),
+        ),
+        (
+            "changed vcpkg commit",
+            compliant.replace(
+                "          vcpkgGitCommitId: '9e593bb18ea69cc5095e012465dcd675a822ed0d'",
+                "          vcpkgGitCommitId: '0000000000000000000000000000000000000000'",
+            ),
+        ),
+        (
+            "changed action environment",
+            compliant.replace(
+                "          VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release",
+                "          VCPKG_DEFAULT_TRIPLET: attacker",
+            ),
+        ),
+        (
+            "pre-verifier failure field",
+            compliant.replace(
+                "      - name: Build MSI Installer\n",
+                "      - name: Build MSI Installer\n        continue-on-error: true\n",
+            ),
+        ),
+    ];
+
+    for (verifier, preceding) in [
+        ("Verify Windows package outputs", "Build MSI Installer"),
+        ("Verify Linux package outputs", "Build AppImage"),
+        ("Verify Arch package outputs", "Build package"),
+        (
+            "Verify final release outputs",
+            "Generate release description",
+        ),
+    ] {
+        mutations.push((
+            verifier,
+            insert_workflow_step_after(
+                &compliant,
+                preceding,
+                "name: Mutate before verifier\n        run: echo replace verified payload",
+            ),
+        ));
+        mutations.push((
+            verifier,
+            insert_workflow_step_after(&compliant, preceding, "uses: actions/checkout@v7"),
+        ));
+    }
+
+    for (label, preceding) in [
+        ("duplicate Windows cache", "Build Release"),
+        ("duplicate Linux cache", "Build DEB Package"),
+        ("duplicate Arch cache", "Build binary"),
+    ] {
+        mutations.push((
+            label,
+            insert_workflow_step_after(
+                &compliant,
+                preceding,
+                "name: Duplicate cache\n        uses: actions/cache@v6\n        with:\n          path: payload\n          key: duplicate\n          restore-keys: duplicate-",
+            ),
+        ));
+    }
+
+    for (label, preceding) in [
+        ("duplicate Windows toolchain", "Build Release"),
+        ("duplicate Linux toolchain", "Build DEB Package"),
+        (
+            "duplicate release toolchain",
+            "Generate release description",
+        ),
+    ] {
+        mutations.push((
+            label,
+            insert_workflow_step_after(
+                &compliant,
+                preceding,
+                "name: Duplicate toolchain\n        uses: dtolnay/rust-toolchain@1.98.0",
+            ),
+        ));
+    }
+
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "pre-verifier action/run mutations escaped: {escaped:?}"
+    );
+}
+
+#[test]
+fn packaging_jobs_reject_changed_or_duplicate_job_level_semantics() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_six_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-seven job contract baseline");
+
+    let mutations = [
+        (
+            "changed runner",
+            compliant.replace("    runs-on: windows-2022", "    runs-on: self-hosted"),
+        ),
+        (
+            "changed job condition",
+            compliant.replace(
+                "    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'",
+                "    if: always()",
+            ),
+        ),
+        (
+            "changed job environment",
+            compliant.replace(
+                "      VCPKG_BINARY_SOURCES: \"clear;x-gha,readwrite\"",
+                "      VCPKG_BINARY_SOURCES: attacker",
+            ),
+        ),
+        (
+            "changed container",
+            compliant.replace("    container: archlinux:latest", "    container: attacker/image:latest"),
+        ),
+        (
+            "changed release needs",
+            compliant.replace(
+                "    needs: [build-windows, build-linux, build-arch]",
+                "    needs: [build-windows]",
+            ),
+        ),
+        (
+            "changed release permission",
+            compliant.replace("      contents: write", "      contents: read"),
+        ),
+        (
+            "job defaults alter run meaning",
+            compliant.replace(
+                "    runs-on: windows-2022\n",
+                "    runs-on: windows-2022\n    defaults:\n      run:\n        shell: cmd\n",
+            ),
+        ),
+        (
+            "job strategy changes execution",
+            compliant.replace(
+                "    runs-on: ubuntu-24.04\n",
+                "    runs-on: ubuntu-24.04\n    strategy:\n      matrix:\n        payload: [safe, attacker]\n",
+            ),
+        ),
+        (
+            "job service adds mutable input",
+            compliant.replace(
+                "    container: archlinux:latest\n",
+                "    container: archlinux:latest\n    services:\n      payload:\n        image: attacker/image:latest\n",
+            ),
+        ),
+        (
+            "duplicate participating job key",
+            compliant.replace(
+                "  release:\n",
+                "  build-windows:\n    runs-on: windows-2022\n    steps:\n      - run: echo shadow\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional contents-write job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-release:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - run: echo shadow\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional artifact-upload job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-upload:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/upload-artifact@v7\n        with:\n          name: shadow\n          path: payload\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional artifact-download job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-download:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/download-artifact@v8\n        with:\n          path: payload\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional release-publication job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-publication:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: softprops/action-gh-release@v3\n        with:\n          files: payload/*\n          body_path: body.md\n          generate_release_notes: false\n          prerelease: false\n\n  release:\n",
+            ),
+        ),
+    ];
+
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "packaging job-level mutations escaped: {escaped:?}"
     );
 }
 
