@@ -285,6 +285,79 @@ fn yaml_field(value: &str) -> Option<(&str, &str)> {
     .then_some((key, value.trim()))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct YamlMappingEntry<'a> {
+    key: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn yaml_mapping_entries<'a>(
+    lines: &'a [&'a str],
+    start: usize,
+    end: usize,
+    entry_indent: usize,
+) -> Result<Vec<YamlMappingEntry<'a>>, &'static str> {
+    let mut entries = Vec::new();
+    let mut keys = BTreeSet::new();
+    let mut cursor = start;
+    while cursor < end {
+        if lines[cursor].trim().is_empty() {
+            cursor += 1;
+            continue;
+        }
+        if yaml_indent(lines[cursor])? != entry_indent {
+            return Err("workflow mapping contains malformed or unconsumed indentation");
+        }
+        let (key, _) = yaml_field(lines[cursor].trim())
+            .ok_or("workflow mapping key must be an unquoted plain scalar")?;
+        if !keys.insert(key) {
+            return Err("duplicate workflow mapping key");
+        }
+        let mut entry_end = cursor + 1;
+        while entry_end < end {
+            if lines[entry_end].trim().is_empty() {
+                entry_end += 1;
+                continue;
+            }
+            let indent = yaml_indent(lines[entry_end])?;
+            if indent < entry_indent {
+                return Err("workflow mapping escaped its parent indentation");
+            }
+            if indent == entry_indent {
+                break;
+            }
+            entry_end += 1;
+        }
+        entries.push(YamlMappingEntry {
+            key,
+            start: cursor,
+            end: entry_end,
+        });
+        cursor = entry_end;
+    }
+    Ok(entries)
+}
+
+fn canonical_mapping_entry(
+    lines: &[&str],
+    entry: YamlMappingEntry<'_>,
+    base_indent: usize,
+) -> Result<String, &'static str> {
+    lines[entry.start..entry.end]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let indent = yaml_indent(line)?;
+            if indent < base_indent {
+                return Err("workflow mapping content escaped its declaration");
+            }
+            Ok(line[base_indent..].trim_end())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|lines| lines.join("\n"))
+}
+
 fn block_value(
     lines: &[&str],
     start: usize,
@@ -382,96 +455,86 @@ fn validate_workflow_step_shape(step: &WorkflowStep) -> Result<(), &'static str>
 }
 
 fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
-    if workflow.lines().any(|line| line.trim() == "---") {
-        return Err("multiple workflow documents are not accepted");
+    // The structural parser below assigns semantics to every mapping entry. This reviewed-source
+    // fingerprint is the final full-consumption guard for comments, blank-line placement, and
+    // nested text that YAML treats as non-semantic or that a bounded grammar could otherwise skip.
+    // It authenticates repository declaration text only, not mutable marketplace action tags.
+    const EXPECTED_WORKFLOW_SHA256: &str =
+        "654bf0da63cb8cb22899fcef86ce70c162fee7b78ad1f62a1502a5cea1ef759f";
+    let normalized_workflow = workflow.replace("\r\n", "\n");
+    if hex::encode(Sha256::digest(normalized_workflow.as_bytes())) != EXPECTED_WORKFLOW_SHA256 {
+        return Err("complete release workflow declaration changed");
     }
     let lines = workflow.lines().collect::<Vec<_>>();
-    let jobs = lines
+    if lines
         .iter()
-        .enumerate()
-        .filter_map(|(index, line)| (line.trim() == "jobs:").then_some((index, *line)))
-        .collect::<Vec<_>>();
-    if jobs.len() != 1 || yaml_indent(jobs[0].1)? != 0 {
-        return Err("workflow must contain one top-level jobs mapping");
+        .any(|line| matches!(line.trim(), "---" | "..."))
+    {
+        return Err("workflow document markers are not accepted");
     }
-    let jobs_start = jobs[0].0;
-    let job_indent = lines[jobs_start + 1..]
+    for line in &lines {
+        yaml_indent(line)?;
+    }
+    let top = yaml_mapping_entries(&lines, 0, lines.len(), 0)?;
+    if top.iter().map(|entry| entry.key).collect::<Vec<_>>()
+        != ["name", "on", "permissions", "env", "jobs"]
+    {
+        return Err("top-level workflow mapping changed");
+    }
+    let expected_top = [
+        "name: Release Build",
+        "on:\n  push:\n    branches: [ \"master\" ]\n    tags: [ \"v*\" ]\n  pull_request:\n    branches: [ \"master\" ]\n  workflow_dispatch:",
+        "permissions:\n  contents: read",
+        "env:\n  CARGO_TERM_COLOR: always\n  CARGO_NET_RETRY: 10\n  CARGO_HTTP_MULTIPLEXING: false",
+    ];
+    for (entry, expected) in top.iter().take(4).zip(expected_top) {
+        if canonical_mapping_entry(&lines, *entry, 0)? != expected {
+            return Err("top-level workflow authority changed");
+        }
+    }
+    let jobs_entry = *top.last().ok_or("workflow jobs mapping missing")?;
+    let job_entries = yaml_mapping_entries(&lines, jobs_entry.start + 1, jobs_entry.end, 2)?;
+    if job_entries
         .iter()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| yaml_indent(line))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|indent| *indent > 0)
-        .min()
-        .ok_or("workflow jobs mapping is empty")?;
-    let mut jobs_seen = BTreeSet::new();
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>()
+        != [
+            "check",
+            "check-windows",
+            "build-windows",
+            "build-linux",
+            "build-arch",
+            "release",
+        ]
+    {
+        return Err("workflow job inventory changed");
+    }
     let mut parsed_jobs = Vec::new();
     let mut steps = Vec::new();
-    let mut job_start = jobs_start + 1;
-    while job_start < lines.len() {
-        if lines[job_start].trim().is_empty() || yaml_indent(lines[job_start])? != job_indent {
-            job_start += 1;
-            continue;
-        }
-        let job = lines[job_start]
-            .trim()
-            .strip_suffix(':')
-            .filter(|job| !job.is_empty())
-            .ok_or("malformed workflow job mapping")?
-            .to_owned();
-        if !jobs_seen.insert(job.clone()) {
-            return Err("duplicate workflow job key");
-        }
-        let mut job_end = job_start + 1;
-        while job_end < lines.len() {
-            let indent = yaml_indent(lines[job_end])?;
-            if !lines[job_end].trim().is_empty() && indent <= job_indent {
-                break;
-            }
-            job_end += 1;
-        }
-        let step_mappings = (job_start + 1..job_end)
-            .filter(|index| lines[*index].trim() == "steps:")
+    for job_entry in job_entries {
+        let job = job_entry.key.to_owned();
+        let job_fields = yaml_mapping_entries(&lines, job_entry.start + 1, job_entry.end, 4)?;
+        let step_mappings = job_fields
+            .iter()
+            .filter(|entry| entry.key == "steps")
             .collect::<Vec<_>>();
         if step_mappings.len() != 1 {
             return Err("workflow job must contain one steps sequence");
         }
-        let steps_mapping = step_mappings[0];
-        let steps_indent = yaml_indent(lines[steps_mapping])?;
-        let metadata_indent = job_indent + 2;
-        let metadata = lines[job_start + 1..steps_mapping]
+        let steps_mapping = *step_mappings[0];
+        let metadata = job_fields
             .iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                let indent = yaml_indent(line)?;
-                if indent < metadata_indent {
-                    return Err("workflow job metadata escaped its mapping");
-                }
-                Ok(line[metadata_indent..].trim_end())
-            })
+            .filter(|entry| entry.key != "steps")
+            .map(|entry| canonical_mapping_entry(&lines, *entry, 4))
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
         parsed_jobs.push(WorkflowJob {
             name: job.clone(),
             metadata,
         });
-        let mut sequence_end = steps_mapping + 1;
-        while sequence_end < job_end {
-            let indent = yaml_indent(lines[sequence_end])?;
-            if !lines[sequence_end].trim().is_empty() && indent <= steps_indent {
-                break;
-            }
-            sequence_end += 1;
-        }
-        let list_indent = lines[steps_mapping + 1..sequence_end]
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| yaml_indent(line))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .min()
-            .ok_or("workflow steps sequence is empty")?;
-        let mut cursor = steps_mapping + 1;
+        let sequence_end = steps_mapping.end;
+        let list_indent = 6;
+        let mut cursor = steps_mapping.start + 1;
         let mut ordinal = 0;
         while cursor < sequence_end {
             if lines[cursor].trim().is_empty() {
@@ -668,7 +731,6 @@ fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
             validate_workflow_step_shape(&step)?;
             steps.push(step);
         }
-        job_start = job_end;
     }
     Ok(ParsedWorkflow {
         jobs: parsed_jobs,
@@ -1629,6 +1691,12 @@ fn validate_exact_packaging_step(
 
 fn expected_packaging_job_metadata(job: &str) -> Option<&'static str> {
     match job {
+        "check" => Some(
+            "name: Check\nruns-on: ubuntu-24.04\nif: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))\nenv:\n  LIBTORRENT_STATIC: \"1\"\n  PKG_CONFIG_PATH: /usr/local/lib/pkgconfig",
+        ),
+        "check-windows" => Some(
+            "name: Check Windows native FFI and shutdown\nruns-on: windows-2022\nif: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))\nenv:\n  LIBCLANG_PATH: C:\\Program Files\\LLVM\\bin",
+        ),
         "build-windows" => Some(
             "name: Build Windows\nruns-on: windows-2022\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\nenv:\n  VCPKG_BINARY_SOURCES: \"clear;x-gha,readwrite\"",
         ),
@@ -1645,8 +1713,60 @@ fn expected_packaging_job_metadata(job: &str) -> Option<&'static str> {
     }
 }
 
+fn validate_check_job_authority(step: &WorkflowStep) -> Result<(), &'static str> {
+    if step.id.is_some() || step.condition.is_some() || !step.environment.is_empty() {
+        return Err("check step gained token-bearing execution metadata");
+    }
+    if let Some(action) = step.uses.as_deref()
+        && !matches!(
+            action,
+            "actions/checkout@v7"
+                | "dtolnay/rust-toolchain@1.98.0"
+                | "taiki-e/install-action@v2"
+                | "actions/cache@v6"
+        )
+    {
+        return Err("check job gained a publication-capable action");
+    }
+    let token_or_publication = [
+        "github.token",
+        "github_token",
+        "secrets.github_token",
+        "gh api",
+        "api.github.com",
+        "uploads.github.com",
+        "authorization:",
+    ];
+    let values = step
+        .run
+        .iter()
+        .map(String::as_str)
+        .chain(
+            step.inputs
+                .values()
+                .flat_map(|values| values.iter().map(String::as_str)),
+        )
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if values.iter().any(|value| {
+        token_or_publication
+            .iter()
+            .any(|marker| value.contains(marker))
+    }) {
+        return Err("check job gained token-bearing publication behavior");
+    }
+    Ok(())
+}
+
 fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'static str> {
-    for job in ["build-windows", "build-linux", "build-arch", "release"] {
+    for job in [
+        "check",
+        "check-windows",
+        "build-windows",
+        "build-linux",
+        "build-arch",
+        "release",
+    ] {
         let metadata = parsed
             .jobs
             .iter()
@@ -1654,6 +1774,12 @@ fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'stat
             .ok_or("packaging workflow job missing")?;
         if Some(metadata.metadata.as_str()) != expected_packaging_job_metadata(job) {
             return Err("packaging workflow job metadata changed");
+        }
+        if matches!(job, "check" | "check-windows") {
+            for step in parsed.steps.iter().filter(|step| step.job == job) {
+                validate_check_job_authority(step)?;
+            }
+            continue;
         }
         let actual = parsed
             .steps
@@ -1666,28 +1792,6 @@ fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'stat
         }
         for (actual, expected) in actual.into_iter().zip(&expected) {
             validate_exact_packaging_step(actual, expected)?;
-        }
-    }
-    for job in parsed.jobs.iter().filter(|job| {
-        !matches!(
-            job.name.as_str(),
-            "check" | "check-windows" | "build-windows" | "build-linux" | "build-arch" | "release"
-        )
-    }) {
-        if job
-            .metadata
-            .lines()
-            .any(|line| line.trim_start().starts_with("permissions:"))
-            || parsed.steps.iter().any(|step| {
-                step.job == job.name
-                    && step.uses.as_deref().is_some_and(|action| {
-                        action.contains("upload-artifact")
-                            || action.contains("download-artifact")
-                            || action.contains("action-gh-release")
-                    })
-            })
-        {
-            return Err("additional workflow job can affect release publication");
         }
     }
     Ok(())
@@ -2649,6 +2753,18 @@ fn round_six_compliant_workflow(workflow: &str) -> String {
     )
 }
 
+fn round_eight_compliant_workflow(workflow: &str) -> String {
+    let workflow = round_six_compliant_workflow(workflow);
+    if workflow.contains("permissions:\n  contents: read") {
+        workflow
+    } else {
+        workflow.replace(
+            "env:\n  CARGO_TERM_COLOR: always",
+            "permissions:\n  contents: read\n\nenv:\n  CARGO_TERM_COLOR: always",
+        )
+    }
+}
+
 #[test]
 fn workflow_contract_rejects_order_and_failure_semantics_mutations() {
     let (_, wix, cargo, workflow) = repository_inputs();
@@ -3214,6 +3330,237 @@ fn packaging_jobs_reject_changed_or_duplicate_job_level_semantics() {
     assert!(
         escaped.is_empty(),
         "packaging job-level mutations escaped: {escaped:?}"
+    );
+}
+
+#[test]
+fn workflow_authority_contract_rejects_global_mapping_bypasses() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_eight_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-eight global authority baseline");
+
+    let mutations = [
+        (
+            "workflow defaults shell",
+            compliant.replace(
+                "permissions:\n  contents: read",
+                "defaults:\n  run:\n    shell: bash -e {0}\n\npermissions:\n  contents: read",
+            ),
+        ),
+        (
+            "global BASH_ENV",
+            compliant.replace(
+                "  CARGO_TERM_COLOR: always",
+                "  BASH_ENV: payload/replace-verifier.sh\n  CARGO_TERM_COLOR: always",
+            ),
+        ),
+        (
+            "global contents write",
+            compliant.replace("  contents: read", "  contents: write"),
+        ),
+        (
+            "quoted global permissions key",
+            compliant.replace(
+                "permissions:\n  contents: read",
+                "\"permissions\":\n  contents: write",
+            ),
+        ),
+        (
+            "duplicate global permissions",
+            compliant.replace(
+                "permissions:\n  contents: read",
+                "permissions:\n  contents: read\n\npermissions:\n  contents: write",
+            ),
+        ),
+        (
+            "duplicate global env",
+            compliant.replace(
+                "jobs:\n",
+                "env:\n  BASH_ENV: payload/replace-verifier.sh\n\njobs:\n",
+            ),
+        ),
+        (
+            "changed trigger authority",
+            compliant.replace(
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n  repository_dispatch:\n",
+            ),
+        ),
+        (
+            "unsupported global concurrency",
+            compliant.replace("jobs:\n", "concurrency: unsafe-release\n\njobs:\n"),
+        ),
+    ];
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "global workflow authority mutations escaped: {escaped:?}"
+    );
+}
+
+#[test]
+fn workflow_authority_contract_rejects_job_mapping_and_token_bypasses() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_eight_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-eight job authority baseline");
+
+    let mutations = [
+        (
+            "check permissions after steps",
+            compliant.replace(
+                "\n  check-windows:\n",
+                "\n    permissions:\n      contents: write\n\n  check-windows:\n",
+            ),
+        ),
+        (
+            "packaging defaults after steps",
+            compliant.replace(
+                "\n  build-linux:\n",
+                "\n    defaults:\n      run:\n        shell: cmd\n\n  build-linux:\n",
+            ),
+        ),
+        (
+            "packaging BASH_ENV after steps",
+            compliant.replace(
+                "\n  build-arch:\n",
+                "\n    env:\n      BASH_ENV: payload/replace-verifier.sh\n\n  build-arch:\n",
+            ),
+        ),
+        (
+            "duplicate runner after steps",
+            compliant.replace(
+                "\n  release:\n",
+                "\n    runs-on: self-hosted\n\n  release:\n",
+            ),
+        ),
+        (
+            "quoted check permissions",
+            compliant.replace(
+                "  check:\n    name: Check\n",
+                "  check:\n    name: Check\n    \"permissions\":\n      contents: write\n",
+            ),
+        ),
+        (
+            "check-windows contents write",
+            compliant.replace(
+                "  check-windows:\n    name: Check Windows native FFI and shutdown\n",
+                "  check-windows:\n    name: Check Windows native FFI and shutdown\n    permissions:\n      contents: write\n",
+            ),
+        ),
+        (
+            "check gh api publication",
+            insert_workflow_step_after(
+                &compliant,
+                "Run Tests",
+                "name: Publish through GitHub CLI\n        run: gh api --method POST repos/${GITHUB_REPOSITORY}/releases",
+            ),
+        ),
+        (
+            "check-windows token script publication",
+            insert_workflow_step_after(
+                &compliant,
+                "Test repeated Windows shutdown",
+                "name: Publish with workflow token\n        env:\n          RELEASE_TOKEN: ${{ github.token }}\n        run: curl -H \"Authorization: Bearer $RELEASE_TOKEN\" https://api.github.com/repos/${GITHUB_REPOSITORY}/releases",
+            ),
+        ),
+        (
+            "additional quoted write and gh api job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-release:\n    name: Shadow release\n    runs-on: ubuntu-latest\n    \"permissions\":\n      contents: write\n    steps:\n      - run: gh api --method POST repos/${GITHUB_REPOSITORY}/releases\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional token-bearing REST job",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-rest:\n    name: Shadow REST release\n    runs-on: ubuntu-latest\n    steps:\n      - env:\n          RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: curl -H \"Authorization: Bearer $RELEASE_TOKEN\" https://api.github.com/repos/${GITHUB_REPOSITORY}/releases\n\n  release:\n",
+            ),
+        ),
+        (
+            "additional dependency on release",
+            compliant.replace(
+                "  release:\n",
+                "  shadow-dependent:\n    name: Shadow dependent\n    needs: release\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo shadow\n\n  release:\n",
+            ),
+        ),
+    ];
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "job workflow authority mutations escaped: {escaped:?}"
+    );
+}
+
+#[test]
+fn workflow_authority_contract_rejects_every_unconsumed_document_line() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_eight_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-eight complete-document baseline");
+
+    let mutations = [
+        ("top-level comment", format!("# hidden authority\n{compliant}")),
+        (
+            "comment hidden in action environment",
+            compliant.replace(
+                "          VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release",
+                "          # BASH_ENV: payload/replace-verifier.sh\n          VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release",
+            ),
+        ),
+        (
+            "nested unconsumed action input",
+            compliant.replace(
+                "          path: target/wix/*.msi",
+                "          path: target/wix/*.msi\n            hidden: payload/replace-verifier.sh",
+            ),
+        ),
+        ("document start marker", format!("---\n{compliant}")),
+        ("document end marker", format!("{compliant}\n...\n")),
+        (
+            "second YAML document",
+            format!("{compliant}\n---\nname: shadow\n"),
+        ),
+        (
+            "tab indentation",
+            compliant.replace("  contents: read", "\tcontents: read"),
+        ),
+        (
+            "malformed top indentation",
+            compliant.replace("permissions:\n", " permissions:\n"),
+        ),
+        (
+            "malformed job indentation",
+            compliant.replace("    runs-on: windows-2022", "     runs-on: windows-2022"),
+        ),
+    ];
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "unconsumed workflow lines escaped: {escaped:?}"
     );
 }
 
