@@ -16,6 +16,7 @@ pub struct MissingFfmpegError {
 }
 
 impl MissingFfmpegError {
+    #[allow(dead_code)]
     fn unavailable() -> Self {
         Self {
             details: "No compatible FFmpeg and FFprobe pair is available.",
@@ -103,7 +104,7 @@ fn platform_absence_error(error: RuntimeError) -> RuntimeError {
 
 /// Compatibility startup adapter. Acquisition is implemented by the managed
 /// installer; this adapter only resolves an already-installed paired runtime.
-pub async fn setup_ffmpeg(
+pub(crate) async fn setup_ffmpeg(
     config_dir: &Path,
     supervisor: Arc<ProcessSupervisor>,
 ) -> Result<Arc<TranscodingService>> {
@@ -142,7 +143,8 @@ pub async fn setup_ffmpeg(
 
 /// Compatibility adapter for callers that already own resolution policy.
 /// It resolves one adjacent pair and does not alter process-global search state.
-pub async fn setup_ffmpeg_with_config(
+#[allow(dead_code)]
+pub(crate) async fn setup_ffmpeg_with_config(
     config: RuntimeConfig,
     supervisor: Arc<ProcessSupervisor>,
 ) -> Result<Arc<TranscodingService>> {
@@ -154,7 +156,7 @@ pub async fn setup_ffmpeg_with_config(
     )))
 }
 
-pub fn unavailable_service(supervisor: Arc<ProcessSupervisor>) -> Arc<TranscodingService> {
+pub(crate) fn unavailable_service(supervisor: Arc<ProcessSupervisor>) -> Arc<TranscodingService> {
     Arc::new(TranscodingService::unavailable(supervisor))
 }
 

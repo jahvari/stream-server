@@ -56,7 +56,14 @@ mod tui;
 mod updater;
 pub mod ytdlp;
 
-pub use ffmpeg_setup::{MissingFfmpegError, setup_ffmpeg_with_config};
+/// Startup runtime setup is owned by the server and cannot be invoked with a
+/// downstream-created raw process supervisor.
+///
+/// ```compile_fail
+/// use stream_server::setup_ffmpeg_with_config;
+/// let _internal_setup = setup_ffmpeg_with_config;
+/// ```
+pub use ffmpeg_setup::MissingFfmpegError;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {

@@ -100,6 +100,25 @@ pub enum RuntimeKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Public runtime observations and leased sessions remain usable without raw
+/// process construction.
+///
+/// ```
+/// use stream_server::transcoding::runtime::{
+///     RuntimeConfig, RuntimeId, RuntimeKind, RuntimeStatus, TranscodingService,
+///     VerifiedRuntimeSession,
+/// };
+///
+/// let _config = RuntimeConfig::isolated();
+/// let _status = RuntimeStatus::Unavailable;
+/// assert!(RuntimeKind::Jellyfin.hardware_allowed());
+/// fn observe(session: &VerifiedRuntimeSession) -> (&RuntimeId, RuntimeKind) {
+///     (session.id(), session.kind())
+/// }
+/// fn service_status(service: &TranscodingService) {
+///     let _status_future = service.status();
+/// }
+/// ```
 pub enum RuntimeStatus {
     Unavailable,
     Jellyfin,
@@ -256,6 +275,19 @@ impl RuntimeKind {
 ///     let _ = service.supervisor();
 /// }
 /// ```
+///
+/// Service creation and raw runtime resolution are internal ownership
+/// boundaries.
+///
+/// ```compile_fail
+/// use stream_server::transcoding::runtime::{
+///     TranscodingService, resolve_runtime, verify_unchanged,
+/// };
+/// let _unavailable = TranscodingService::unavailable;
+/// let _resolved = TranscodingService::resolved;
+/// let _resolve = resolve_runtime;
+/// let _verify = verify_unchanged;
+/// ```
 pub struct TranscodingService {
     supervisor: Arc<ProcessSupervisor>,
     state: tokio::sync::RwLock<ServiceState>,
@@ -270,14 +302,14 @@ enum ServiceState {
 }
 
 impl TranscodingService {
-    pub fn unavailable(supervisor: Arc<ProcessSupervisor>) -> Self {
+    pub(crate) fn unavailable(supervisor: Arc<ProcessSupervisor>) -> Self {
         Self {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Unavailable),
         }
     }
 
-    pub fn resolved(
+    pub(crate) fn resolved(
         config: RuntimeConfig,
         supervisor: Arc<ProcessSupervisor>,
         runtime: Arc<FfmpegRuntime>,
@@ -571,7 +603,7 @@ fn authenticated_managed_candidates(
     Ok(Some(candidates))
 }
 
-pub async fn resolve_runtime(
+pub(crate) async fn resolve_runtime(
     config: &RuntimeConfig,
     supervisor: &ProcessSupervisor,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
@@ -798,7 +830,7 @@ fn candidate_failure_error(failure: CandidateFailure) -> RuntimeError {
     }
 }
 
-pub async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
+pub(crate) async fn verify_unchanged(runtime: &FfmpegRuntime) -> Result<(), RuntimeError> {
     #[cfg(test)]
     let mode = runtime
         .hash_observer

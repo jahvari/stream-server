@@ -646,6 +646,7 @@ pub(super) fn terminate_and_wait(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn is_process_tree_drained(
     job: &TrackedHandle,
     process: &TrackedHandle,

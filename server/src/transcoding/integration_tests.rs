@@ -235,7 +235,7 @@ async fn setup_ffmpeg_compatibility_adapter_returns_the_exact_explicit_pair_with
         .with_explicit_root(explicit.clone())
         .with_search_path(Some(std::env::join_paths([decoy]).expect("decoy path")));
 
-    let service = crate::setup_ffmpeg_with_config(config, supervisor)
+    let service = crate::ffmpeg_setup::setup_ffmpeg_with_config(config, supervisor)
         .await
         .expect("compatibility adapter resolves explicit pair");
     let expected = resolve_runtime(

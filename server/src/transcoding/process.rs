@@ -132,6 +132,7 @@ impl WindowsLifecycleHooks {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum StdoutPolicy {
     Null,
     Capture { byte_limit: usize },
@@ -144,6 +145,7 @@ pub enum StdinPolicy {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ProcessSpec {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
@@ -156,6 +158,7 @@ pub struct ProcessSpec {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BoundedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
@@ -380,6 +383,7 @@ impl ProcessRegistry {
         }
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.entries
             .lock()
@@ -535,6 +539,7 @@ impl ProcessRegistry {
         entry.cleanup_started = false;
     }
 
+    #[allow(dead_code)]
     fn force_terminate_all(&self) -> Result<(), ProcessError> {
         let entries = self
             .entries
@@ -561,6 +566,7 @@ impl ProcessRegistry {
         }
     }
 
+    #[allow(dead_code)]
     fn reap_retained(&self) -> Result<(), ProcessError> {
         let mut entries = self
             .entries
@@ -824,6 +830,7 @@ impl ProcessSupervisor {
         self.inner.cancellation.clone()
     }
 
+    #[allow(dead_code)]
     pub fn active_processes(&self) -> usize {
         self.inner.registry.len()
     }
@@ -870,10 +877,12 @@ impl ProcessSupervisor {
         commit()
     }
 
+    #[allow(dead_code)]
     pub fn force_terminate_registered(&self) -> Result<(), ProcessError> {
         self.inner.registry.force_terminate_all()
     }
 
+    #[allow(dead_code)]
     pub async fn wait_for_idle(&self, deadline: Duration) -> Result<(), ProcessError> {
         let expires = tokio::time::Instant::now() + deadline;
         loop {
