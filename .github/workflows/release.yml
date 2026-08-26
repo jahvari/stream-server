@@ -483,9 +483,6 @@ jobs:
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release/
 
-      - name: Verify final release outputs
-        run: STREAM_SERVER_RELEASE_GATE_STAGE=release cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
-
       - name: Generate release description
         run: |
           prev_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
@@ -498,6 +495,9 @@ jobs:
             --output "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 
           cat "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
+
+      - name: Verify final release outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=release cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

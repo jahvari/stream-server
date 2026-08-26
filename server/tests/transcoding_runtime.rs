@@ -225,6 +225,7 @@ struct WorkflowStep {
     paths: Vec<String>,
     release_files: Vec<String>,
     run: Option<String>,
+    condition: Option<String>,
     fields: BTreeSet<String>,
     inputs: BTreeMap<String, Vec<String>>,
 }
@@ -243,8 +244,7 @@ fn yaml_scalar(value: &str) -> Result<String, &'static str> {
         || value
             .chars()
             .next()
-            .is_some_and(|value| matches!(value, '&' | '*' | '!' | '{' | '[' | '>'))
-        || matches!(value, "|" | "|-")
+            .is_some_and(|value| matches!(value, '&' | '*' | '!' | '{' | '[' | '|' | '>'))
     {
         return Err("unsupported workflow scalar shape");
     }
@@ -465,6 +465,7 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                 paths: Vec::new(),
                 release_files: Vec::new(),
                 run: None,
+                condition: None,
                 fields: BTreeSet::new(),
                 inputs: BTreeMap::new(),
             };
@@ -515,7 +516,7 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                         }
                     }
                     "run" => {
-                        let value = if matches!(value, "|" | "|-") {
+                        let value = if value == "|" {
                             block_value(&lines, index, yaml_indent(lines[index])?, end)?.0
                         } else {
                             yaml_scalar(value)?
@@ -549,7 +550,7 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             if yaml_indent(lines[child])? == child_indent {
                                 let (input, value) = yaml_field(lines[child].trim())
                                     .ok_or("unsupported workflow action input shape")?;
-                                let values = if matches!(value, "|" | "|-") {
+                                let values = if value == "|" {
                                     block_value(
                                         &lines,
                                         child,
@@ -611,8 +612,13 @@ fn workflow_steps(workflow: &str) -> Result<Vec<WorkflowStep>, &'static str> {
                             yaml_scalar(value)?;
                         }
                     }
-                    "id" | "if" => {
+                    "id" => {
                         yaml_scalar(value)?;
+                    }
+                    "if" => {
+                        if step.condition.replace(yaml_scalar(value)?).is_some() {
+                            return Err("duplicate workflow condition");
+                        }
                     }
                     _ => unreachable!("workflow step field allowlist checked"),
                 }
@@ -1055,6 +1061,41 @@ fn require_action_inputs(step: &WorkflowStep, expected: &[&str]) -> Result<(), &
         .ok_or("release-affecting action input set changed")
 }
 
+fn expected_package_upload_suffix(job: &str) -> Option<&'static [&'static str]> {
+    match job {
+        "build-windows" => Some(&["server-windows-amd64", "server-windows-msi"]),
+        "build-linux" => Some(&[
+            "server-linux-amd64",
+            "server-linux-deb",
+            "server-linux-appimage",
+        ]),
+        "build-arch" => Some(&["server-arch-pkg"]),
+        _ => None,
+    }
+}
+
+const WINDOWS_POST_UPLOAD_DIAGNOSTIC: &str = "Get-ChildItem -Path . -Force
+if (Test-Path vcpkg) { Get-ChildItem -Path vcpkg -Force }
+if (Test-Path vcpkg_installed) { Get-ChildItem -Path vcpkg_installed -Force }";
+
+fn validate_post_upload_tail(job: &str, tail: &[&WorkflowStep]) -> Result<(), &'static str> {
+    match job {
+        "build-windows" if tail.len() == 1 => {
+            let diagnostic = tail[0];
+            require_step_fields(diagnostic, &["name", "if", "run"])?;
+            if diagnostic.name.as_deref() != Some("Debug VCPKG Location")
+                || diagnostic.condition.as_deref() != Some("always()")
+                || diagnostic.run.as_deref().map(str::trim) != Some(WINDOWS_POST_UPLOAD_DIAGNOSTIC)
+            {
+                return Err("Windows post-upload diagnostic changed");
+            }
+            Ok(())
+        }
+        "build-linux" | "build-arch" if tail.is_empty() => Ok(()),
+        _ => Err("post-upload workflow tail changed"),
+    }
+}
+
 fn validate_workflow_order_and_prerequisites(
     steps: &[WorkflowStep],
     classified: &ClassifiedWorkflowRuns,
@@ -1069,15 +1110,30 @@ fn validate_workflow_order_and_prerequisites(
         if completion >= gate {
             return Err("package verifier does not follow package creation");
         }
-        for upload in steps.iter().filter(|step| {
-            step.job == job && step.uses.as_deref() == Some("actions/upload-artifact@v7")
-        }) {
+        let job_steps = steps
+            .iter()
+            .filter(|step| step.job == job)
+            .collect::<Vec<_>>();
+        let gate_index = job_steps
+            .iter()
+            .position(|step| step.ordinal == *gate)
+            .ok_or("package verifier step missing")?;
+        let expected_uploads =
+            expected_package_upload_suffix(job).ok_or("package upload suffix missing")?;
+        let suffix_end = gate_index + 1 + expected_uploads.len();
+        let uploads = job_steps
+            .get(gate_index + 1..suffix_end)
+            .ok_or("package upload suffix is incomplete")?;
+        for (upload, expected_artifact) in uploads.iter().zip(expected_uploads) {
             require_step_fields(upload, &["name", "uses", "with"])?;
             require_action_inputs(upload, &["name", "path"])?;
-            if upload.ordinal <= *gate {
-                return Err("package upload does not follow its verifier");
+            if upload.uses.as_deref() != Some("actions/upload-artifact@v7")
+                || upload.artifact_name.as_deref() != Some(*expected_artifact)
+            {
+                return Err("package publication suffix changed");
             }
         }
+        validate_post_upload_tail(job, &job_steps[suffix_end..])?;
     }
 
     let release_gate = *gates
@@ -1096,6 +1152,10 @@ fn validate_workflow_order_and_prerequisites(
     }
     let download = downloads[0];
     let publication = publications[0];
+    let release_steps = steps
+        .iter()
+        .filter(|step| step.job == "release")
+        .collect::<Vec<_>>();
     require_step_fields(download, &["name", "uses", "with"])?;
     require_action_inputs(download, &["path"])?;
     require_step_fields(publication, &["name", "uses", "with"])?;
@@ -1114,9 +1174,11 @@ fn validate_workflow_order_and_prerequisites(
     {
         return Err("final release action semantics changed");
     }
-    if !(download.ordinal < classified.assembly_ordinal
-        && classified.assembly_ordinal < release_gate
-        && release_gate < publication.ordinal)
+    if publication.job != "release"
+        || !(download.ordinal < classified.assembly_ordinal
+            && classified.assembly_ordinal < release_gate)
+        || publication.ordinal != release_gate + 1
+        || publication.ordinal + 1 != release_steps.len()
     {
         return Err("final assembly, verifier, and publication order changed");
     }
@@ -1918,6 +1980,21 @@ fn move_named_workflow_step_after(workflow: &str, moving: &str, after: &str) -> 
     blocks.join("\n      - ")
 }
 
+fn insert_workflow_step_after(workflow: &str, after: &str, step: &str) -> String {
+    let marker = format!("      - name: {after}\n");
+    let start = workflow
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing workflow step {after}"));
+    let search_start = start + marker.len();
+    let remainder = &workflow[search_start..];
+    let end = ["\n      - ", "\n  build-", "\n  release:"]
+        .into_iter()
+        .filter_map(|boundary| remainder.find(boundary))
+        .min()
+        .map_or(workflow.len(), |offset| search_start + offset);
+    format!("{}\n      - {step}{}", &workflow[..end], &workflow[end..])
+}
+
 fn round_five_compliant_workflow(workflow: &str) -> String {
     let workflow = move_named_workflow_step_after(
         &workflow.replace("\r\n", "\n"),
@@ -1927,6 +2004,14 @@ fn round_five_compliant_workflow(workflow: &str) -> String {
     workflow.replace(
         "      - name: Setup Rust for package gate\n        uses: dtolnay/rust-toolchain@1.98.0\n\n      - name: Download all artifacts",
         "      - name: Setup Rust for package gate\n        uses: dtolnay/rust-toolchain@1.98.0\n\n      - name: Install package gate dependencies\n        run: |\n          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt\n          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update\n          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev\n\n      - name: Download all artifacts",
+    )
+}
+
+fn round_six_compliant_workflow(workflow: &str) -> String {
+    move_named_workflow_step_after(
+        &round_five_compliant_workflow(workflow),
+        "Generate release description",
+        "Prepare release files",
     )
 }
 
@@ -2059,6 +2144,186 @@ fn release_gate_requires_exact_linux_native_prerequisites_before_verification() 
         mutations
             .into_iter()
             .all(|mutation| { enumerate_authoritative_sources(&wix, &cargo, &mutation).is_err() })
+    );
+}
+
+#[test]
+fn workflow_contract_rejects_every_post_verifier_mutation_path() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_six_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-six compliant workflow fixture");
+
+    let stages = [
+        (
+            "Verify Windows package outputs",
+            "Copy-Item payload/renamed-codec.exe target/x86_64-pc-windows-msvc/release/server.exe",
+        ),
+        (
+            "Verify Linux package outputs",
+            "cp payload/renamed-codec.zip stream-server-linux-amd64.AppImage",
+        ),
+        (
+            "Verify Arch package outputs",
+            "cp payload/renamed-codec.exe pkg/stream-server-renamed.pkg.tar.zst",
+        ),
+        (
+            "Verify final release outputs",
+            "cp payload/renamed-codec.zip release/renamed-codec.bin",
+        ),
+    ];
+    let block_headers = [
+        "|",
+        "|+",
+        "|-",
+        "|2",
+        "| 2",
+        "| +",
+        "| -",
+        "| 2 # trailing comment",
+        "| # trailing comment",
+        "|+ # trailing comment",
+        ">",
+        ">+",
+        ">-",
+        ">2",
+    ];
+    let mut mutations = Vec::<(String, String)>::new();
+    for (verifier, command) in stages {
+        for header in block_headers {
+            mutations.push((
+                format!("{verifier}: run {header}"),
+                insert_workflow_step_after(
+                    &compliant,
+                    verifier,
+                    &format!(
+                        "name: Mutate verified payload\n        run: {header}\n          {command}"
+                    ),
+                ),
+            ));
+        }
+        mutations.push((
+            format!("{verifier}: intervening action"),
+            insert_workflow_step_after(
+                &compliant,
+                verifier,
+                "name: Intervening action\n        uses: actions/checkout@v7",
+            ),
+        ));
+    }
+    mutations.push((
+        "release notes after final verifier".to_owned(),
+        move_named_workflow_step_after(
+            &compliant,
+            "Generate release description",
+            "Verify final release outputs",
+        ),
+    ));
+    for (name, fields) in [
+        (
+            "mixed uses and run",
+            "uses: actions/checkout@v7\n        run: echo mutate",
+        ),
+        ("post-gate shell", "run: echo mutate\n        shell: pwsh"),
+        (
+            "post-gate working directory",
+            "run: echo mutate\n        working-directory: release",
+        ),
+        (
+            "post-gate continue-on-error",
+            "run: echo mutate\n        continue-on-error: true",
+        ),
+        (
+            "post-gate environment",
+            "run: echo mutate\n        env:\n          PAYLOAD: renamed-codec.exe",
+        ),
+    ] {
+        mutations.push((
+            name.to_owned(),
+            insert_workflow_step_after(
+                &compliant,
+                "Verify Windows package outputs",
+                &format!("name: Boundary field mutation\n        {fields}"),
+            ),
+        ));
+    }
+
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "post-verifier mutations escaped the contract: {escaped:?}"
+    );
+}
+
+#[test]
+fn workflow_contract_allows_only_the_exact_post_upload_diagnostic_tail() {
+    let (_, wix, cargo, workflow) = repository_inputs();
+    let compliant = round_six_compliant_workflow(&workflow);
+    enumerate_authoritative_sources(&wix, &cargo, &compliant)
+        .expect("round-six post-upload boundary fixture");
+
+    let mutations = [
+        (
+            "step after Windows suffix",
+            insert_workflow_step_after(
+                &compliant,
+                "Upload MSI",
+                "name: Mutate after Windows uploads\n        run: Copy-Item payload/renamed-codec.exe target/x86_64-pc-windows-msvc/release/server.exe",
+            ),
+        ),
+        (
+            "step after Linux suffix",
+            insert_workflow_step_after(
+                &compliant,
+                "Upload AppImage",
+                "name: Mutate after Linux uploads\n        run: cp payload/renamed-codec.zip stream-server-linux-amd64.AppImage",
+            ),
+        ),
+        (
+            "step after Arch suffix",
+            insert_workflow_step_after(
+                &compliant,
+                "Upload Arch Package",
+                "name: Mutate after Arch upload\n        run: cp payload/renamed-codec.exe pkg/stream-server-renamed.pkg.tar.zst",
+            ),
+        ),
+        (
+            "changed diagnostic body",
+            compliant.replace(
+                "          Get-ChildItem -Path . -Force",
+                "          Copy-Item payload/renamed-codec.exe target/x86_64-pc-windows-msvc/release/server.exe",
+            ),
+        ),
+        (
+            "changed diagnostic condition",
+            compliant.replace("        if: always()", "        if: success()"),
+        ),
+        (
+            "diagnostic environment",
+            compliant.replace(
+                "      - name: Debug VCPKG Location\n",
+                "      - name: Debug VCPKG Location\n        env:\n          PAYLOAD: renamed-codec.exe\n",
+            ),
+        ),
+    ];
+    let escaped = mutations
+        .into_iter()
+        .filter_map(|(name, mutation)| {
+            enumerate_authoritative_sources(&wix, &cargo, &mutation)
+                .is_ok()
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        escaped.is_empty(),
+        "post-upload tail mutations escaped the contract: {escaped:?}"
     );
 }
 
