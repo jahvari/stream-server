@@ -1936,6 +1936,60 @@ fn run_bounded_workflow_command(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<Vec<u8>, &'static str> {
+    run_bounded_workflow_command_with_reader(command, timeout, |stdout, sender| {
+        thread::Builder::new()
+            .name("release-workflow-git-reader".to_owned())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let result = stdout
+                    .take((MAX_WORKFLOW_OBJECT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map(|_| bytes)
+                    .map_err(|_| "workflow Git object read failed");
+                let _ = sender.send(result);
+            })
+    })
+}
+
+fn cleanup_workflow_command(
+    mut child: std::process::Child,
+    reader: Option<thread::JoinHandle<()>>,
+    terminate_if_running: bool,
+) -> Result<std::process::ExitStatus, &'static str> {
+    let mut lifecycle_failed = false;
+    let running = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(_) => {
+            lifecycle_failed = true;
+            true
+        }
+    };
+    if terminate_if_running && running && child.kill().is_err() {
+        lifecycle_failed = true;
+    }
+    let waited = child.wait();
+    let reader_panicked = reader.is_some_and(|reader| reader.join().is_err());
+    if reader_panicked {
+        return Err("workflow Git object read failed");
+    }
+    if lifecycle_failed {
+        return Err("workflow Git object command failed");
+    }
+    waited.map_err(|_| "workflow Git object command failed")
+}
+
+fn run_bounded_workflow_command_with_reader<S>(
+    command: &mut Command,
+    timeout: Duration,
+    spawn_reader: S,
+) -> Result<Vec<u8>, &'static str>
+where
+    S: FnOnce(
+        std::process::ChildStdout,
+        mpsc::SyncSender<Result<Vec<u8>, &'static str>>,
+    ) -> std::io::Result<thread::JoinHandle<()>>,
+{
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1944,49 +1998,40 @@ fn run_bounded_workflow_command(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            cleanup_workflow_command(child, None, true)?;
             return Err("workflow Git stdout unavailable");
         }
     };
     let (sender, receiver) = mpsc::sync_channel(1);
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((MAX_WORKFLOW_OBJECT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-            .map_err(|_| "workflow Git object read failed");
-        let _ = sender.send(result);
-    });
+    let reader = match spawn_reader(stdout, sender) {
+        Ok(reader) => reader,
+        Err(_) => {
+            cleanup_workflow_command(child, None, true)?;
+            return Err("workflow Git reader unavailable");
+        }
+    };
     let deadline = Instant::now() + timeout;
     let mut output = None;
     loop {
         match receiver.try_recv() {
             Ok(Ok(bytes)) if bytes.len() > MAX_WORKFLOW_OBJECT_BYTES => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                cleanup_workflow_command(child, Some(reader), true)?;
                 return Err("release workflow commit object exceeds size limit");
             }
             Ok(Ok(bytes)) => output = Some(bytes),
             Ok(Err(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                cleanup_workflow_command(child, Some(reader), true)?;
                 return Err(error);
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) if output.is_none() => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                cleanup_workflow_command(child, Some(reader), true)?;
                 return Err("workflow Git object read failed");
             }
             Err(TryRecvError::Disconnected) => {}
         }
         match child.try_wait() {
-            Ok(Some(status)) => {
+            Ok(Some(_)) => {
                 let result = match output {
                     Some(bytes) => Ok(bytes),
                     None => match receiver.recv() {
@@ -1994,7 +2039,7 @@ fn run_bounded_workflow_command(
                         Err(_) => Err("workflow Git object read failed"),
                     },
                 };
-                let _ = reader.join();
+                let status = cleanup_workflow_command(child, Some(reader), false)?;
                 if !status.success() {
                     return Err("workflow Git object command failed");
                 }
@@ -2006,16 +2051,12 @@ fn run_bounded_workflow_command(
             }
             Ok(None) => {}
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                cleanup_workflow_command(child, Some(reader), true)?;
                 return Err("workflow Git object command failed");
             }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
+            cleanup_workflow_command(child, Some(reader), true)?;
             return Err("workflow Git object command timed out");
         }
         thread::sleep(Duration::from_millis(5));
@@ -4049,6 +4090,109 @@ fn workflow_object_command_is_bounded_timed_and_reaped() {
         run_bounded_workflow_command(oversized, Duration::from_secs(2)).unwrap_err(),
         "release workflow commit object exceeds size limit"
     );
+}
+
+fn workflow_reader_cleanup_helper_command(ready: &Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("workflow test executable"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "workflow_reader_cleanup_child_helper",
+        ])
+        .env("STREAM_SERVER_WORKFLOW_READER_READY", ready)
+        .stdin(Stdio::null());
+    command
+}
+
+fn wait_for_workflow_reader_helper(ready: &Path) -> std::net::SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(address) = fs::read_to_string(ready) {
+            return address.parse().expect("helper listener address");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "workflow reader cleanup helper did not become ready"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn reader_spawn_failure_kills_and_waits_for_the_owned_git_child() {
+    let temporary = tempfile::tempdir().expect("reader spawn failure fixture");
+    let ready = temporary.path().join("ready");
+    let mut command = workflow_reader_cleanup_helper_command(&ready);
+    let observed_ready = ready.clone();
+
+    assert_eq!(
+        run_bounded_workflow_command_with_reader(
+            &mut command,
+            Duration::from_secs(5),
+            move |stdout, _sender| {
+                wait_for_workflow_reader_helper(&observed_ready);
+                drop(stdout);
+                Err(std::io::Error::other("injected reader spawn failure"))
+            },
+        )
+        .unwrap_err(),
+        "workflow Git reader unavailable"
+    );
+
+    let address = wait_for_workflow_reader_helper(&ready);
+    std::net::TcpListener::bind(address).expect("reader spawn failure must not leave child alive");
+}
+
+#[test]
+fn reader_panic_is_a_read_failure_and_reaps_the_owned_git_child() {
+    let temporary = tempfile::tempdir().expect("reader panic fixture");
+    let ready = temporary.path().join("ready");
+    let mut command = workflow_reader_cleanup_helper_command(&ready);
+    let observed_ready = ready.clone();
+
+    assert_eq!(
+        run_bounded_workflow_command_with_reader(
+            &mut command,
+            Duration::from_secs(5),
+            move |stdout, sender| {
+                wait_for_workflow_reader_helper(&observed_ready);
+                thread::Builder::new()
+                    .name("injected-workflow-reader-panic".to_owned())
+                    .spawn(move || {
+                        drop(stdout);
+                        drop(sender);
+                        panic!("injected workflow reader panic");
+                    })
+            },
+        )
+        .unwrap_err(),
+        "workflow Git object read failed"
+    );
+
+    let address = wait_for_workflow_reader_helper(&ready);
+    std::net::TcpListener::bind(address).expect("reader panic must not leave child alive");
+}
+
+#[test]
+#[ignore = "spawned only by workflow reader ownership fixtures"]
+fn workflow_reader_cleanup_child_helper() {
+    let Some(ready) = std::env::var_os("STREAM_SERVER_WORKFLOW_READER_READY") else {
+        return;
+    };
+    let ready = PathBuf::from(ready);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind helper listener");
+    fs::write(
+        ready,
+        listener
+            .local_addr()
+            .expect("helper listener address")
+            .to_string(),
+    )
+    .expect("publish helper listener address");
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
 }
 
 #[test]
