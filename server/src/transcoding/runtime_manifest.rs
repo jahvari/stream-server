@@ -65,6 +65,18 @@ pub enum RuntimeError {
     ProbeDeadline,
     IncompatiblePair,
     RuntimeChanged,
+    UntrustedDownload,
+    TooManyRedirects,
+    DownloadFailed,
+    DownloadDeadline,
+    ArchiveTooLarge,
+    ArchiveDigestMismatch,
+    UnsafeArchive,
+    ExtractionFailed,
+    InstallFailed,
+    ActivationFailed,
+    AdministratorRuntimeRequired,
+    ManagedRuntimeUnsupported,
 }
 
 impl fmt::Display for RuntimeError {
@@ -79,6 +91,22 @@ impl fmt::Display for RuntimeError {
             }
             Self::IncompatiblePair => f.write_str("FFmpeg executable pair is incompatible"),
             Self::RuntimeChanged => f.write_str("FFmpeg runtime changed after validation"),
+            Self::UntrustedDownload => f.write_str("runtime download was rejected by policy"),
+            Self::TooManyRedirects => f.write_str("runtime download exceeded its redirect limit"),
+            Self::DownloadFailed => f.write_str("runtime download failed"),
+            Self::DownloadDeadline => f.write_str("runtime download exceeded its deadline"),
+            Self::ArchiveTooLarge => f.write_str("runtime archive exceeded its byte bound"),
+            Self::ArchiveDigestMismatch => f.write_str("runtime archive identity did not match"),
+            Self::UnsafeArchive => f.write_str("runtime archive was rejected by policy"),
+            Self::ExtractionFailed => f.write_str("runtime archive extraction failed"),
+            Self::InstallFailed => f.write_str("runtime installation failed"),
+            Self::ActivationFailed => f.write_str("runtime activation failed"),
+            Self::AdministratorRuntimeRequired => f.write_str(
+                "install the administrator-provided Jellyfin FFmpeg package and restart the server",
+            ),
+            Self::ManagedRuntimeUnsupported => {
+                f.write_str("managed FFmpeg acquisition is unavailable on this platform")
+            }
         }
     }
 }
@@ -356,7 +384,7 @@ fn validate_required_paths(paths: Vec<String>) -> Result<Vec<RelativeArchivePath
     }
     Ok(normalized.into_iter().collect())
 }
-fn normalize_archive_path(path: &str) -> Result<RelativeArchivePath, RuntimeError> {
+pub(crate) fn normalize_archive_path(path: &str) -> Result<RelativeArchivePath, RuntimeError> {
     if path.is_empty()
         || path.len() > 240
         || path.starts_with('/')
