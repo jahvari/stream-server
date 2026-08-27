@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
@@ -27,6 +27,10 @@ pub struct SettingsPayload {
     pub cache_size: f64,
     #[serde(rename = "proxyStreamsEnabled", default)]
     pub proxy_streams_enabled: bool,
+    #[serde(rename = "allowPrivateNetworkSources", default)]
+    pub allow_private_network_sources: bool,
+    #[serde(rename = "allowInvalidProxyTlsCertificates", default)]
+    pub allow_invalid_proxy_tls_certificates: bool,
     #[serde(rename = "btMaxConnections", default)]
     pub bt_max_connections: u64,
     #[serde(rename = "btHandshakeTimeout", default)]
@@ -131,6 +135,10 @@ pub struct ChangelogSectionPayload {
 
 #[async_trait::async_trait]
 pub trait ServerConnector: Send + Sync + 'static {
+    fn can_update_protected_settings(&self) -> bool {
+        false
+    }
+
     async fn get_settings(&self) -> Result<SettingsPayload>;
     async fn apply_settings(&self, settings: SettingsPayload) -> Result<()>;
     async fn get_logs(&self) -> Result<LogsSnapshot>;
@@ -142,16 +150,83 @@ pub trait ServerConnector: Send + Sync + 'static {
 pub struct HttpConnector {
     client: Client,
     server_url: String,
+    protected_client: Option<Client>,
+    settings_control_token: Option<HeaderValue>,
 }
 
 impl HttpConnector {
     pub fn new(client: Client, server_url: String) -> Self {
-        Self { client, server_url }
+        Self {
+            client,
+            server_url,
+            protected_client: None,
+            settings_control_token: None,
+        }
     }
+
+    pub fn with_settings_control_token(mut self, mut token: HeaderValue) -> Result<Self> {
+        if !server_url_has_ip_literal_loopback(&self.server_url) {
+            anyhow::bail!("protected settings require an IP-literal loopback server URL");
+        }
+
+        self.protected_client = Some(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .context("failed to create protected settings client")?,
+        );
+        token.set_sensitive(true);
+        self.settings_control_token = Some(token);
+        Ok(self)
+    }
+}
+
+pub fn server_url_has_ip_literal_loopback(server_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(server_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(ip) = url
+        .host_str()
+        .map(|host| host.trim_matches(['[', ']']))
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+    else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| ip.is_loopback(), |mapped| mapped.is_loopback()),
+    }
+}
+
+pub fn parse_settings_control_token(bytes: &[u8]) -> Result<HeaderValue> {
+    let token = bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes);
+    if token.len() != 64
+        || !token
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        anyhow::bail!("settings control token is invalid");
+    }
+    let mut value = HeaderValue::from_bytes(token).context("settings control token is invalid")?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 #[async_trait::async_trait]
 impl ServerConnector for HttpConnector {
+    fn can_update_protected_settings(&self) -> bool {
+        self.protected_client.is_some() && self.settings_control_token.is_some()
+    }
+
     async fn get_settings(&self) -> Result<SettingsPayload> {
         let res = self
             .client
@@ -169,12 +244,23 @@ impl ServerConnector for HttpConnector {
 
     async fn apply_settings(&self, settings: SettingsPayload) -> Result<()> {
         let value = serde_json::to_value(&settings)?;
-        self.client
-            .post(format!("{}/settings", self.server_url))
-            .json(&value)
-            .send()
-            .await?
-            .error_for_status()?;
+        let url = format!("{}/settings", self.server_url);
+        let response = if let (Some(client), Some(token)) =
+            (&self.protected_client, &self.settings_control_token)
+        {
+            client
+                .post(url)
+                .header("x-stream-server-settings-token", token)
+                .json(&value)
+                .send()
+                .await?
+        } else {
+            self.client.post(url).json(&value).send().await?
+        };
+        if response.status().is_redirection() {
+            anyhow::bail!("settings endpoint returned an unexpected redirect");
+        }
+        response.error_for_status()?;
         Ok(())
     }
 
@@ -356,6 +442,7 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
     ui.set_log_entries(ModelRc::new(VecModel::from(Vec::<LogEntry>::new())));
     ui.set_log_timeline_bins(ModelRc::new(VecModel::from(vec![1; 32])));
     ui.set_log_target_options(ModelRc::new(VecModel::from(Vec::<FilterOption>::new())));
+    ui.set_protected_settings_enabled(connector.can_update_protected_settings());
 
     // Hide (don't destroy) the window when the user clicks close so
     // the event loop stays alive and the window can be re-shown later.
@@ -688,7 +775,12 @@ fn refresh_settings(handle: Handle, connector: Arc<dyn ServerConnector>, weak: W
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = weak.upgrade() {
                         write_settings_to_ui(&ui, settings);
-                        ui.set_status_text("Settings loaded".into());
+                        let status = if connector.can_update_protected_settings() {
+                            "Settings loaded"
+                        } else {
+                            "Settings loaded; protected proxy controls require a local token"
+                        };
+                        ui.set_status_text(status.into());
                     }
                 });
             }
@@ -1451,6 +1543,8 @@ fn write_settings_to_ui(ui: &AppWindow, settings: SettingsPayload) {
     ui.set_cache_root(settings.cache_root.into());
     ui.set_cache_size(settings.cache_size.to_string().into());
     ui.set_proxy_streams_enabled(settings.proxy_streams_enabled);
+    ui.set_allow_private_network_sources(settings.allow_private_network_sources);
+    ui.set_allow_invalid_proxy_tls_certificates(settings.allow_invalid_proxy_tls_certificates);
     ui.set_bt_max_connections(settings.bt_max_connections.to_string().into());
     ui.set_bt_handshake_timeout(settings.bt_handshake_timeout.to_string().into());
     ui.set_bt_request_timeout(settings.bt_request_timeout.to_string().into());
@@ -1489,6 +1583,8 @@ fn read_settings_from_ui(ui: &AppWindow) -> Result<SettingsPayload> {
         cache_root: ui.get_cache_root().to_string(),
         cache_size: parse_f64("cacheSize", ui.get_cache_size())?,
         proxy_streams_enabled: ui.get_proxy_streams_enabled(),
+        allow_private_network_sources: ui.get_allow_private_network_sources(),
+        allow_invalid_proxy_tls_certificates: ui.get_allow_invalid_proxy_tls_certificates(),
         bt_max_connections: parse_u64("btMaxConnections", ui.get_bt_max_connections())?,
         bt_handshake_timeout: parse_u64("btHandshakeTimeout", ui.get_bt_handshake_timeout())?,
         bt_request_timeout: parse_u64("btRequestTimeout", ui.get_bt_request_timeout())?,
@@ -1554,4 +1650,195 @@ fn parse_f64(field: &str, value: SharedString) -> Result<f64> {
         .trim()
         .parse::<f64>()
         .with_context(|| format!("{field} must be a number"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    fn test_token() -> HeaderValue {
+        HeaderValue::from_static("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    }
+
+    fn spawn_http_server(
+        responses: Vec<String>,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = mpsc::channel();
+        let task = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = sent.send(String::from_utf8_lossy(&request).into_owned());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), received, task)
+    }
+
+    fn empty_settings() -> SettingsPayload {
+        serde_json::from_value(serde_json::json!({})).unwrap()
+    }
+
+    #[test]
+    fn protected_proxy_settings_round_trip_with_camel_case_names() {
+        let payload: SettingsPayload = serde_json::from_value(serde_json::json!({
+            "allowPrivateNetworkSources": true,
+            "allowInvalidProxyTlsCertificates": true
+        }))
+        .unwrap();
+        assert!(payload.allow_private_network_sources);
+        assert!(payload.allow_invalid_proxy_tls_certificates);
+
+        let serialized = serde_json::to_value(payload).unwrap();
+        assert_eq!(serialized["allowPrivateNetworkSources"], true);
+        assert_eq!(serialized["allowInvalidProxyTlsCertificates"], true);
+    }
+
+    #[test]
+    fn token_parser_accepts_one_line_ending_and_rejects_surrounding_whitespace() {
+        let token = "a".repeat(64);
+        assert!(
+            parse_settings_control_token(token.as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            parse_settings_control_token(format!("{token}\n").as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            parse_settings_control_token(format!("{token}\r\n").as_bytes())
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(parse_settings_control_token(format!(" {token}").as_bytes()).is_err());
+        assert!(parse_settings_control_token(format!("{token} \n").as_bytes()).is_err());
+        assert!(parse_settings_control_token(b"abc").is_err());
+    }
+
+    #[test]
+    fn protected_token_requires_an_ip_literal_loopback_server() {
+        let token = test_token();
+        for server_url in [
+            "http://localhost:11470",
+            "http://192.168.1.10:11470",
+            "https://example.com",
+        ] {
+            assert!(
+                HttpConnector::new(Client::new(), server_url.to_string())
+                    .with_settings_control_token(token.clone())
+                    .is_err(),
+                "accepted protected token for {server_url}"
+            );
+        }
+
+        for server_url in [
+            "http://127.0.0.1:11470",
+            "http://[::1]:11470",
+            "http://[::ffff:127.0.0.1]:11470",
+        ] {
+            let connector = HttpConnector::new(Client::new(), server_url.to_string())
+                .with_settings_control_token(token.clone())
+                .unwrap();
+            assert!(connector.can_update_protected_settings(), "{server_url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_is_attached_only_to_the_protected_settings_post() {
+        let json = "{\"values\":{}}";
+        let (url, requests, task) = spawn_http_server(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            ),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ]);
+        let connector = HttpConnector::new(Client::new(), url)
+            .with_settings_control_token(test_token())
+            .unwrap();
+
+        connector.get_settings().await.unwrap();
+        connector.apply_settings(empty_settings()).await.unwrap();
+        let get_request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let post_request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        task.join().unwrap();
+
+        assert!(get_request.starts_with("GET /settings "));
+        assert!(
+            !get_request
+                .to_ascii_lowercase()
+                .contains("x-stream-server-settings-token")
+        );
+        assert!(post_request.starts_with("POST /settings "));
+        assert!(post_request.to_ascii_lowercase().contains(
+            "x-stream-server-settings-token: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_client_does_not_follow_redirects() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let destination = redirect_target.local_addr().unwrap();
+        let (url, _, task) = spawn_http_server(vec![format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )]);
+        let connector = HttpConnector::new(Client::new(), url)
+            .with_settings_control_token(test_token())
+            .unwrap();
+
+        assert!(connector.apply_settings(empty_settings()).await.is_err());
+        task.join().unwrap();
+        assert!(matches!(
+            redirect_target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_client_bypasses_a_configured_http_proxy() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let (url, requests, target_task) = spawn_http_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ]);
+        let ordinary_client = Client::builder()
+            .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+            .build()
+            .unwrap();
+        let connector = HttpConnector::new(ordinary_client, url)
+            .with_settings_control_token(test_token())
+            .unwrap();
+
+        connector.apply_settings(empty_settings()).await.unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        target_task.join().unwrap();
+        assert!(request.starts_with("POST /settings "));
+        assert!(matches!(
+            proxy.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
 }

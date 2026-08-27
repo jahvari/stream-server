@@ -1,10 +1,11 @@
 use crate::routes::compat;
 use crate::state::AppState;
 use crate::updater::version::UpdateChannel;
+use crate::{network_security::ProxyPolicySettings, settings_control::SettingsMutationAuthority};
 use axum::{
     Json,
-    extract::{Query, RawQuery, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Query, RawQuery, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use enginefs::backend::{
@@ -98,6 +99,10 @@ pub struct ServerSettings {
     pub cache_size: f64,
     #[serde(rename = "proxyStreamsEnabled")]
     pub proxy_streams_enabled: bool,
+    #[serde(rename = "allowPrivateNetworkSources", default)]
+    pub allow_private_network_sources: bool,
+    #[serde(rename = "allowInvalidProxyTlsCertificates", default)]
+    pub allow_invalid_proxy_tls_certificates: bool,
     #[serde(rename = "btMaxConnections")]
     pub bt_max_connections: u64,
     #[serde(rename = "btHandshakeTimeout")]
@@ -267,6 +272,85 @@ pub fn default_bt_ssrf_mitigation() -> bool {
     true
 }
 
+fn parse_environment_bool(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("1")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+    {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("0")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProxyEnvironmentOverrides {
+    pub(crate) allow_private_network_sources: Option<bool>,
+    pub(crate) allow_invalid_proxy_tls_certificates: Option<bool>,
+}
+
+impl ProxyEnvironmentOverrides {
+    pub(crate) fn apply_to(self, settings: &mut ServerSettings) {
+        if let Some(value) = self.allow_private_network_sources {
+            settings.allow_private_network_sources = value;
+        }
+        if let Some(value) = self.allow_invalid_proxy_tls_certificates {
+            settings.allow_invalid_proxy_tls_certificates = value;
+        }
+    }
+
+    fn from_environment() -> Self {
+        Self::from_reader(
+            |name| std::env::var(name),
+            |name| {
+                tracing::warn!(
+                    variable = name,
+                    "ignoring invalid boolean environment override"
+                );
+            },
+        )
+    }
+
+    fn from_reader<R, W>(mut read: R, mut warn_invalid: W) -> Self
+    where
+        R: FnMut(&str) -> Result<String, std::env::VarError>,
+        W: FnMut(&str),
+    {
+        let mut overrides = Self::default();
+        for (name, target) in [
+            (
+                "STREMIO_ALLOW_PRIVATE_NETWORK_SOURCES",
+                &mut overrides.allow_private_network_sources,
+            ),
+            (
+                "STREMIO_ALLOW_INVALID_PROXY_TLS_CERTIFICATES",
+                &mut overrides.allow_invalid_proxy_tls_certificates,
+            ),
+        ] {
+            match read(name) {
+                Ok(value) => match parse_environment_bool(&value) {
+                    Some(value) => *target = Some(value),
+                    None => warn_invalid(name),
+                },
+                Err(std::env::VarError::NotPresent) => {}
+                Err(std::env::VarError::NotUnicode(_)) => warn_invalid(name),
+            }
+        }
+        overrides
+    }
+}
+
+pub(crate) fn apply_proxy_environment_overrides(settings: &mut ServerSettings) {
+    ProxyEnvironmentOverrides::from_environment().apply_to(settings);
+}
+
 fn parse_torrent_encryption_mode(value: &Value) -> Option<TorrentEncryptionMode> {
     if let Some(code) = value.as_u64() {
         return match code {
@@ -385,6 +469,8 @@ impl Default for ServerSettings {
             cache_root,
             cache_size: 10.0 * 1024.0 * 1024.0 * 1024.0, // 10GB
             proxy_streams_enabled: false,
+            allow_private_network_sources: false,
+            allow_invalid_proxy_tls_certificates: false,
             bt_max_connections: enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
             bt_handshake_timeout: 20000,
             bt_request_timeout: 10000,
@@ -425,6 +511,89 @@ impl Default for ServerSettings {
     }
 }
 
+pub(crate) struct PreparedSettingsUpdate {
+    pub(crate) next: ServerSettings,
+    allow_private_network_sources_changed: bool,
+    allow_invalid_proxy_tls_certificates_changed: bool,
+}
+
+impl PreparedSettingsUpdate {
+    fn disk_candidate(&self, live: &ServerSettings, raw: &ServerSettings) -> ServerSettings {
+        let mut disk = live.clone();
+        if !self.allow_private_network_sources_changed {
+            disk.allow_private_network_sources = raw.allow_private_network_sources;
+        }
+        if !self.allow_invalid_proxy_tls_certificates_changed {
+            disk.allow_invalid_proxy_tls_certificates = raw.allow_invalid_proxy_tls_certificates;
+        }
+        disk
+    }
+}
+
+pub(crate) fn preserve_raw_protected_settings(
+    live: &ServerSettings,
+    raw: &ServerSettings,
+) -> ServerSettings {
+    let mut disk = live.clone();
+    disk.allow_private_network_sources = raw.allow_private_network_sources;
+    disk.allow_invalid_proxy_tls_certificates = raw.allow_invalid_proxy_tls_certificates;
+    disk
+}
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum SettingsUpdateError {
+    #[error("protected setting requires local authorization")]
+    Forbidden,
+    #[error("invalid settings payload: {0}")]
+    Invalid(&'static str),
+    #[error("settings persistence failed")]
+    Persistence(#[source] anyhow::Error),
+}
+
+fn prepare_settings_update(
+    current: &ServerSettings,
+    payload: &Value,
+    authority: SettingsMutationAuthority,
+) -> Result<PreparedSettingsUpdate, SettingsUpdateError> {
+    let object = payload
+        .as_object()
+        .ok_or(SettingsUpdateError::Invalid("expected a JSON object"))?;
+    let mut next = current.clone();
+    let mut allow_private_network_sources_changed = false;
+    let mut allow_invalid_proxy_tls_certificates_changed = false;
+    for (key, current_value, target, changed) in [
+        (
+            "allowPrivateNetworkSources",
+            current.allow_private_network_sources,
+            &mut next.allow_private_network_sources,
+            &mut allow_private_network_sources_changed,
+        ),
+        (
+            "allowInvalidProxyTlsCertificates",
+            current.allow_invalid_proxy_tls_certificates,
+            &mut next.allow_invalid_proxy_tls_certificates,
+            &mut allow_invalid_proxy_tls_certificates_changed,
+        ),
+    ] {
+        if let Some(value) = object.get(key) {
+            let value = value.as_bool().ok_or(SettingsUpdateError::Invalid(
+                "protected values must be boolean",
+            ))?;
+            if value != current_value && authority == SettingsMutationAuthority::Untrusted {
+                return Err(SettingsUpdateError::Forbidden);
+            }
+            *changed = value != current_value;
+            *target = value;
+        }
+    }
+
+    Ok(PreparedSettingsUpdate {
+        next,
+        allow_private_network_sources_changed,
+        allow_invalid_proxy_tls_certificates_changed,
+    })
+}
+
 /// Returns server settings in the SettingsResponse format expected by stremio-core
 /// Response format: { "baseUrl": "http://...", "values": { ...settings } }
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -436,11 +605,92 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<()> {
-    tracing::debug!("update_settings: received payload: {:?}", payload);
+#[cfg(not(test))]
+pub(crate) async fn persist_settings_atomic(
+    path: &std::path::Path,
+    settings: &ServerSettings,
+) -> anyhow::Result<SettingsPersistenceOutcome> {
+    persist_settings_atomic_with_after_rename(path, settings, async {}).await
+}
 
-    // Merge with existing settings
-    let mut settings = state.settings.write().await;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsPersistenceOutcome {
+    Durable,
+    CommittedWithDurabilityWarning,
+}
+
+#[cfg(not(test))]
+pub(crate) async fn persist_settings_atomic_with_after_rename<F>(
+    path: &std::path::Path,
+    settings: &ServerSettings,
+    after_rename: F,
+) -> anyhow::Result<SettingsPersistenceOutcome>
+where
+    F: std::future::Future<Output = ()>,
+{
+    persist_settings_atomic_with_hooks(path, settings, after_rename, sync_settings_parent).await
+}
+
+#[cfg(not(test))]
+async fn sync_settings_parent(parent: std::path::PathBuf) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+pub(crate) async fn persist_settings_atomic_with_hooks<F, S, SF>(
+    path: &std::path::Path,
+    settings: &ServerSettings,
+    after_rename: F,
+    sync_parent: S,
+) -> anyhow::Result<SettingsPersistenceOutcome>
+where
+    F: std::future::Future<Output = ()>,
+    S: FnOnce(std::path::PathBuf) -> SF,
+    SF: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    let path = path.to_owned();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent"))?
+        .to_owned();
+    tokio::fs::create_dir_all(&parent).await?;
+    let parent_to_sync = parent.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
+        temporary.write_all(&bytes)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await??;
+    after_rename.await;
+    match sync_parent(parent_to_sync).await {
+        Ok(()) => Ok(SettingsPersistenceOutcome::Durable),
+        Err(_) => {
+            tracing::warn!("settings persistence durability warning");
+            Ok(SettingsPersistenceOutcome::CommittedWithDurabilityWarning)
+        }
+    }
+}
+
+pub async fn update_settings(
+    state: &AppState,
+    payload: &Value,
+    authority: SettingsMutationAuthority,
+) -> Result<(), SettingsUpdateError> {
+    let mut raw = state.settings_persistence.lock_owned().await;
+    let current = state.settings.read().await.clone();
+    let protected = prepare_settings_update(&current, payload, authority)?;
+    let mut settings = current;
+    settings.allow_private_network_sources = protected.next.allow_private_network_sources;
+    settings.allow_invalid_proxy_tls_certificates =
+        protected.next.allow_invalid_proxy_tls_certificates;
 
     if let Some(obj) = payload.as_object() {
         // Update fields that are present in the payload
@@ -645,38 +895,100 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
     };
 
-    // Release the write lock before saving
-    drop(settings);
+    let proxy_policy = ProxyPolicySettings {
+        allow_private_network_sources: settings.allow_private_network_sources,
+        allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+    };
+    let disk = protected.disk_candidate(&settings, &raw);
+    let transaction_state = state.clone();
+    let persistence = state.settings_persistence.clone();
+    #[cfg(test)]
+    let before_final_side_effect = state
+        .settings_persistence
+        .take_before_final_side_effect_gate();
+    let completion = state
+        .settings_persistence
+        .register_transaction(async move {
+            persistence
+                .persist_settings(&transaction_state.settings_path, &disk)
+                .await?;
+            *raw = disk;
+            let mut published = transaction_state.settings.write().await;
+            transaction_state
+                .proxy_runtime
+                .begin_reconfigure(proxy_policy);
+            *published = settings;
+            transaction_state
+                .proxy_runtime
+                .finish_reconfigure(proxy_policy);
+            drop(published);
 
-    // Apply updated torrent session settings dynamically.
-    state
-        .engine
-        .update_torrent_settings(&new_profile, &new_privacy)
-        .await;
-    state
-        .download_engine
-        .update_torrent_settings(&new_profile, &new_privacy)
-        .await;
+            #[cfg(test)]
+            transaction_state
+                .settings_persistence
+                .record_post_persist_side_effects();
+            transaction_state
+                .engine
+                .update_torrent_settings(&new_profile, &new_privacy)
+                .await;
+            transaction_state
+                .download_engine
+                .update_torrent_settings(&new_profile, &new_privacy)
+                .await;
 
-    state.engine.set_seeding_enabled(seeding_enabled);
-    state.download_engine.set_seeding_enabled(seeding_enabled);
+            transaction_state
+                .engine
+                .set_seeding_enabled(seeding_enabled);
+            #[cfg(test)]
+            if let Some(gate) = before_final_side_effect {
+                gate.reach_and_wait().await;
+            }
+            transaction_state
+                .download_engine
+                .set_seeding_enabled(seeding_enabled);
+            Ok(())
+        })
+        .map_err(|error| SettingsUpdateError::Persistence(error.into()))?;
 
-    // Save to disk
-    state.save_settings().await?;
-
-    Ok(())
+    match completion.await {
+        Ok(result) => result.map_err(SettingsUpdateError::Persistence),
+        Err(error) => {
+            tracing::error!("settings transaction failed");
+            Err(SettingsUpdateError::Persistence(error.into()))
+        }
+    }
 }
 
 pub async fn set_settings(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    match update_settings(&state, &payload).await {
-        Ok(_) => Json(json!({ "success": true })),
-        Err(e) => {
-            tracing::error!("Failed to save settings: {}", e);
-            Json(json!({ "success": false, "error": e.to_string() }))
-        }
+) -> Response {
+    let authority = state.settings_control.authorize_http(peer, &headers);
+    match update_settings(&state, &payload, authority).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
+        Err(SettingsUpdateError::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": "protected setting requires local authorization"
+            })),
+        )
+            .into_response(),
+        Err(SettingsUpdateError::Invalid(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"success": false, "error": "invalid settings payload"})),
+        )
+            .into_response(),
+        Err(SettingsUpdateError::Persistence(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "error": "settings could not be saved"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1031,12 +1343,437 @@ pub async fn get_file_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings_control::{
+        SETTINGS_TOKEN_HEADER, SettingsControl, SettingsMutationAuthority,
+    };
+    use enginefs::EngineFS;
     use serde_json::json;
+    use std::sync::Arc;
 
+    #[tokio::test]
+    async fn real_settings_handler_uses_connect_info_token_and_ignores_forwarded_headers() {
+        async fn call(
+            state: &AppState,
+            peer: &str,
+            token: Option<&[u8]>,
+            forwarded_for: Option<&str>,
+            value: bool,
+        ) -> StatusCode {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    SETTINGS_TOKEN_HEADER,
+                    axum::http::HeaderValue::from_bytes(token).unwrap(),
+                );
+            }
+            if let Some(forwarded_for) = forwarded_for {
+                headers.insert(
+                    "x-forwarded-for",
+                    axum::http::HeaderValue::from_str(forwarded_for).unwrap(),
+                );
+                headers.insert(
+                    "forwarded",
+                    axum::http::HeaderValue::from_str(&format!("for={forwarded_for}")).unwrap(),
+                );
+            }
+            set_settings(
+                ConnectInfo(peer.parse().unwrap()),
+                State(state.clone()),
+                headers,
+                Json(json!({"allowPrivateNetworkSources": value})),
+            )
+            .await
+            .status()
+        }
+
+        let _engine_test_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(
+            engine,
+            ServerSettings::default(),
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
+        let token = [b'a'; 64];
+        state.settings_control = SettingsControl::for_test(token);
+
+        for (peer, next) in [
+            ("127.0.0.1:40000", true),
+            ("[::1]:40000", false),
+            ("[::ffff:127.0.0.1]:40000", true),
+        ] {
+            assert_eq!(
+                call(&state, peer, Some(&token), None, next).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            call(
+                &state,
+                "127.0.0.1:40000",
+                Some(&token),
+                Some("192.168.1.50"),
+                false,
+            )
+            .await,
+            StatusCode::OK,
+            "forwarded remote address must not override loopback ConnectInfo"
+        );
+
+        for (peer, token_value, forwarded) in [
+            ("192.168.1.50:40000", Some(&token[..]), Some("127.0.0.1")),
+            ("[::ffff:192.168.1.50]:40000", Some(&token[..]), None),
+            ("127.0.0.1:40000", None, None),
+            ("127.0.0.1:40000", Some(&[b'b'; 64][..]), None),
+        ] {
+            assert_eq!(
+                call(&state, peer, token_value, forwarded, true).await,
+                StatusCode::FORBIDDEN,
+                "peer={peer}"
+            );
+        }
+        assert_eq!(
+            call(&state, "192.168.1.50:40000", None, Some("127.0.0.1"), false,).await,
+            StatusCode::OK,
+            "unchanged protected values remain compatible for untrusted callers"
+        );
+        assert!(!state.settings.read().await.allow_private_network_sources);
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_rolls_back_handler_policy_engine_and_tracker_state() {
+        let _engine_test_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(
+            engine,
+            ServerSettings::default(),
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
+        let token = [b'a'; 64];
+        state.settings_control = SettingsControl::for_test(token);
+        std::fs::create_dir_all(&state.settings_path).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SETTINGS_TOKEN_HEADER,
+            axum::http::HeaderValue::from_bytes(&token).unwrap(),
+        );
+        let response = set_settings(
+            ConnectInfo("127.0.0.1:40000".parse().unwrap()),
+            State(state.clone()),
+            headers,
+            Json(json!({
+                "allowPrivateNetworkSources": true,
+                "btMaxConnections": 321,
+                "btProxyPassword": "unique-secret-marker",
+                "cacheSize": 123.0,
+                "seedingEnabled": false,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let outward = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            outward,
+            r#"{"error":"settings could not be saved","success":false}"#
+        );
+        assert!(!outward.contains("unique-secret-marker"));
+        assert!(!outward.contains(state.settings_path.to_string_lossy().as_ref()));
+
+        let live = state.settings.read().await.clone();
+        assert!(!live.allow_private_network_sources);
+        assert_eq!(
+            live.bt_max_connections,
+            ServerSettings::default().bt_max_connections
+        );
+        assert_eq!(live.cache_size, ServerSettings::default().cache_size);
+        assert!(live.bt_proxy_password.is_empty());
+        assert!(live.cached_trackers.is_empty());
+        assert!(live.seeding_enabled);
+        let raw = state.settings_persistence.raw_snapshot().await;
+        assert!(!raw.allow_private_network_sources);
+        assert_eq!(
+            raw.bt_max_connections,
+            ServerSettings::default().bt_max_connections
+        );
+        assert_eq!(raw.cache_size, ServerSettings::default().cache_size);
+        assert!(raw.bt_proxy_password.is_empty());
+        assert!(raw.cached_trackers.is_empty());
+        assert!(raw.seeding_enabled);
+        let request = state.proxy_runtime.try_request().unwrap();
+        assert!(!request.settings.allow_private_network_sources);
+        assert!(state.engine.seeding_enabled());
+        assert!(state.download_engine.seeding_enabled());
+        assert_eq!(
+            state.settings_persistence.post_persist_side_effect_count(),
+            0
+        );
+
+        let bridge = crate::state::TrackerStorageBridge::new_with_persistence(
+            state.settings.clone(),
+            state.settings_path.clone(),
+            state.settings_persistence.clone(),
+        );
+        assert!(
+            bridge
+                .save_trackers_with_completion(
+                    vec!["udp://unique-tracker-secret".to_string()],
+                    123,
+                )
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(state.settings.read().await.cached_trackers.is_empty());
+        assert!(
+            state
+                .settings_persistence
+                .raw_snapshot()
+                .await
+                .cached_trackers
+                .is_empty()
+        );
+        assert_eq!(
+            state.settings_persistence.post_persist_side_effect_count(),
+            0
+        );
+        assert!(state.settings_path.is_dir());
+    }
     #[test]
     fn server_version_default_uses_crate_version() {
         let settings = ServerSettings::default();
         assert_eq!(settings.server_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn proxy_security_settings_default_false_when_missing_from_json() {
+        let mut value = serde_json::to_value(ServerSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("allowPrivateNetworkSources");
+        object.remove("allowInvalidProxyTlsCertificates");
+        let settings: ServerSettings = serde_json::from_value(value).unwrap();
+        assert!(!settings.allow_private_network_sources);
+        assert!(!settings.allow_invalid_proxy_tls_certificates);
+    }
+
+    #[test]
+    fn untrusted_round_trip_may_repeat_but_not_change_protected_values() {
+        let current = ServerSettings::default();
+        let unchanged = json!({
+            "allowPrivateNetworkSources": false,
+            "allowInvalidProxyTlsCertificates": false,
+        });
+        assert!(
+            prepare_settings_update(&current, &unchanged, SettingsMutationAuthority::Untrusted,)
+                .is_ok()
+        );
+
+        let changed = json!({"allowPrivateNetworkSources": true});
+        assert!(matches!(
+            prepare_settings_update(&current, &changed, SettingsMutationAuthority::Untrusted,),
+            Err(SettingsUpdateError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn authorized_callers_may_change_protected_values() {
+        let current = ServerSettings::default();
+        for authority in [
+            SettingsMutationAuthority::TrustedLocal,
+            SettingsMutationAuthority::HttpAuthorized,
+        ] {
+            let prepared = prepare_settings_update(
+                &current,
+                &json!({
+                    "allowPrivateNetworkSources": true,
+                    "allowInvalidProxyTlsCertificates": true,
+                }),
+                authority,
+            )
+            .unwrap();
+            assert!(prepared.next.allow_private_network_sources);
+            assert!(prepared.next.allow_invalid_proxy_tls_certificates);
+        }
+    }
+
+    #[test]
+    fn same_effective_protected_values_do_not_overwrite_raw_settings() {
+        for (raw_value, effective_value) in [(false, true), (true, false)] {
+            for authority in [
+                SettingsMutationAuthority::Untrusted,
+                SettingsMutationAuthority::TrustedLocal,
+                SettingsMutationAuthority::HttpAuthorized,
+            ] {
+                for field in [
+                    "allowPrivateNetworkSources",
+                    "allowInvalidProxyTlsCertificates",
+                ] {
+                    let raw = ServerSettings {
+                        allow_private_network_sources: raw_value,
+                        allow_invalid_proxy_tls_certificates: raw_value,
+                        ..ServerSettings::default()
+                    };
+                    let mut effective = raw.clone();
+                    effective.allow_private_network_sources = effective_value;
+                    effective.allow_invalid_proxy_tls_certificates = effective_value;
+                    let payload = json!({field: effective_value});
+                    let prepared =
+                        prepare_settings_update(&effective, &payload, authority).unwrap();
+                    let mut live = prepared.next.clone();
+                    live.cache_size = 321.0;
+
+                    let disk = prepared.disk_candidate(&live, &raw);
+
+                    assert_eq!(disk.allow_private_network_sources, raw_value, "{field}");
+                    assert_eq!(
+                        disk.allow_invalid_proxy_tls_certificates, raw_value,
+                        "{field}"
+                    );
+                    assert_eq!(disk.cache_size, 321.0, "{field}");
+                    assert_eq!(
+                        prepared.next.allow_private_network_sources, effective_value,
+                        "{field}"
+                    );
+                    assert_eq!(
+                        prepared.next.allow_invalid_proxy_tls_certificates, effective_value,
+                        "{field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_boolean_protected_values_are_invalid_even_when_falsey() {
+        let current = ServerSettings::default();
+        for payload in [
+            json!({"allowPrivateNetworkSources": null}),
+            json!({"allowPrivateNetworkSources": 0}),
+            json!({"allowInvalidProxyTlsCertificates": "false"}),
+        ] {
+            assert!(matches!(
+                prepare_settings_update(
+                    &current,
+                    &payload,
+                    SettingsMutationAuthority::TrustedLocal,
+                ),
+                Err(SettingsUpdateError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn environment_boolean_parser_is_strict_and_case_insensitive() {
+        for value in ["1", "true", "TRUE", "yes", "On"] {
+            assert_eq!(parse_environment_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "false", "FALSE", "no", "Off"] {
+            assert_eq!(parse_environment_bool(value), Some(false), "{value}");
+        }
+        for value in ["", " true ", "enabled", "2"] {
+            assert_eq!(parse_environment_bool(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn pure_environment_overrides_apply_in_both_directions_and_win_on_restart() {
+        for (raw_value, override_value) in [(false, true), (true, false)] {
+            let raw = ServerSettings {
+                allow_private_network_sources: raw_value,
+                allow_invalid_proxy_tls_certificates: raw_value,
+                ..ServerSettings::default()
+            };
+            let overrides = ProxyEnvironmentOverrides {
+                allow_private_network_sources: Some(override_value),
+                allow_invalid_proxy_tls_certificates: Some(override_value),
+            };
+
+            let mut effective = raw.clone();
+            overrides.apply_to(&mut effective);
+
+            assert_eq!(effective.allow_private_network_sources, override_value);
+            assert_eq!(
+                effective.allow_invalid_proxy_tls_certificates,
+                override_value
+            );
+            assert_eq!(raw.allow_private_network_sources, raw_value);
+            assert_eq!(raw.allow_invalid_proxy_tls_certificates, raw_value);
+
+            let mut restarted = raw;
+            overrides.apply_to(&mut restarted);
+            assert_eq!(restarted.allow_private_network_sources, override_value);
+            assert_eq!(
+                restarted.allow_invalid_proxy_tls_certificates,
+                override_value
+            );
+        }
+    }
+
+    #[test]
+    fn environment_reader_reports_invalid_unicode_by_name_without_value() {
+        let mut warnings = Vec::new();
+        let overrides = ProxyEnvironmentOverrides::from_reader(
+            |_| {
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "secret-environment-bytes",
+                )))
+            },
+            |name| warnings.push(name.to_string()),
+        );
+
+        assert_eq!(overrides, ProxyEnvironmentOverrides::default());
+        assert_eq!(
+            warnings,
+            [
+                "STREMIO_ALLOW_PRIVATE_NETWORK_SOURCES",
+                "STREMIO_ALLOW_INVALID_PROXY_TLS_CERTIFICATES",
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("secret-environment-bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_commit_survives_a_parent_directory_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let candidate = ServerSettings {
+            cache_size: 654.0,
+            ..ServerSettings::default()
+        };
+
+        let outcome = persist_settings_atomic_with_hooks(&path, &candidate, async {}, |_| async {
+            Err(anyhow::anyhow!("injected parent sync failure"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            SettingsPersistenceOutcome::CommittedWithDurabilityWarning
+        );
+        let disk: ServerSettings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(disk.cache_size, 654.0);
     }
 
     #[test]

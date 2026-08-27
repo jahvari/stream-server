@@ -135,6 +135,7 @@ export component IconButton inherits Rectangle {
 // A custom on/off switch bound to a bool. Two-way bindable via `checked`.
 export component Toggle inherits Rectangle {
     in-out property <bool> checked;
+    in property <bool> enabled: true;
 
     width: 42px;
     height: 24px;
@@ -142,12 +143,15 @@ export component Toggle inherits Rectangle {
     border-width: 1px;
     border-color: root.checked ? Theme.accent : Theme.border;
     background: root.checked ? Theme.accent : Theme.surface-alt;
+    opacity: root.enabled ? 1 : 0.45;
     animate background, border-color { duration: 140ms; }
 
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => {
-            root.checked = !root.checked;
+            if root.enabled {
+                root.checked = !root.checked;
+            }
         }
     }
 
@@ -372,6 +376,7 @@ export component FieldRow inherits HorizontalLayout {
 export component ToggleRow inherits HorizontalLayout {
     in property <string> label;
     in property <string> description;
+    in property <bool> enabled: true;
     in-out property <bool> checked;
 
     height: root.description != "" ? 56px : 40px;
@@ -417,6 +422,7 @@ export component ToggleRow inherits HorizontalLayout {
         alignment: center;
         Toggle {
             checked <=> root.checked;
+            enabled: root.enabled;
         }
     }
 }

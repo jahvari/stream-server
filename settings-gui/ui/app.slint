@@ -92,6 +92,9 @@ export component AppWindow inherits Window {
     in-out property <string> cache-root;
     in-out property <string> cache-size;
     in-out property <bool> proxy-streams-enabled;
+    in-out property <bool> allow-private-network-sources;
+    in-out property <bool> allow-invalid-proxy-tls-certificates;
+    in-out property <bool> protected-settings-enabled: false;
     in-out property <string> bt-max-connections;
     in-out property <string> bt-handshake-timeout;
     in-out property <string> bt-request-timeout;
@@ -357,7 +360,19 @@ export component AppWindow inherits Window {
                         ToggleRow { label: "Anonymous mode"; checked <=> root.bt-anonymous-mode; }
                         ToggleRow { label: "Allow multiple connections per IP"; checked <=> root.bt-allow-multiple-connections-per-ip; }
                         ToggleRow { label: "Validate HTTPS trackers"; checked <=> root.bt-validate-https-trackers; }
-                        ToggleRow { label: "SSRF mitigation"; checked <=> root.bt-ssrf-mitigation; }
+                        ToggleRow {
+                            label: "Allow private/LAN proxy sources";
+                            description: "Global for every /proxy request. Allows eligible computer/LAN services; metadata stays blocked.";
+                            enabled: root.protected-settings-enabled;
+                            checked <=> root.allow-private-network-sources;
+                        }
+                        ToggleRow {
+                            label: "Allow invalid proxy TLS certificates";
+                            description: "Global for every /proxy request. Disables certificate checks; enable only when required.";
+                            enabled: root.protected-settings-enabled;
+                            checked <=> root.allow-invalid-proxy-tls-certificates;
+                        }
+                        ToggleRow { label: "BitTorrent SSRF mitigation"; checked <=> root.bt-ssrf-mitigation; }
                     }
 
                     // ---------------- Network ----------------

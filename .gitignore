@@ -5,6 +5,7 @@
 /vcpkg
 /vcpkg_installed
 /memory/
+/.worktrees/
 /.vscode/
 /debug.log
 err.txt

@@ -62,7 +62,7 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 - **🌐 Network Info**: `/network-info` endpoint for interface discovery
 - **💓 Heartbeat**: `/heartbeat` for health checks
 - **⚙️ Settings**: Runtime-configurable via `/settings`
-- **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
+- **🔒 Privacy Controls**: Safe `/proxy` network-source defaults plus BitTorrent DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [Network Source Security](docs/network-source-security.md) and [BitTorrent Settings](docs/bittorrent-settings.md).
 
 ---
 

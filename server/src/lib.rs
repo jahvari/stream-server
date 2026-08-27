@@ -20,6 +20,9 @@ pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 pub static GLOBAL_STATE: once_cell::sync::Lazy<std::sync::RwLock<Option<AppState>>> =
     once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
 
+#[cfg(test)]
+pub(crate) static TEST_ENGINE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub mod tray;
 
@@ -48,7 +51,10 @@ mod cache_cleaner;
 mod diagnostics;
 mod ffmpeg_setup;
 mod local_addon;
+mod network_security;
 mod routes;
+mod safe_file;
+mod settings_control;
 mod ssdp;
 mod state;
 pub mod transcoding;
@@ -154,6 +160,7 @@ pub enum ShutdownSource {
 pub struct ServerHandle {
     http_addr: SocketAddr,
     bound_http_addr: SocketAddr,
+    bound_https_addr: Option<SocketAddr>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     join: std::thread::JoinHandle<anyhow::Result<Option<ShutdownSource>>>,
 }
@@ -165,6 +172,10 @@ impl ServerHandle {
 
     pub fn bound_http_addr(&self) -> SocketAddr {
         self.bound_http_addr
+    }
+
+    pub fn bound_https_addr(&self) -> Option<SocketAddr> {
+        self.bound_https_addr
     }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
@@ -192,11 +203,17 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
         .name("stream-server".to_string())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run(thread_cfg, shutdown_rx, Some(ready_tx)))
+            rt.block_on(run_inner(
+                thread_cfg,
+                shutdown_rx,
+                None,
+                None,
+                Some(ready_tx),
+            ))
         })?;
 
-    let bound_http_addr = match ready_rx.blocking_recv() {
-        Ok(addr) => addr,
+    let bindings = match ready_rx.blocking_recv() {
+        Ok(bindings) => bindings,
         Err(_) => {
             return match join.join() {
                 Ok(result) => match result {
@@ -211,8 +228,9 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     };
 
     Ok(ServerHandle {
-        http_addr: connectable_addr(bound_http_addr),
-        bound_http_addr,
+        http_addr: connectable_addr(bindings.http),
+        bound_http_addr: bindings.http,
+        bound_https_addr: bindings.https,
         shutdown_tx,
         join,
     })
@@ -223,7 +241,7 @@ pub async fn run(
     external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, None, ready_tx).await
+    run_inner(cfg, external_shutdown_rx, None, ready_tx, None).await
 }
 
 pub async fn run_with_tray_stats(
@@ -232,7 +250,30 @@ pub async fn run_with_tray_stats(
     tray_stats: Arc<tray::TrayStats>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, Some(tray_stats), ready_tx).await
+    run_inner(cfg, external_shutdown_rx, Some(tray_stats), ready_tx, None).await
+}
+
+struct StartupBindings {
+    http: SocketAddr,
+    https: Option<SocketAddr>,
+}
+
+struct PreparedHttpsListener {
+    bound_addr: SocketAddr,
+    server: axum_server::Server<SocketAddr, axum_server::tls_rustls::RustlsAcceptor>,
+}
+
+async fn prepare_https_listener(
+    configured_addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<PreparedHttpsListener> {
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    let listener = std::net::TcpListener::bind(configured_addr)?;
+    listener.set_nonblocking(true)?;
+    let bound_addr = listener.local_addr()?;
+    let server = axum_server::from_tcp_rustls(listener, tls)?;
+    Ok(PreparedHttpsListener { bound_addr, server })
 }
 
 async fn run_inner(
@@ -240,6 +281,7 @@ async fn run_inner(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     tray_stats: Option<Arc<tray::TrayStats>>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    startup_ready_tx: Option<tokio::sync::oneshot::Sender<StartupBindings>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
@@ -400,12 +442,17 @@ async fn run_inner(
         ..routes::system::ServerSettings::default()
     };
 
-    let settings = AppState::load_settings(&config_dir, &default_settings);
+    let raw_settings = AppState::load_raw_settings(&config_dir, &default_settings);
+    let mut settings = raw_settings.clone();
+    routes::system::apply_proxy_environment_overrides(&mut settings);
+    let settings_control = settings_control::SettingsControl::load_or_create(&config_dir)?;
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
     let settings_path = config_dir.join("settings.json");
-    let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
+    let settings_persistence = Arc::new(state::SettingsPersistenceCoordinator::new(raw_settings));
+    let tracker_storage = Arc::new(state::TrackerStorageBridge::new_with_persistence(
         settings_arc.clone(),
         settings_path.clone(),
+        settings_persistence.clone(),
     ));
 
     let backend_config = enginefs::backend::BackendConfig {
@@ -488,6 +535,53 @@ async fn run_inner(
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.update_install_exit_enabled = cfg.enable_update_exit;
+    state.settings_control = settings_control;
+    state.settings_persistence = settings_persistence;
+    let https_cert_path = config_dir.join("https-cert.pem");
+    let https_key_path = config_dir.join("https-key.pem");
+    let prepared_https = if https_cert_path.exists() && https_key_path.exists() {
+        match cfg.https_addr {
+            Some(https_addr) => {
+                match prepare_https_listener(https_addr, &https_cert_path, &https_key_path).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(_) => {
+                        tracing::error!("HTTPS server preparation failed");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        if let Some(https_addr) = cfg.https_addr {
+            tracing::info!(
+                "No HTTPS certificates found in {:?}, skipping HTTPS server on {:?}",
+                config_dir,
+                https_addr
+            );
+        }
+        None
+    };
+    let bound_https_addr = prepared_https.as_ref().map(|prepared| prepared.bound_addr);
+    let mut listeners = vec![network_security::ListenerBinding {
+        socket: bound_http_addr,
+    }];
+    if let Some(https_addr) = bound_https_addr {
+        listeners.push(network_security::ListenerBinding { socket: https_addr });
+    }
+    let validator = Arc::new(network_security::DestinationValidator::new(
+        Arc::new(network_security::SystemDnsResolver),
+        Arc::new(network_security::SystemLocalNetworkProvider),
+        Arc::new(network_security::SystemClock),
+        listeners,
+    ));
+    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+        network_security::ProxyPolicySettings {
+            allow_private_network_sources: settings.allow_private_network_sources,
+            allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+        },
+        validator,
+    ));
 
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
@@ -607,6 +701,8 @@ async fn run_inner(
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
 
+    let settings_persistence_for_shutdown = state.settings_persistence.clone();
+    let settings_persistence_for_drain = state.settings_persistence.clone();
     let app = build_router(state);
 
     tracing::info!("listening on {}", bound_http_addr);
@@ -616,6 +712,12 @@ async fn run_inner(
     }
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(bound_http_addr);
+    }
+    if let Some(startup_ready_tx) = startup_ready_tx {
+        let _ = startup_ready_tx.send(StartupBindings {
+            http: bound_http_addr,
+            https: bound_https_addr,
+        });
     }
 
     let (shutdown_started_tx, mut shutdown_started_rx) =
@@ -639,6 +741,7 @@ async fn run_inner(
             }
         };
 
+        settings_persistence_for_shutdown.close();
         // Close supervised child/selection admission synchronously before the
         // broader server token wakes asynchronous shutdown observers.
         supervisor_on_shutdown.cancel();
@@ -646,37 +749,25 @@ async fn run_inner(
         let _ = shutdown_started_tx.send(source);
     };
 
-    let https_cert_path = config_dir.join("https-cert.pem");
-    let https_key_path = config_dir.join("https-key.pem");
-
-    if let Some(https_addr) = cfg.https_addr {
-        if https_cert_path.exists() && https_key_path.exists() {
-            tracing::info!("Found HTTPS certificates, starting HTTPS server on {https_addr}");
-            let https_app = app.clone();
-            let https_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                https_cert_path,
-                https_key_path,
-            )
-            .await?;
-
-            background_tasks.push(diagnostics::logging::spawn_logged(
-                "https-server",
-                async move {
-                    if let Err(e) = axum_server::bind_rustls(https_addr, https_config)
-                        .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
-                        .await
-                    {
-                        tracing::error!("HTTPS server error: {}", e);
-                    }
-                },
-            ));
-        } else {
-            tracing::info!(
-                "No HTTPS certificates found in {:?}, skipping HTTPS server on {:?}",
-                config_dir,
-                https_addr
-            );
-        }
+    if let Some(prepared_https) = prepared_https {
+        tracing::info!(
+            "Found HTTPS certificates, starting HTTPS server on {}",
+            prepared_https.bound_addr
+        );
+        let https_app = app.clone();
+        background_tasks.push(diagnostics::logging::spawn_logged(
+            "https-server",
+            async move {
+                if prepared_https
+                    .server
+                    .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("HTTPS server failed");
+                }
+            },
+        ));
     }
 
     let server = axum::serve(
@@ -688,9 +779,11 @@ async fn run_inner(
 
     tokio::pin!(server);
 
+    let mut force_exit_after_drain = false;
+    let mut server_result = Ok(());
     let shutdown_source = tokio::select! {
         result = &mut server => {
-            result?;
+            server_result = result;
             match shutdown_started_rx.try_recv() {
                 Ok(source) => Some(source),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
@@ -700,7 +793,7 @@ async fn run_inner(
         Ok(source) = &mut shutdown_started_rx => {
             match tokio::time::timeout(cfg.graceful_shutdown_timeout, &mut server).await {
                 Ok(result) => {
-                    result?;
+                    server_result = result;
                 }
                 Err(_) => {
                     if cfg.exit_process_on_shutdown_timeout {
@@ -709,14 +802,14 @@ async fn run_inner(
                             timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
                             "Shutdown taking too long, forcing process exit"
                         );
-                        std::process::exit(0);
+                        force_exit_after_drain = true;
+                    } else {
+                        tracing::warn!(
+                            ?source,
+                            timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
+                            "Shutdown taking too long, dropping server future so restart can continue"
+                        );
                     }
-
-                    tracing::warn!(
-                        ?source,
-                        timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
-                        "Shutdown taking too long, dropping server future so restart can continue"
-                    );
                 }
             }
             Some(source)
@@ -730,6 +823,14 @@ async fn run_inner(
         task.abort();
     }
 
+    finish_settings_shutdown(
+        settings_persistence_for_drain,
+        force_exit_after_drain,
+        || std::process::exit(0),
+        server_result,
+    )
+    .await?;
+
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
         if let Ok(mut guard) = GLOBAL_STATE.write() {
@@ -738,6 +839,24 @@ async fn run_inner(
     }
 
     Ok(shutdown_source)
+}
+
+async fn finish_settings_shutdown<F>(
+    settings_persistence: Arc<state::SettingsPersistenceCoordinator>,
+    force_exit: bool,
+    exit_action: F,
+    server_result: std::io::Result<()>,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(),
+{
+    settings_persistence.close();
+    settings_persistence.drain().await;
+    if force_exit {
+        exit_action();
+    }
+    server_result?;
+    Ok(())
 }
 
 async fn maybe_ctrl_c(enabled: bool) {
@@ -760,6 +879,22 @@ fn connectable_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+async fn reject_proxy_hop_reentry(
+    State(runtime): State<Arc<network_security::ProxyRuntime>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    let is_proxy_path = path == "/proxy" || path.starts_with("/proxy/");
+    if !is_proxy_path && runtime.matches_inbound_hop_marker(request.headers()) {
+        return routes::proxy::blocked_response();
+    }
+    next.run(request).await
+}
+
+/// Builds the legacy convenience router. Its proxy self-listener policy uses
+/// the default `127.0.0.1:11470` binding installed by [`AppState`]. Embedders
+/// serving on any other socket must use [`build_router_with_listeners`].
 pub fn build_router(state: AppState) -> Router {
     fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
         req.extensions()
@@ -869,7 +1004,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tgz", routes::archive::router())
         .nest("/nzb", routes::nzb::router())
         .nest("/local-addon", local_addon::get_router())
-        .nest("/proxy", routes::proxy::router())
+        .nest_service("/proxy", routes::proxy::service(state.clone()))
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
         .route("/hlsv2/status", get(routes::hls::hls_status))
@@ -910,16 +1045,62 @@ pub fn build_router(state: AppState) -> Router {
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "request",
-                    method = %request.method(),
-                    path = request.uri().path(),
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let target = diagnostics::logging::sanitize_request_target(request.uri());
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        path = %target.path,
+                    )
+                })
+                .on_request(
+                    |request: &axum::http::Request<axum::body::Body>, span: &tracing::Span| {
+                        if request.uri().path().starts_with("/proxy") {
+                            tracing::info!(parent: span, "proxy request started");
+                        }
+                    },
+                ),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.proxy_runtime.clone(),
+            reject_proxy_hop_reentry,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Builds a router whose proxy destination policy knows the complete sockets
+/// on which the caller will serve it. Pass every actual bound `SocketAddr`
+/// after binding, including IPv6 scope IDs; configured or requested addresses
+/// are not a substitute for the sockets returned by the operating system.
+pub fn build_router_with_listeners(mut state: AppState, listeners: Vec<SocketAddr>) -> Router {
+    assert!(
+        !listeners.is_empty(),
+        "listener-aware router requires at least one actual bound socket"
+    );
+    let settings = state
+        .settings
+        .try_read()
+        .expect("settings must be uncontended during router construction")
+        .clone();
+    let validator = Arc::new(network_security::DestinationValidator::new(
+        Arc::new(network_security::SystemDnsResolver),
+        Arc::new(network_security::SystemLocalNetworkProvider),
+        Arc::new(network_security::SystemClock),
+        listeners
+            .into_iter()
+            .map(|socket| network_security::ListenerBinding { socket })
+            .collect(),
+    ));
+    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+        network_security::ProxyPolicySettings {
+            allow_private_network_sources: settings.allow_private_network_sources,
+            allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
+        },
+        validator,
+    ));
+    build_router(state)
 }
 
 async fn root_redirect(State(state): State<AppState>) -> Redirect {
@@ -928,4 +1109,329 @@ async fn root_redirect(State(state): State<AppState>) -> Redirect {
         "https://web.stremio.com/#/?streamingServer={}",
         encoded_url
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_request_traces_and_diagnostics_export_only_redacted_targets() {
+        use std::io::Read;
+        use tower::ServiceExt;
+
+        const SECRETS: &[&str] = &[
+            "parser-header-secret-9c30",
+            "policy-user-secret-9c30",
+            "policy-query-secret-9c30",
+            "policy-header-secret-9c30",
+            "redirect-user-secret-9c30",
+            "redirect-query-secret-9c30",
+            "redirect-header-secret-9c30",
+            "upstream-user-secret-9c30",
+            "upstream-query-secret-9c30",
+            "upstream-header-secret-9c30",
+        ];
+
+        #[derive(Clone)]
+        struct TestLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for TestLogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _engine_test_guard = TEST_ENGINE_MUTEX.lock().await;
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let redirect_task = tokio::spawn(async move {
+            axum::serve(
+                redirect_listener,
+                Router::new().route(
+                    "/redirect",
+                    get(|| async {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(
+                                axum::http::header::LOCATION,
+                                concat!(
+                                    "http://redirect-user:redirect-user-secret-9c30@169.254.169.254/",
+                                    "latest/meta-data/?token=redirect-query-secret-9c30"
+                                ),
+                            )],
+                        )
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_address = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let settings = routes::system::ServerSettings {
+            allow_private_network_sources: true,
+            ..routes::system::ServerSettings::default()
+        };
+        let state = AppState::new(
+            engine,
+            settings,
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
+        std::fs::create_dir_all(&state.log_dir).unwrap();
+        let router = build_router(state.clone());
+        let requests = [
+            (
+                format!(
+                    "/proxy/?d=not-a-url&h={}",
+                    urlencoding::encode("X-Api-Key:parser-header-secret-9c30")
+                ),
+                StatusCode::BAD_REQUEST,
+                "Invalid proxy request",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(concat!(
+                        "http://policy-user:policy-user-secret-9c30@169.254.169.254/",
+                        "latest/meta-data/?token=policy-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:policy-header-secret-9c30")
+                ),
+                StatusCode::FORBIDDEN,
+                "Proxy destination is blocked",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(&format!(
+                        "http://redirect-user:redirect-user-secret-9c30@{redirect_address}/redirect?token=redirect-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:redirect-header-secret-9c30")
+                ),
+                StatusCode::FORBIDDEN,
+                "Proxy destination is blocked",
+            ),
+            (
+                format!(
+                    "/proxy/?d={}&h={}",
+                    urlencoding::encode(&format!(
+                        "http://upstream-user:upstream-user-secret-9c30@{closed_address}/asset?token=upstream-query-secret-9c30"
+                    )),
+                    urlencoding::encode("X-Api-Key:upstream-header-secret-9c30")
+                ),
+                StatusCode::BAD_GATEWAY,
+                "Proxy upstream request failed",
+            ),
+        ];
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = TestLogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        for (uri, expected_status, expected_body) in requests {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(body, expected_body);
+            for secret in SECRETS {
+                assert!(
+                    !body
+                        .windows(secret.len())
+                        .any(|part| part == secret.as_bytes())
+                );
+            }
+        }
+        drop(subscriber_guard);
+
+        let captured = logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let captured_text = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            captured_text.matches("proxy request started").count(),
+            4,
+            "unexpected proxy trace output:\n{captured_text}"
+        );
+        assert!(captured_text.matches("/proxy/<redacted>").count() >= 4);
+        for secret in SECRETS {
+            assert!(
+                !captured_text.contains(secret),
+                "captured log leaked {secret}"
+            );
+        }
+        std::fs::write(state.log_dir.join("proxy-redaction.log"), &captured).unwrap();
+
+        let diagnostics = diagnostics::build_diagnostics_zip(&state).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(diagnostics)).unwrap();
+        let mut saw_redacted_proxy = false;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            saw_redacted_proxy |= bytes
+                .windows(b"/proxy/<redacted>".len())
+                .any(|part| part == b"/proxy/<redacted>");
+            for secret in SECRETS {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|part| part == secret.as_bytes()),
+                    "diagnostics entry {} leaked {secret}",
+                    entry.name()
+                );
+            }
+        }
+        assert!(saw_redacted_proxy);
+        redirect_task.abort();
+    }
+
+    #[tokio::test]
+    async fn listener_aware_embedding_blocks_supplied_socket_while_legacy_keeps_default() {
+        let _engine_test_guard = TEST_ENGINE_MUTEX.lock().await;
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new().route("/ok", get(|| async { "fixture-ok" })),
+            )
+            .await
+            .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            EngineFS::new(temp.path().join("engine"), Default::default())
+                .await
+                .unwrap(),
+        );
+        let settings = routes::system::ServerSettings {
+            allow_private_network_sources: true,
+            ..routes::system::ServerSettings::default()
+        };
+        let state = AppState::new(
+            engine,
+            settings,
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
+        let target = format!("http://{upstream_address}/ok");
+
+        for (router, expected) in [
+            (
+                build_router_with_listeners(state.clone(), vec![upstream_address]),
+                StatusCode::FORBIDDEN,
+            ),
+            (build_router(state), StatusCode::OK),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let response = reqwest::get(format!(
+                "http://{address}/proxy/?d={}",
+                urlencoding::encode(&target)
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                assert_eq!(response.text().await.unwrap(), "fixture-ok");
+            }
+            server.abort();
+        }
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn forced_exit_waits_for_admitted_settings_transactions_to_drain() {
+        let coordinator = Arc::new(state::SettingsPersistenceCoordinator::new(
+            routes::system::ServerSettings::default(),
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let admitted = coordinator
+            .register_transaction(async move {
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .unwrap();
+        coordinator.close();
+        let exit_called = Arc::new(AtomicBool::new(false));
+        let observed = exit_called.clone();
+        let drain = finish_settings_shutdown(
+            coordinator,
+            true,
+            move || {
+                observed.store(true, Ordering::Release);
+            },
+            Ok(()),
+        );
+        tokio::pin!(drain);
+
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        assert!(!exit_called.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        drain.await.unwrap();
+        admitted.await.unwrap().unwrap();
+        assert!(exit_called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn server_error_is_returned_only_after_settings_transactions_drain() {
+        let coordinator = Arc::new(state::SettingsPersistenceCoordinator::new(
+            routes::system::ServerSettings::default(),
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let completion = coordinator
+            .register_transaction(async move {
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .unwrap();
+        let finish = finish_settings_shutdown(
+            coordinator,
+            false,
+            || {},
+            Err(std::io::Error::other("injected server failure")),
+        );
+        tokio::pin!(finish);
+
+        assert!(futures_util::poll!(&mut finish).is_pending());
+        release_tx.send(()).unwrap();
+        let error = finish.await.unwrap_err();
+        completion.await.unwrap().unwrap();
+        assert_eq!(error.to_string(), "injected server failure");
+    }
 }
