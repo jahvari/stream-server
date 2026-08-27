@@ -79,6 +79,9 @@ async-sevenz = { path = "../bindings/async-sevenz" }
 chrono = "0.4.45"
 sysinfo = "0.39.6"
 
+[dev-dependencies]
+librqbit = "9.0.0"
+
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 tao = "0.36.0"
 settings-gui = { path = "../settings-gui" }
