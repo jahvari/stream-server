@@ -280,12 +280,22 @@ impl RuntimeKind {
 /// boundaries.
 ///
 /// ```compile_fail
-/// use stream_server::transcoding::runtime::{
-///     TranscodingService, resolve_runtime, verify_unchanged,
-/// };
+/// use stream_server::transcoding::runtime::TranscodingService;
 /// let _unavailable = TranscodingService::unavailable;
+/// ```
+///
+/// ```compile_fail
+/// use stream_server::transcoding::runtime::TranscodingService;
 /// let _resolved = TranscodingService::resolved;
+/// ```
+///
+/// ```compile_fail
+/// use stream_server::transcoding::runtime::resolve_runtime;
 /// let _resolve = resolve_runtime;
+/// ```
+///
+/// ```compile_fail
+/// use stream_server::transcoding::runtime::verify_unchanged;
 /// let _verify = verify_unchanged;
 /// ```
 pub struct TranscodingService {
