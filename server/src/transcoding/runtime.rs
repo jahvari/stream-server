@@ -38,7 +38,7 @@ const SUPPORTED_JELLYFIN_MATCHER: &str = "7.1.4-Jellyfin";
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANAGED_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const HASH_DEADLINE: Duration = Duration::from_secs(10);
-const HASH_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
+pub(super) const HASH_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_PATH_CANDIDATES: usize = 64;
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(30);
 const MANAGED_INSTALL_LOCK_DEADLINE: Duration = Duration::from_secs(20);
@@ -2280,12 +2280,11 @@ fn run_snapshot_helper(
         helper_destination.to_string(),
         super::snapshot_helper::SNAPSHOT_MAXIMUM_BYTES.to_string(),
     ]);
-    command
-        .current_dir("/")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    command.current_dir("/").env_clear().stdin(Stdio::null());
+    #[cfg(test)]
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(not(test))]
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(staged_source_descriptor, helper_source) < 0
@@ -2305,10 +2304,14 @@ fn run_snapshot_helper(
                 let output = child
                     .wait_with_output()
                     .map_err(|_| CandidateFailure::Unsafe)?;
-                if !status.success() || output.stdout.len() > 96 {
+                #[cfg(test)]
+                let protocol = &output.stderr;
+                #[cfg(not(test))]
+                let protocol = &output.stdout;
+                if !status.success() || protocol.len() > 96 {
                     return Err(CandidateFailure::Unsafe);
                 }
-                let text = std::str::from_utf8(&output.stdout)
+                let text = std::str::from_utf8(protocol)
                     .map_err(|_| CandidateFailure::Unsafe)?
                     .trim();
                 let (length, digest) = text.split_once(':').ok_or(CandidateFailure::Unsafe)?;
@@ -5008,13 +5011,146 @@ fn extract_managed_archive_for_test(
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateFailure, FdNamespace, HashTestObserver, MAX_EXECUTABLE_BYTES, OpenMode,
-        open_pair_lease, render_fd_path,
+        CandidateFailure, FdNamespace, HASH_ADMISSION_DEADLINE, HASH_DEADLINE, HashTestObserver,
+        MAX_EXECUTABLE_BYTES, OpenMode, open_pair_lease, render_fd_path,
     };
     use sha2::Digest;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     use std::collections::BTreeMap;
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+
+    fn write_hash_test_pair(root: &std::path::Path) {
+        for role in ["ffmpeg", "ffprobe"] {
+            let path = root.join(format!("{role}{}", std::env::consts::EXE_SUFFIX));
+            fs::write(&path, format!("deterministic hash fixture for {role}\n"))
+                .expect("write hash fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o500))
+                    .expect("mark hash fixture executable");
+            }
+        }
+    }
+
+    fn hash_pause_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct HashPauseGuard {
+        observer: Arc<HashTestObserver>,
+        paused: bool,
+    }
+
+    impl HashPauseGuard {
+        fn new(observer: Arc<HashTestObserver>) -> Self {
+            observer.set_paused(true);
+            Self {
+                observer,
+                paused: true,
+            }
+        }
+
+        fn release(&mut self) {
+            self.observer.set_paused(false);
+            self.paused = false;
+        }
+    }
+
+    impl Drop for HashPauseGuard {
+        fn drop(&mut self) {
+            if self.paused {
+                self.observer.set_paused(false);
+            }
+        }
+    }
+
+    async fn wait_for_hash_start(
+        observer: &HashTestObserver,
+        task: &mut tokio::task::JoinHandle<Result<super::OpenedPair, CandidateFailure>>,
+    ) {
+        let started =
+            tokio::time::timeout(HASH_ADMISSION_DEADLINE + Duration::from_secs(5), async {
+                loop {
+                    if observer.snapshot().0 != 0 {
+                        break;
+                    }
+                    if task.is_finished() {
+                        let result = (&mut *task)
+                            .await
+                            .expect("hash task panicked before observation started");
+                        panic!("hash task finished before observation started: {result:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+        if started.is_err() {
+            observer.set_paused(false);
+            task.abort();
+            panic!("hash observation did not start within the bounded admission window");
+        }
+    }
+
+    fn hash_test_completion_deadline() -> Duration {
+        HASH_ADMISSION_DEADLINE + HASH_DEADLINE.saturating_mul(2) + Duration::from_secs(5)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_linux_snapshot_executable(
+        role: &str,
+        snapshot_value: &str,
+        require_origin_marker: bool,
+    ) -> Vec<u8> {
+        static BINARIES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        let key = format!("{role}:{snapshot_value}:{require_origin_marker}");
+        let binaries = BINARIES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let mut binaries = binaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(binary) = binaries.get(&key) {
+            return binary.clone();
+        }
+
+        let directory = tempfile::tempdir().expect("Linux snapshot fixture compiler directory");
+        let source = directory.path().join("snapshot_fixture.rs");
+        let executable = directory.path().join("snapshot-fixture");
+        fs::write(
+            &source,
+            format!(
+                r#"
+fn main() {{
+    if {require_origin_marker} && !std::path::Path::new("probe-origin-marker").is_file() {{
+        std::process::exit(91);
+    }}
+    match std::env::args().nth(1).as_deref() {{
+        Some("-version") => println!("{role} version 7.1.4"),
+        Some("-buildconf") => println!("configuration: --snapshot-origin"),
+        Some("--snapshot-value") => println!("{snapshot_value}"),
+        _ => std::process::exit(92),
+    }}
+}}
+"#
+            ),
+        )
+        .expect("write Linux snapshot fixture source");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-O"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("compile Linux snapshot fixture");
+        assert!(
+            status.success(),
+            "Linux snapshot fixture compilation failed"
+        );
+        let binary = fs::read(executable).expect("read Linux snapshot fixture");
+        binaries.insert(key, binary.clone());
+        binary
+    }
 
     #[cfg(windows)]
     fn hold_managed_install_lock(root: &std::path::Path) -> fslock::LockFile {
@@ -8369,11 +8505,9 @@ fn main() {{
             let executable = directory.path().join(role);
             fs::write(
                 &executable,
-                format!(
-                    "#!/bin/sh\n[ -f ./probe-origin-marker ] || exit 91\ncase \"$1\" in\n-version) echo \"{role} version 7.1.4\" ;;\n-buildconf) echo \"configuration: --snapshot-origin\" ;;\n*) exit 92 ;;\nesac\n"
-                ),
+                fake_linux_snapshot_executable(role, "ORIGINAL", true),
             )
-            .expect("write fake pair executable");
+            .expect("write native fake pair executable");
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
                 .expect("mark fake pair executable");
         }
@@ -8408,17 +8542,20 @@ fn main() {{
         use std::{ffi::OsString, fs::FileTimes, os::unix::fs::PermissionsExt};
         use tokio_util::sync::CancellationToken;
 
-        fn script(role: &str, value: &str) -> Vec<u8> {
-            format!(
-                "#!/bin/sh\ncase \"$1\" in\n-version) echo \"{role} version 7.1.4\" ;;\n-buildconf) echo \"configuration: --immutable-session\" ;;\n--snapshot-value) echo \"{value}\" ;;\n*) exit 92 ;;\nesac\n"
-            )
-            .into_bytes()
-        }
-
         let directory = tempfile::tempdir().expect("immutable session root");
-        for role in ["ffmpeg", "ffprobe"] {
+        let fixtures = ["ffmpeg", "ffprobe"].map(|role| {
+            let mut original = fake_linux_snapshot_executable(role, "ORIGINAL", false);
+            let mut replacement = fake_linux_snapshot_executable(role, "MUTATED!", false);
+            let shared_length = original.len().max(replacement.len());
+            // Linux ignores bytes after the ELF image. Equal padding makes the
+            // source mutation preserve length across rustc versions.
+            original.resize(shared_length, 0);
+            replacement.resize(shared_length, 0);
+            (role, original, replacement)
+        });
+        for (role, original, _) in &fixtures {
             let path = directory.path().join(role);
-            fs::write(&path, script(role, "ORIGINAL")).expect("write original fake runtime");
+            fs::write(&path, original).expect("write original native fake runtime");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o500))
                 .expect("mark fake runtime executable");
         }
@@ -8433,10 +8570,9 @@ fn main() {{
             .await
             .expect("required first-session full integrity check");
 
-        for role in ["ffmpeg", "ffprobe"] {
+        for (role, _, replacement) in fixtures {
             let path = directory.path().join(role);
             let metadata = fs::metadata(&path).expect("capture original metadata");
-            let replacement = script(role, "MUTATED!");
             assert_eq!(replacement.len(), metadata.len() as usize);
             fs::write(&path, replacement).expect("mutate same inode and size");
             fs::File::options()
@@ -8567,15 +8703,7 @@ fn main() {{
     #[tokio::test]
     async fn verification_hashing_is_single_flight_and_metadata_reopens_do_not_rehash() {
         let directory = tempfile::tempdir().expect("hash test root");
-        for role in ["ffmpeg", "ffprobe"] {
-            fs::copy(
-                std::env::current_exe().expect("test executable"),
-                directory
-                    .path()
-                    .join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
-            )
-            .expect("copy hash input");
-        }
+        write_hash_test_pair(directory.path());
         let observer = Arc::new(HashTestObserver::default());
         let (first, second) = tokio::join!(
             open_pair_lease(
@@ -8609,25 +8737,16 @@ fn main() {{
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborting_hash_future_keeps_admission_until_blocking_hash_finishes() {
+        let _test_guard = hash_pause_test_lock().lock().await;
         let directory = tempfile::tempdir().expect("cancelled hash root");
-        for role in ["ffmpeg", "ffprobe"] {
-            fs::copy(
-                std::env::current_exe().expect("test executable"),
-                directory
-                    .path()
-                    .join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
-            )
-            .expect("copy hash input");
-        }
+        write_hash_test_pair(directory.path());
         let observer = Arc::new(HashTestObserver::default());
-        observer.set_paused(true);
-        let first = tokio::spawn(open_pair_lease(
+        let mut pause_guard = HashPauseGuard::new(observer.clone());
+        let mut first = tokio::spawn(open_pair_lease(
             directory.path().to_path_buf(),
             OpenMode::FullObserved(observer.clone()),
         ));
-        while observer.snapshot().0 == 0 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_hash_start(&observer, &mut first).await;
         first.abort();
         assert!(
             first
@@ -8635,7 +8754,7 @@ fn main() {{
                 .expect_err("first hash future aborted")
                 .is_cancelled()
         );
-        let second = tokio::spawn(open_pair_lease(
+        let mut second = tokio::spawn(open_pair_lease(
             directory.path().to_path_buf(),
             OpenMode::FullObserved(observer.clone()),
         ));
@@ -8646,9 +8765,16 @@ fn main() {{
             "aborted future released admission while blocking hash was still alive"
         );
 
-        observer.set_paused(false);
-        second
-            .await
+        pause_guard.release();
+        let second_result =
+            match tokio::time::timeout(hash_test_completion_deadline(), &mut second).await {
+                Ok(result) => result,
+                Err(_) => {
+                    second.abort();
+                    panic!("second hash did not finish within the bounded hash window");
+                }
+            };
+        second_result
             .expect("join second hash")
             .expect("second hash after retained admission");
         assert_eq!(observer.snapshot(), (4, 1));
@@ -8656,25 +8782,16 @@ fn main() {{
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hash_admission_has_an_independent_deadline_while_a_worker_is_blocked() {
+        let _test_guard = hash_pause_test_lock().lock().await;
         let directory = tempfile::tempdir().expect("hash admission root");
-        for role in ["ffmpeg", "ffprobe"] {
-            fs::copy(
-                std::env::current_exe().expect("test executable"),
-                directory
-                    .path()
-                    .join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
-            )
-            .expect("copy hash input");
-        }
+        write_hash_test_pair(directory.path());
         let observer = Arc::new(HashTestObserver::default());
-        observer.set_paused(true);
-        let first = tokio::spawn(open_pair_lease(
+        let mut pause_guard = HashPauseGuard::new(observer.clone());
+        let mut first = tokio::spawn(open_pair_lease(
             directory.path().to_path_buf(),
             OpenMode::FullObserved(observer.clone()),
         ));
-        while observer.snapshot().0 == 0 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_hash_start(&observer, &mut first).await;
         observer.set_admission_deadline(Duration::from_millis(50));
 
         let second = tokio::time::timeout(
@@ -8689,9 +8806,16 @@ fn main() {{
         .expect_err("blocked admission must fail closed");
         assert!(matches!(second, CandidateFailure::Deadline));
 
-        observer.set_paused(false);
-        first
-            .await
+        pause_guard.release();
+        let first_result =
+            match tokio::time::timeout(hash_test_completion_deadline(), &mut first).await {
+                Ok(result) => result,
+                Err(_) => {
+                    first.abort();
+                    panic!("admitted hash did not finish within the bounded hash window");
+                }
+            };
+        first_result
             .expect("join admitted verification")
             .expect("finish admitted verification");
     }
@@ -8704,15 +8828,7 @@ fn main() {{
         use tokio_util::sync::CancellationToken;
 
         let directory = tempfile::tempdir().expect("session hash root");
-        for role in ["ffmpeg", "ffprobe"] {
-            fs::copy(
-                std::env::current_exe().expect("test executable"),
-                directory
-                    .path()
-                    .join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
-            )
-            .expect("copy hash input");
-        }
+        write_hash_test_pair(directory.path());
         let opened = open_pair_lease(directory.path().to_path_buf(), OpenMode::Full)
             .await
             .expect("initial resolution seal");

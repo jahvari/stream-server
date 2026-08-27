@@ -12,7 +12,8 @@ use crate::transcoding::process::{
 #[cfg(unix)]
 use crate::transcoding::runtime::verify_unchanged;
 use crate::transcoding::runtime::{
-    RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService, resolve_runtime,
+    HASH_ADMISSION_DEADLINE, RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService,
+    resolve_runtime,
 };
 use crate::transcoding::runtime_manifest::RuntimeError;
 #[cfg(windows)]
@@ -27,26 +28,43 @@ struct FakeProcess {
 
 fn fake_process() -> &'static FakeProcess {
     static FAKE: OnceLock<FakeProcess> = OnceLock::new();
-    FAKE.get_or_init(|| {
-        let directory = tempfile::tempdir().expect("fake process directory");
-        let source = directory.path().join("fake_process.rs");
-        let executable = directory
-            .path()
-            .join(format!("fake-process{}", std::env::consts::EXE_SUFFIX));
-        fs::write(&source, FAKE_PROCESS_SOURCE).expect("write fake process source");
-        let status = Command::new("rustc")
-            .args(["--edition=2024", "-O"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&executable)
-            .status()
-            .expect("compile fake process");
-        assert!(status.success(), "fake process compilation failed");
-        FakeProcess {
-            _directory: directory,
-            executable,
-        }
-    })
+    FAKE.get_or_init(|| compile_fake_process(None))
+}
+
+#[cfg(unix)]
+fn fake_runtime_process(role: &'static str) -> &'static FakeProcess {
+    static FFMPEG: OnceLock<FakeProcess> = OnceLock::new();
+    static FFPROBE: OnceLock<FakeProcess> = OnceLock::new();
+    match role {
+        "ffmpeg" => FFMPEG.get_or_init(|| compile_fake_process(Some("ffmpeg"))),
+        "ffprobe" => FFPROBE.get_or_init(|| compile_fake_process(Some("ffprobe"))),
+        _ => panic!("unsupported fake runtime role: {role}"),
+    }
+}
+
+fn compile_fake_process(runtime_role: Option<&str>) -> FakeProcess {
+    let directory = tempfile::tempdir().expect("fake process directory");
+    let source = directory.path().join("fake_process.rs");
+    let executable = directory
+        .path()
+        .join(format!("fake-process{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&source, FAKE_PROCESS_SOURCE).expect("write fake process source");
+    let mut compiler = Command::new("rustc");
+    compiler
+        .args(["--edition=2024", "-O"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable);
+    compiler.env_remove("STREAM_SERVER_FAKE_RUNTIME_ROLE");
+    if let Some(role) = runtime_role {
+        compiler.env("STREAM_SERVER_FAKE_RUNTIME_ROLE", role);
+    }
+    let status = compiler.status().expect("compile fake process");
+    assert!(status.success(), "fake process compilation failed");
+    FakeProcess {
+        _directory: directory,
+        executable,
+    }
 }
 
 fn spec(args: impl IntoIterator<Item = impl Into<OsString>>) -> ProcessSpec {
@@ -161,8 +179,12 @@ fn runtime_root(
     let root = base.join(name);
     fs::create_dir_all(&root).expect("create fake runtime root");
     for role in ["ffmpeg", "ffprobe"] {
+        #[cfg(unix)]
+        let source = &fake_runtime_process(role).executable;
+        #[cfg(not(unix))]
+        let source = &fake_process().executable;
         fs::copy(
-            &fake_process().executable,
+            source,
             root.join(format!("{role}{}", std::env::consts::EXE_SUFFIX)),
         )
         .expect("copy fake runtime executable");
@@ -412,7 +434,7 @@ async fn aborting_run_future_keeps_tree_readers_and_permit_owned_until_confirmed
     let running = {
         let supervisor = supervisor.clone();
         let request = spec([
-            OsString::from("--spawn-descendant"),
+            OsString::from("--spawn-descendant-ignore-sigterm"),
             markers.path().as_os_str().to_os_string(),
         ]);
         tokio::spawn(async move { supervisor.run_bounded(request).await })
@@ -672,7 +694,7 @@ async fn cancellation_allows_a_process_two_seconds_to_exit_before_force() {
     let running = {
         let supervisor = supervisor.clone();
         let request = spec([
-            OsString::from("--sleep-ms-with-marker"),
+            OsString::from("--sleep-ms-with-marker-ignore-sigterm"),
             OsString::from("350"),
             pid_marker.as_os_str().to_os_string(),
         ]);
@@ -704,7 +726,7 @@ async fn cancellation_forces_a_stalled_tree_after_two_seconds_then_confirms_reap
     let running = {
         let supervisor = supervisor.clone();
         let request = spec([
-            OsString::from("--stall-with-marker"),
+            OsString::from("--stall-with-marker-ignore-sigterm"),
             pid_marker.as_os_str().to_os_string(),
         ]);
         tokio::spawn(async move { supervisor.run_bounded(request).await })
@@ -1033,7 +1055,7 @@ async fn incompatible_explicit_pair_fails_closed_without_using_a_valid_managed_p
     assert!(matches!(error, RuntimeError::IncompatiblePair));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
     let directory = tempfile::tempdir().expect("runtime candidates");
     let stalled = jellyfin_root(directory.path(), "stalled");
@@ -1043,26 +1065,63 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
     let config = isolated_config()
         .with_explicit_root(stalled)
         .with_managed_current_root(managed);
-    let started = tokio::time::Instant::now();
-    let resolving = {
+    let mut resolving = {
         let supervisor = supervisor.clone();
         tokio::spawn(async move { resolve_runtime(&config, &supervisor).await })
     };
-    while supervisor.active_processes() == 0 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_secs(10)).await;
+    let registered = match tokio::time::timeout(
+        HASH_ADMISSION_DEADLINE + Duration::from_secs(5),
+        async {
+            loop {
+                if supervisor.active_processes() != 0 {
+                    break Instant::now();
+                }
+                if resolving.is_finished() {
+                    let result = (&mut resolving)
+                        .await
+                        .expect("join resolver that finished before probe registration");
+                    panic!("resolver finished before the stalled probe registered: {result:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        },
+    )
+    .await
+    {
+        Ok(registered) => registered,
+        Err(_) => {
+            supervisor.cancel();
+            let force_result = supervisor.force_terminate_registered();
+            resolving.abort();
+            let _ = resolving.await;
+            let idle_result = supervisor.wait_for_idle(Duration::from_secs(8)).await;
+            panic!(
+                "stalled probe did not register within the bounded snapshot admission window: force={force_result:?}, idle={idle_result:?}"
+            );
+        }
+    };
 
-    let error = resolving
-        .await
+    let resolved = match tokio::time::timeout(Duration::from_secs(20), &mut resolving).await {
+        Ok(result) => result,
+        Err(_) => {
+            supervisor.cancel();
+            let force_result = supervisor.force_terminate_registered();
+            resolving.abort();
+            let _ = resolving.await;
+            let idle_result = supervisor.wait_for_idle(Duration::from_secs(8)).await;
+            panic!(
+                "stalled resolver exceeded its command deadline and bounded cleanup: force={force_result:?}, idle={idle_result:?}"
+            );
+        }
+    };
+    let error = resolved
         .expect("join stalled resolver")
         .expect_err("stalled version probe must fail");
 
     assert!(matches!(error, RuntimeError::ProbeDeadline));
-    assert!(started.elapsed() >= Duration::from_secs(10));
     assert!(
-        started.elapsed() <= Duration::from_millis(17_100),
-        "the ten-second probe deadline may be followed by the specified two-second grace and five-second bounded reap"
+        registered.elapsed() >= Duration::from_secs(10),
+        "the stalled probe ended before its ten-second wall deadline"
     );
     assert_eq!(supervisor.active_processes(), 0);
 }
@@ -1396,12 +1455,29 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+fn ignore_sigterm() {
+    unsafe extern "C" {
+        fn signal(signal: i32, handler: usize) -> usize;
+    }
+    const SIGTERM: i32 = 15;
+    // libc defines `sighandler_t` as `size_t` and SIG_IGN as 1 on the
+    // supported Unix targets. This fixture is compiled directly by rustc, so
+    // it cannot import the workspace's libc crate.
+    const SIG_IGN: usize = 1;
+    unsafe { signal(SIGTERM, SIG_IGN); }
+}
+
+#[cfg(not(unix))]
+fn ignore_sigterm() {}
+
 fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     if runtime_query(&args) {
         return;
     }
-    match args.first().and_then(|arg| arg.to_str()) {
+    let mode = args.first().and_then(|arg| arg.to_str());
+    match mode {
         Some("--emit") => {
             let stdout = parse_size(args.get(1));
             let stderr = parse_size(args.get(2));
@@ -1419,7 +1495,10 @@ fn main() {
         Some("--touch") => {
             fs::write(PathBuf::from(args.get(1).expect("marker path")), b"spawned").unwrap();
         }
-        Some("--spawn-descendant") => {
+        Some("--spawn-descendant") | Some("--spawn-descendant-ignore-sigterm") => {
+            if mode == Some("--spawn-descendant-ignore-sigterm") {
+                ignore_sigterm();
+            }
             let directory = PathBuf::from(args.get(1).expect("marker directory"));
             let child = Command::new(env::current_exe().unwrap())
                 .arg("--descendant-child")
@@ -1444,7 +1523,10 @@ fn main() {
         }
         Some("--descendant-child") => loop { thread::sleep(Duration::from_secs(1)); },
         Some("--stall") => loop { thread::sleep(Duration::from_secs(1)); },
-        Some("--stall-with-marker") => {
+        Some("--stall-with-marker") | Some("--stall-with-marker-ignore-sigterm") => {
+            if mode == Some("--stall-with-marker-ignore-sigterm") {
+                ignore_sigterm();
+            }
             fs::write(
                 PathBuf::from(args.get(1).expect("marker path")),
                 std::process::id().to_string(),
@@ -1452,7 +1534,8 @@ fn main() {
             .unwrap();
             loop { thread::sleep(Duration::from_secs(1)); }
         }
-        Some("--sleep-ms-with-marker") => {
+        Some("--sleep-ms-with-marker-ignore-sigterm") => {
+            ignore_sigterm();
             let milliseconds = parse_size(args.get(1));
             fs::write(
                 PathBuf::from(args.get(2).expect("marker path")),
@@ -1476,18 +1559,20 @@ fn runtime_query(args: &[OsString]) -> bool {
     if root.join("stall-version").is_file() && query == "-version" {
         loop { thread::sleep(Duration::from_secs(1)); }
     }
-    let executable = env::current_exe().unwrap();
-    let role = if executable
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .contains("ffprobe")
-    {
-        "ffprobe"
-    } else {
-        "ffmpeg"
-    };
+    let role = option_env!("STREAM_SERVER_FAKE_RUNTIME_ROLE").unwrap_or_else(|| {
+        let executable = env::current_exe().unwrap();
+        if executable
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("ffprobe")
+        {
+            "ffprobe"
+        } else {
+            "ffmpeg"
+        }
+    });
     let version = fs::read_to_string(root.join(format!("{role}.version"))).unwrap();
     println!("{role} version {}", version.trim());
     if query == "-buildconf" {

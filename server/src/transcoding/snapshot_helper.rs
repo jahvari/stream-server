@@ -25,14 +25,18 @@ pub(crate) const SNAPSHOT_MAXIMUM_BYTES: u64 = 512 * 1024 * 1024;
 )]
 pub(crate) fn maybe_run_from_environment() -> Option<i32> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
-    maybe_run_from_arguments(&arguments)
+    let mut output = std::io::stdout().lock();
+    maybe_run_from_arguments(&arguments, &mut output)
 }
 
 #[allow(
     dead_code,
     reason = "this source is included by both the library and executable, whose copies have different callers"
 )]
-fn maybe_run_from_arguments(arguments: &[std::ffi::OsString]) -> Option<i32> {
+fn maybe_run_from_arguments(
+    arguments: &[std::ffi::OsString],
+    output: &mut impl Write,
+) -> Option<i32> {
     let marker_present = arguments
         .iter()
         .any(|argument| argument == SNAPSHOT_HELPER_ARGUMENT);
@@ -49,7 +53,6 @@ fn maybe_run_from_arguments(arguments: &[std::ffi::OsString]) -> Option<i32> {
     }
     match copy_and_hash() {
         Ok((length, digest)) => {
-            let mut output = std::io::stdout().lock();
             if writeln!(output, "{length}:{}", hex::encode(digest)).is_ok() {
                 Some(0)
             } else {
@@ -147,5 +150,9 @@ pub(crate) fn run_exact_test_request(malformed_case: Option<usize>) -> i32 {
     };
     let mut arguments = vec![std::ffi::OsString::from("snapshot-helper")];
     arguments.extend(payload.into_iter().map(std::ffi::OsString::from));
-    maybe_run_from_arguments(&arguments).unwrap_or(2)
+    // The libtest harness writes its own banner to stdout before invoking an
+    // ignored test. Keep the helper protocol on stderr in test subprocesses so
+    // the parent receives exactly one machine-readable record.
+    let mut output = std::io::stderr().lock();
+    maybe_run_from_arguments(&arguments, &mut output).unwrap_or(2)
 }
