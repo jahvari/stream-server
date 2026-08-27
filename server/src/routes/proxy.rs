@@ -7152,13 +7152,19 @@ mod tests {
         assert!(join_error.is_cancelled());
         gate.release();
 
-        wait_for_capacity(&runtime, (0, 0)).await;
-        for _ in 0..32 {
-            if runtime.playlist_capacity_snapshot() == (0, 0) {
-                break;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.capacity_snapshot() == (0, 0)
+                    && runtime.playlist_capacity_snapshot() == (0, 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("claimed playlist worker did not release both quotas");
+        assert_eq!(runtime.capacity_snapshot(), (0, 0));
         assert_eq!(runtime.playlist_capacity_snapshot(), (0, 0));
     }
 
