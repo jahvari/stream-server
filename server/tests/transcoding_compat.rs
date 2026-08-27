@@ -322,6 +322,57 @@ fn run_async<T>(future: impl Future<Output = T>) -> T {
         .block_on(future)
 }
 
+struct IsolatedTestChild(Option<std::process::Child>);
+
+impl Drop for IsolatedTestChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn run_isolated_test_bounded(
+    exact_test: &str,
+    deadline: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .args(["--ignored", "--exact", exact_test])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut child = IsolatedTestChild(Some(child));
+    let expires = std::time::Instant::now() + deadline;
+    loop {
+        match child
+            .0
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("isolated helper ownership missing"))?
+            .try_wait()?
+        {
+            Some(status) => {
+                let mut completed = child
+                    .0
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("isolated helper ownership missing"))?;
+                let _ = completed.wait()?;
+                return Ok(status);
+            }
+            None if std::time::Instant::now() < expires => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "isolated compatibility helper deadline",
+                ));
+            }
+        }
+    }
+}
+
 fn with_embedded_server<T>(test: impl FnOnce(&Client, String) -> T) -> T {
     let config_dir = tempfile::tempdir().expect("config tempdir");
     let cache_dir = tempfile::tempdir().expect("cache tempdir");
@@ -628,6 +679,44 @@ fn transcode_profile_aliases_preserve_encoder_selection_contract() {
 
 #[test]
 fn device_and_profiler_routes_preserve_compatibility_shapes() {
+    // Every embedded-server compatibility test takes this process-local lock.
+    // Hold it while the isolated helper runs so the helper owns both the fresh
+    // hwaccel cache and the fixed librqbit listen ports for its lifetime.
+    let _embedded_server_guard = lock_env();
+    let status = run_isolated_test_bounded(
+        "device_and_profiler_routes_preserve_compatibility_shapes_isolated",
+        SERVER_JOIN_TIMEOUT,
+    )
+    .expect("bounded isolated device and profiler compatibility test");
+
+    assert!(
+        status.success(),
+        "isolated device and profiler compatibility test failed: {status}"
+    );
+}
+
+#[test]
+#[ignore = "spawned only by compatibility_helper_subprocess_has_a_kill_and_wait_deadline"]
+fn compatibility_helper_hang_isolated() {
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn compatibility_helper_subprocess_has_a_kill_and_wait_deadline() {
+    let started = std::time::Instant::now();
+    let error = run_isolated_test_bounded(
+        "compatibility_helper_hang_isolated",
+        Duration::from_millis(50),
+    )
+    .expect_err("hanging helper must hit its own deadline");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+#[ignore = "spawned only by device_and_profiler_routes_preserve_compatibility_shapes"]
+fn device_and_profiler_routes_preserve_compatibility_shapes_isolated() {
     with_fake_ffmpeg("device_probe", |log_path| {
         with_embedded_server(|client, base| {
             let device_info = client
