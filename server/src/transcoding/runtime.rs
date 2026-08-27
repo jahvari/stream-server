@@ -2710,9 +2710,9 @@ fn known_system_roots() -> Vec<PathBuf> {
     }
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86_64"))]
 const MANAGED_DOWNLOAD_IDLE_DEADLINE: Duration = Duration::from_secs(30);
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86_64"))]
 const MANAGED_DOWNLOAD_OVERALL_DEADLINE: Duration = Duration::from_secs(10 * 60);
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const MAX_MANAGED_DOWNLOAD_REDIRECTS: usize = 5;
@@ -3246,6 +3246,7 @@ impl ManagedVersionReceipt {
         })
     }
 
+    #[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
     fn matches_artifact(&self, artifact: &super::runtime_manifest::RuntimeArtifact) -> bool {
         self.is_self_consistent()
             && self.version == artifact.source_tag()
@@ -4360,7 +4361,7 @@ fn open_managed_archive(archive_path: &Path) -> Result<File, RuntimeError> {
     Ok(file)
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 fn verify_opened_archive_identity(
     file: &mut File,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4436,7 +4437,7 @@ fn is_owned_selection_temporary(name: &str) -> bool {
         .is_some_and(is_canonical_uuid)
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 fn remove_owned_staging_path(staging_root: &Path, path: &Path) -> Result<(), RuntimeError> {
     if path
         .parent()
