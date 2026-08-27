@@ -9,7 +9,12 @@ members = [
     "stremio-runtime-stub",
     "updater-helper",
     "settings-gui",
+    # Test-only FFmpeg/ffprobe process fixture; not referenced by release/package metadata.
+    "test-support/fake-media-tool",
 ]
+
+[workspace.package]
+rust-version = "1.98"
 
 [profile.release]
 opt-level = "z"

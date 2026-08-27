@@ -1,4 +1,5 @@
 use crate::routes::system::ServerSettings;
+use crate::transcoding::runtime::TranscodingService;
 use crate::{
     network_security::{
         DestinationValidator, ListenerBinding, ProxyPolicySettings, ProxyRuntime, SystemClock,
@@ -13,6 +14,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::local_addon::LocalIndex;
+
+#[cfg(test)]
+pub(crate) fn unavailable_transcoding_for_test() -> Arc<TranscodingService> {
+    let supervisor = Arc::new(crate::transcoding::process::ProcessSupervisor::new(
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    crate::ffmpeg_setup::unavailable_service(supervisor)
+}
 
 pub(crate) struct SettingsPersistenceCoordinator {
     raw: Arc<tokio::sync::Mutex<ServerSettings>>,
@@ -394,6 +403,7 @@ pub struct AppState {
     pub(crate) settings_control: SettingsControl,
     pub(crate) proxy_runtime: Arc<ProxyRuntime>,
     pub(crate) settings_persistence: Arc<SettingsPersistenceCoordinator>,
+    pub transcoding: Arc<TranscodingService>,
 }
 
 impl AppState {
@@ -410,13 +420,19 @@ impl AppState {
     }
 
     #[allow(unused)]
-    pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
+    pub fn new(
+        engine: Arc<EngineFS>,
+        settings: ServerSettings,
+        config_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
+    ) -> Self {
         let log_dir = config_dir.join("logs");
         Self::new_with_shared_settings_and_log_dir(
             engine,
             Arc::new(RwLock::new(settings)),
             config_dir,
             log_dir,
+            transcoding,
         )
     }
 
@@ -427,7 +443,12 @@ impl AppState {
         effective: ServerSettings,
         config_dir: PathBuf,
     ) -> Self {
-        let mut state = Self::new(engine, effective, config_dir);
+        let mut state = Self::new(
+            engine,
+            effective,
+            config_dir,
+            unavailable_transcoding_for_test(),
+        );
         state.settings_persistence = Arc::new(SettingsPersistenceCoordinator::new(raw));
         state
     }
@@ -437,9 +458,16 @@ impl AppState {
         engine: Arc<EngineFS>,
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         let log_dir = config_dir.join("logs");
-        Self::new_with_shared_settings_and_log_dir(engine, settings, config_dir, log_dir)
+        Self::new_with_shared_settings_and_log_dir(
+            engine,
+            settings,
+            config_dir,
+            log_dir,
+            transcoding,
+        )
     }
 
     pub fn new_with_shared_settings_and_log_dir(
@@ -447,6 +475,7 @@ impl AppState {
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
         log_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         Self::new_with_shared_settings_log_dir_and_download_engine(
             engine.clone(),
@@ -455,6 +484,7 @@ impl AppState {
             settings,
             config_dir,
             log_dir,
+            transcoding,
         )
     }
 
@@ -465,6 +495,7 @@ impl AppState {
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
         log_dir: PathBuf,
+        transcoding: Arc<TranscodingService>,
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
         let updater = Arc::new(crate::updater::UpdateManager::new(config_dir.clone()));
@@ -506,6 +537,7 @@ impl AppState {
             settings_control: SettingsControl::ephemeral(),
             proxy_runtime: Arc::new(ProxyRuntime::new(proxy_policy, validator)),
             settings_persistence: Arc::new(SettingsPersistenceCoordinator::new(initial_settings)),
+            transcoding,
         }
     }
 

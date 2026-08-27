@@ -86,6 +86,10 @@ Download from [Releases](https://github.com/perpetus/stream-server/releases):
 
 ### Build from Source
 
+Building from source requires Rust 1.98 or newer. The committed
+`rust-toolchain.toml` pins Rust 1.98.0, which `rustup` selects automatically
+when commands are run from this repository.
+
 ```bash
 # Default build (librqbit - recommended)
 cargo build --release
@@ -117,7 +121,7 @@ The server starts on `http://localhost:11470` by default (compatible with standa
 
 ```bash
 sudo pacman -S rustup
-rustup default stable
+rustup toolchain install 1.98.0
 
 # For libtorrent backend
 sudo pacman -S libtorrent-rasterbar boost pkg-config

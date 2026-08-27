@@ -1,5 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(unix)]
+#[path = "transcoding/snapshot_helper.rs"]
+mod snapshot_helper;
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod app {
     use fslock::LockFile;
@@ -14,6 +18,12 @@ mod app {
     static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
     pub fn main() -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            if let Some(exit_code) = crate::snapshot_helper::maybe_run_from_environment() {
+                std::process::exit(exit_code);
+            }
+        }
         #[cfg(windows)]
         let attached_console = unsafe {
             use windows::Win32::System::Console::{

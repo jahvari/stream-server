@@ -57,10 +57,18 @@ mod safe_file;
 mod settings_control;
 mod ssdp;
 mod state;
+pub mod transcoding;
 mod tui;
 mod updater;
 pub mod ytdlp;
 
+/// Startup runtime setup is owned by the server and cannot be invoked with a
+/// downstream-created raw process supervisor.
+///
+/// ```compile_fail
+/// use stream_server::setup_ffmpeg_with_config;
+/// let _internal_setup = setup_ffmpeg_with_config;
+/// ```
 pub use ffmpeg_setup::MissingFfmpegError;
 
 #[derive(Clone, Debug)]
@@ -310,6 +318,11 @@ async fn run_inner(
     tokio::fs::create_dir_all(&cache_dir).await?;
     tokio::fs::create_dir_all(&log_dir).await?;
 
+    let server_cancellation = tokio_util::sync::CancellationToken::new();
+    let process_supervisor = Arc::new(transcoding::process::ProcessSupervisor::new(
+        server_cancellation.child_token(),
+    ));
+
     diagnostics::logging::init_process_start();
     if cfg.manage_process_globals {
         diagnostics::logging::install_panic_hook();
@@ -379,12 +392,14 @@ async fn run_inner(
         }
     }
 
-    if cfg.setup_ffmpeg
-        && let Err(e) = ffmpeg_setup::setup_ffmpeg().await
-    {
-        tracing::error!("FFmpeg setup failed: {}", e);
-        return Err(e).context("FFmpeg setup failed");
-    }
+    let transcoding = if cfg.setup_ffmpeg {
+        ffmpeg_setup::setup_ffmpeg(&config_dir, process_supervisor.clone())
+            .await
+            .inspect_err(|error| tracing::error!(%error, "FFmpeg setup failed"))
+            .context("FFmpeg setup failed")?
+    } else {
+        ffmpeg_setup::unavailable_service(process_supervisor.clone())
+    };
 
     tracing::info!("Config Dir: {:?}", config_dir);
     tracing::info!("Cache/Download Dir: {:?}", cache_dir);
@@ -409,9 +424,15 @@ async fn run_inner(
     // only costs the trailer rather than the server.
     {
         let config_dir = config_dir.clone();
+        let cancellation = server_cancellation.child_token();
         tokio::spawn(async move {
-            if let Err(error) = ytdlp::resolve(&config_dir).await {
-                tracing::warn!(%error, "could not prepare yt-dlp; YouTube trailers will be unavailable");
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                result = ytdlp::resolve(&config_dir) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "could not prepare yt-dlp; YouTube trailers will be unavailable");
+                    }
+                }
             }
         });
     }
@@ -509,6 +530,7 @@ async fn run_inner(
         settings_arc.clone(),
         config_dir.clone(),
         log_dir.clone(),
+        transcoding,
     );
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
@@ -701,6 +723,8 @@ async fn run_inner(
     let (shutdown_started_tx, mut shutdown_started_rx) =
         tokio::sync::oneshot::channel::<ShutdownSource>();
     let listen_for_ctrl_c = cfg.listen_for_ctrl_c;
+    let cancellation_on_shutdown = server_cancellation.clone();
+    let supervisor_on_shutdown = Arc::clone(&process_supervisor);
     let shutdown = async move {
         let source = tokio::select! {
             _ = maybe_ctrl_c(listen_for_ctrl_c) => {
@@ -718,6 +742,10 @@ async fn run_inner(
         };
 
         settings_persistence_for_shutdown.close();
+        // Close supervised child/selection admission synchronously before the
+        // broader server token wakes asynchronous shutdown observers.
+        supervisor_on_shutdown.cancel();
+        cancellation_on_shutdown.cancel();
         let _ = shutdown_started_tx.send(source);
     };
 
@@ -787,6 +815,9 @@ async fn run_inner(
             Some(source)
         }
     };
+
+    process_supervisor.cancel();
+    server_cancellation.cancel();
 
     for task in background_tasks {
         task.abort();
@@ -1159,7 +1190,12 @@ mod tests {
             allow_private_network_sources: true,
             ..routes::system::ServerSettings::default()
         };
-        let state = AppState::new(engine, settings, temp.path().join("config"));
+        let state = AppState::new(
+            engine,
+            settings,
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
         std::fs::create_dir_all(&state.log_dir).unwrap();
         let router = build_router(state.clone());
         let requests = [
@@ -1304,7 +1340,12 @@ mod tests {
             allow_private_network_sources: true,
             ..routes::system::ServerSettings::default()
         };
-        let state = AppState::new(engine, settings, temp.path().join("config"));
+        let state = AppState::new(
+            engine,
+            settings,
+            temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
+        );
         let target = format!("http://{upstream_address}/ok");
 
         for (router, expected) in [

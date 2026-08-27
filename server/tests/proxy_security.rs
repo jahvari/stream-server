@@ -94,16 +94,11 @@ async fn start_tls_fixture() -> anyhow::Result<(
     std::net::SocketAddr,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 )> {
-    // This private key is intentionally public test data. Never reuse it outside tests.
+    let directory = tempfile::tempdir()?;
+    install_https_fixture(directory.path())?;
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/localhost-cert.pem"
-        ),
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/localhost-key.pem"
-        ),
+        directory.path().join("https-cert.pem"),
+        directory.path().join("https-key.pem"),
     )
     .await?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -129,22 +124,20 @@ async fn start_tls_fixture() -> anyhow::Result<(
     Ok((address, task))
 }
 
+fn generate_test_tls_material() -> anyhow::Result<(String, String)> {
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ])?;
+    Ok((cert.pem(), signing_key.serialize_pem()))
+}
+
 fn install_https_fixture(config_dir: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(config_dir)?;
-    std::fs::copy(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/localhost-cert.pem"
-        ),
-        config_dir.join("https-cert.pem"),
-    )?;
-    std::fs::copy(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/localhost-key.pem"
-        ),
-        config_dir.join("https-key.pem"),
-    )?;
+    let (certificate, private_key) = generate_test_tls_material()?;
+    std::fs::write(config_dir.join("https-cert.pem"), certificate)?;
+    std::fs::write(config_dir.join("https-key.pem"), private_key)?;
     Ok(())
 }
 
@@ -539,13 +532,8 @@ async fn unreadable_https_pem_leaves_http_ready_without_a_stale_listener() -> an
     let cache = tempfile::tempdir()?;
     let config_dir = config.path().join("config");
     std::fs::create_dir_all(config_dir.join("https-cert.pem"))?;
-    std::fs::copy(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/localhost-key.pem"
-        ),
-        config_dir.join("https-key.pem"),
-    )?;
+    let (_, private_key) = generate_test_tls_material()?;
+    std::fs::write(config_dir.join("https-key.pem"), private_key)?;
     let server_config = stream_server::ServerConfig {
         http_addr: "127.0.0.1:0".parse().unwrap(),
         https_addr: Some("127.0.0.1:0".parse().unwrap()),

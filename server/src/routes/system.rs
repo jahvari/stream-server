@@ -991,19 +991,23 @@ pub async fn set_settings(
             .into_response(),
     }
 }
+
+pub(crate) fn compat_device_info(profiles: Vec<String>) -> serde_json::Value {
+    json!({ "availableHardwareAccelerations": profiles })
+}
+
+pub(crate) fn compat_profiler(profiles: Vec<String>) -> serde_json::Value {
+    json!({ "success": true, "profiles": profiles })
+}
+
 pub async fn get_device_info() -> impl IntoResponse {
     let profiles = probe_hwaccel().await;
-    Json(json!({
-        "availableHardwareAccelerations": profiles
-    }))
+    Json(compat_device_info(profiles))
 }
 
 pub async fn hwaccel_profiler() -> impl IntoResponse {
     let profiles = probe_hwaccel().await;
-    Json(json!({
-        "success": true,
-        "profiles": profiles
-    }))
+    Json(compat_profiler(profiles))
 }
 
 static HWACCEL_PROFILES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
@@ -1343,6 +1347,7 @@ mod tests {
         SETTINGS_TOKEN_HEADER, SettingsControl, SettingsMutationAuthority,
     };
     use enginefs::EngineFS;
+    use serde_json::json;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1392,6 +1397,7 @@ mod tests {
             engine,
             ServerSettings::default(),
             temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
         );
         let token = [b'a'; 64];
         state.settings_control = SettingsControl::for_test(token);
@@ -1452,6 +1458,7 @@ mod tests {
             engine,
             ServerSettings::default(),
             temp.path().join("config"),
+            crate::state::unavailable_transcoding_for_test(),
         );
         let token = [b'a'; 64];
         state.settings_control = SettingsControl::for_test(token);
@@ -1549,7 +1556,6 @@ mod tests {
         );
         assert!(state.settings_path.is_dir());
     }
-
     #[test]
     fn server_version_default_uses_crate_version() {
         let settings = ServerSettings::default();
@@ -1768,5 +1774,27 @@ mod tests {
         );
         let disk: ServerSettings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(disk.cache_size, 654.0);
+    }
+
+    #[test]
+    fn device_info_shape_is_stable() {
+        let value = compat_device_info(vec!["nvenc".into(), "nvenc:verified".into()]);
+        assert_eq!(
+            value,
+            json!({
+                "availableHardwareAccelerations": ["nvenc", "nvenc:verified"]
+            })
+        );
+    }
+
+    #[test]
+    fn profiler_shape_is_stable() {
+        assert_eq!(
+            compat_profiler(vec!["qsv".into()]),
+            json!({
+                "success": true,
+                "profiles": ["qsv"]
+            })
+        );
     }
 }

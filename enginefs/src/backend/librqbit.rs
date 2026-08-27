@@ -401,7 +401,7 @@ impl Clone for LibrqbitHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use librqbit::{ListenerOptions, SessionOptions};
+    use librqbit::{CreateTorrentOptions, ListenerOptions, SessionOptions, create_torrent};
     use std::net::{Ipv4Addr, TcpListener};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -421,6 +421,79 @@ mod tests {
         }
 
         panic!("could not reserve adjacent test ports");
+    }
+
+    async fn cold_torrent_handle() -> (LibrqbitHandle, Arc<Session>, PathBuf) {
+        let test_dir = std::env::temp_dir().join(format!(
+            "enginefs-librqbit-cold-torrent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&test_dir)
+            .await
+            .expect("create cold torrent test directory");
+
+        let source_dir = test_dir.join("source");
+        let session_dir = test_dir.join("session");
+        tokio::fs::create_dir_all(&source_dir)
+            .await
+            .expect("create source torrent directory");
+        tokio::fs::create_dir_all(&session_dir)
+            .await
+            .expect("create session torrent directory");
+
+        let source_file = source_dir.join("sample.mkv");
+        tokio::fs::write(&source_file, b"cold torrent compatibility fixture")
+            .await
+            .expect("write source torrent file");
+        let torrent = create_torrent(
+            &source_file,
+            CreateTorrentOptions {
+                piece_length: Some(16 * 1024),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create cold torrent metadata");
+
+        let session = Session::new_with_opts(
+            session_dir,
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create isolated librqbit session");
+
+        let response = session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(
+                    torrent.as_bytes().expect("serialize cold torrent metadata"),
+                ),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add cold torrent");
+
+        let handle = match response {
+            librqbit::AddTorrentResponse::Added(_, handle)
+            | librqbit::AddTorrentResponse::AlreadyManaged(_, handle) => LibrqbitHandle {
+                handle,
+                info_hash: torrent.info_hash().as_string(),
+            },
+            _ => panic!("unexpected add torrent response"),
+        };
+
+        (handle, session, test_dir)
     }
 
     #[tokio::test]
@@ -467,5 +540,66 @@ mod tests {
         tokio::fs::remove_dir_all(test_dir)
             .await
             .expect("remove librqbit test directory");
+    }
+
+    #[tokio::test]
+    async fn mp_002a_cold_torrent_piece_readiness_is_immediate_without_progress_or_failure_signal()
+    {
+        let (handle, session, test_dir) = cold_torrent_handle().await;
+        let stats = handle.stats().await;
+        assert!(stats.has_metadata);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.downloaded, 0);
+        assert_eq!(stats.peers, 0);
+
+        let readiness = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.wait_for_piece_ready(
+                0,
+                0,
+                Duration::from_secs(30),
+                crate::backend::priorities::PlaybackIntent::InternalProbe,
+            ),
+        )
+        .await
+        .expect("cold torrent readiness stayed finite")
+        .expect("cold torrent readiness");
+
+        assert!(readiness.ready);
+        assert_eq!(readiness.piece, -1);
+        assert_eq!(readiness.ready_pieces, 1);
+        assert_eq!(readiness.target_pieces, 1);
+        assert_eq!(readiness.elapsed_ms, 0);
+        assert_eq!(readiness.peers, 0);
+        assert_eq!(readiness.download_rate, 0);
+        assert_eq!(readiness.reason, "librqbit-reader");
+
+        let repeated_readiness = tokio::time::timeout(
+            Duration::from_millis(250),
+            handle.wait_for_piece_ready(
+                0,
+                0,
+                Duration::from_millis(1),
+                crate::backend::priorities::PlaybackIntent::InternalProbe,
+            ),
+        )
+        .await
+        .expect("repeated cold torrent readiness stayed finite")
+        .expect("repeated cold torrent readiness");
+        assert!(repeated_readiness.ready);
+        assert_eq!(repeated_readiness.piece, readiness.piece);
+        assert_eq!(repeated_readiness.ready_pieces, readiness.ready_pieces);
+        assert_eq!(repeated_readiness.target_pieces, readiness.target_pieces);
+        assert_eq!(repeated_readiness.elapsed_ms, readiness.elapsed_ms);
+        assert_eq!(repeated_readiness.peers, readiness.peers);
+        assert_eq!(repeated_readiness.download_rate, readiness.download_rate);
+        assert_eq!(repeated_readiness.reason, readiness.reason);
+
+        session.cancellation_token().cancel();
+        drop(handle);
+        drop(session);
+        tokio::fs::remove_dir_all(test_dir)
+            .await
+            .expect("remove cold torrent test directory");
     }
 }

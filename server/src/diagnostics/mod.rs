@@ -655,6 +655,7 @@ mod tests {
             )),
             temp.path().join("config"),
             log_dir,
+            crate::state::unavailable_transcoding_for_test(),
         );
 
         let bytes = build_diagnostics_zip(&state).unwrap();

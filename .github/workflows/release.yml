@@ -8,6 +8,9 @@ on:
     branches: [ "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
@@ -23,9 +26,12 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
@@ -61,8 +67,14 @@ jobs:
       - name: Restore Source Code
         run: git restore server enginefs bindings stremio-runtime-stub updater-helper settings-gui
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --features libtorrent --no-default-features -- -D warnings
+      - name: Check libtorrent and native FFI targets
+        run: cargo check --workspace --all-targets --features libtorrent --no-default-features
+
+      - name: Run Clippy for libtorrent and native FFI targets
+        run: cargo clippy --workspace --all-targets --features libtorrent --no-default-features -- -D warnings
+
+      - name: Check librqbit and native FFI targets
+        run: cargo check -p enginefs -p server --all-targets --features librqbit --no-default-features
 
       - name: Run Clippy for librqbit backend
         run: cargo clippy -p enginefs -p server --all-targets --features librqbit --no-default-features -- -D warnings
@@ -73,6 +85,31 @@ jobs:
       - name: Test librqbit backend
         run: cargo test -p enginefs -p server --features librqbit --no-default-features
 
+  check-windows:
+    name: Check Windows native FFI and shutdown
+    runs-on: windows-2022
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Check librqbit and native FFI targets
+        run: cargo check -p enginefs -p server --all-targets --features librqbit --no-default-features
+
+      - name: Run Clippy for librqbit and native FFI targets
+        run: cargo clippy -p enginefs -p server --all-targets --features librqbit --no-default-features -- -D warnings
+
+      - name: Test repeated Windows shutdown
+        run: cargo test -p server --test embed --features librqbit --no-default-features
+
   build-windows:
     name: Build Windows
     runs-on: windows-2022
@@ -81,12 +118,14 @@ jobs:
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-            toolchain: stable
-            target: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
 
       - name: Install cargo-chef and cargo-wix
         uses: taiki-e/install-action@v2
@@ -132,8 +171,6 @@ jobs:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
           VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release
           VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
-          # The overlay pins libtorrent 2.1.1 and carries the complete official
-          # vcpkg port for that release, including its verified source checksum.
           VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlays
 
       - name: Cargo Chef Prepare
@@ -173,6 +210,19 @@ jobs:
           VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
           PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
 
+      - name: Build MSI Installer
+        run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
+          VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
+
+      - name: Verify Windows package outputs
+        run: |
+          $env:STREAM_SERVER_RELEASE_GATE_STAGE = "windows"
+          cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
+
       - name: Upload EXE
         uses: actions/upload-artifact@v7
         with:
@@ -182,15 +232,6 @@ jobs:
             target/x86_64-pc-windows-msvc/release/settings-gui.exe
             target/x86_64-pc-windows-msvc/release/stremio-runtime.exe
             target/x86_64-pc-windows-msvc/release/stream-server-updater.exe
-
-      - name: Build MSI Installer
-        run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
-
 
       - name: Upload MSI
         uses: actions/upload-artifact@v7
@@ -214,9 +255,12 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Install cargo-chef and cargo-deb
         uses: taiki-e/install-action@v2
@@ -282,7 +326,13 @@ jobs:
           convert -size 256x256 xc:steelblue -gravity center -pointsize 48 -fill white -annotate 0 "SS" AppDir/usr/share/icons/hicolor/256x256/apps/stream-server.png || echo "ImageMagick not available, using placeholder"
 
           # Build AppImage
-          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage || true
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+          generated_appimage="$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'linuxdeploy-x86_64.AppImage' -print -quit)"
+          [ -n "$generated_appimage" ]
+          mv "$generated_appimage" stream-server-linux-amd64.AppImage
+
+      - name: Verify Linux package outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=linux cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Upload Binary
         uses: actions/upload-artifact@v7
@@ -302,8 +352,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: server-linux-appimage
-          path: "*.AppImage"
-          if-no-files-found: ignore
+          path: stream-server-linux-amd64.AppImage
 
   build-arch:
     name: Build Arch Linux
@@ -315,11 +364,17 @@ jobs:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm base-devel cmake curl rust git openssl pkg-config boost clang gtk3 libayatana-appindicator
+          pacman -S --needed --noconfirm base-devel cmake curl rustup git openssl pkg-config boost clang gtk3 libayatana-appindicator
+
+      - name: Install Rust 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Install libtorrent 2.1.1
         run: bash .github/scripts/install-libtorrent.sh
@@ -371,6 +426,9 @@ jobs:
           chown -R builder:builder .
           su builder -c "makepkg -sf --noconfirm"
 
+      - name: Verify Arch package outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=arch cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
+
       - name: Upload Arch Package
         uses: actions/upload-artifact@v7
         with:
@@ -388,6 +446,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust for package gate
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Install package gate dependencies
+        run: |
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -425,7 +493,7 @@ jobs:
           copy_file artifacts/server-linux-amd64/server stream-server-linux-amd64
           copy_file artifacts/server-linux-amd64/settings-gui stream-server-settings-linux-amd64
           copy_latest artifacts/server-linux-deb "*.deb" stream-server-linux-amd64.deb
-          copy_latest artifacts/server-linux-appimage "*.AppImage" stream-server-linux-amd64.AppImage
+          copy_file artifacts/server-linux-appimage/stream-server-linux-amd64.AppImage stream-server-linux-amd64.AppImage
           # Arch
           copy_latest artifacts/server-arch-pkg "stream-server-[0-9]*.pkg.tar.zst" stream-server-arch-x86_64.pkg.tar.zst
           (cd release && sha256sum * > SHA256SUMS.txt)
@@ -443,6 +511,9 @@ jobs:
             --output "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 
           cat "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
+
+      - name: Verify final release outputs
+        run: STREAM_SERVER_RELEASE_GATE_STAGE=release cargo test -p server --test transcoding_runtime --features librqbit --no-default-features authoritative_post_build_package_gate -- --ignored --exact
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
