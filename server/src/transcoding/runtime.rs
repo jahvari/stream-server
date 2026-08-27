@@ -8259,7 +8259,7 @@ fn main() {{
     #[tokio::test]
     async fn linux_pair_probe_executes_unlinked_snapshots_from_the_held_root() {
         use crate::transcoding::process::ProcessSupervisor;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
         use tokio_util::sync::CancellationToken;
 
         let directory = tempfile::tempdir().expect("snapshot probe root");
@@ -8308,7 +8308,7 @@ fn main() {{
             RuntimeCommand, RuntimeConfig, RuntimeExecutable, TranscodingService, resolve_runtime,
         };
         use crate::transcoding::process::{ProcessSupervisor, StdoutPolicy};
-        use std::{fs::FileTimes, os::unix::fs::PermissionsExt};
+        use std::{ffi::OsString, fs::FileTimes, os::unix::fs::PermissionsExt};
         use tokio_util::sync::CancellationToken;
 
         fn script(role: &str, value: &str) -> Vec<u8> {
