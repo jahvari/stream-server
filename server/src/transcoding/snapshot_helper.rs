@@ -19,11 +19,19 @@ pub(crate) const SNAPSHOT_DESTINATION_DESCRIPTOR: i32 = 199;
 pub(crate) const SNAPSHOT_MAXIMUM_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "this source is included by both the library and executable; only the executable entry point calls this copy"
+)]
 pub(crate) fn maybe_run_from_environment() -> Option<i32> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     maybe_run_from_arguments(&arguments)
 }
 
+#[allow(
+    dead_code,
+    reason = "this source is included by both the library and executable, whose copies have different callers"
+)]
 fn maybe_run_from_arguments(arguments: &[std::ffi::OsString]) -> Option<i32> {
     let marker_present = arguments
         .iter()
@@ -53,6 +61,10 @@ fn maybe_run_from_arguments(arguments: &[std::ffi::OsString]) -> Option<i32> {
 }
 
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "this source is included by both the library and executable, whose copies have different callers"
+)]
 fn copy_and_hash() -> std::io::Result<(u64, [u8; 32])> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -113,6 +125,10 @@ fn copy_and_hash() -> std::io::Result<(u64, [u8; 32])> {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "this source is included by both the library and executable; only the library test copy invokes this helper"
+)]
 pub(crate) fn run_exact_test_request(malformed_case: Option<usize>) -> i32 {
     let payload: Vec<&str> = match malformed_case {
         None => vec![SNAPSHOT_HELPER_ARGUMENT, "198", "199", "536870912"],

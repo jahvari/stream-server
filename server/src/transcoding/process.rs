@@ -1446,36 +1446,34 @@ fn own_unix_process(arguments: UnixOwnerArguments) {
     }
     #[cfg(target_os = "linux")]
     let descendant_identities = loop {
-        match linux_terminal_group_descendants(process_group) {
-            Ok(Some(descendants)) => break descendants,
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(descendants)) = linux_terminal_group_descendants(process_group) {
+            break descendants;
         }
-        if std::time::Instant::now() >= cleanup_expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= cleanup_expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     #[cfg(target_os = "macos")]
     let descendant_identities = loop {
-        match macos_terminal_group_descendants(process_group) {
-            Ok(Some(descendants)) => break descendants,
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(descendants)) = macos_terminal_group_descendants(process_group) {
+            break descendants;
         }
-        if std::time::Instant::now() >= cleanup_expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= cleanup_expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     while !unix_group_descendants_drained(process_group).unwrap_or(false) {
-        if std::time::Instant::now() >= cleanup_expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= cleanup_expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1505,19 +1503,19 @@ fn own_unix_process(arguments: UnixOwnerArguments) {
     }
     #[cfg(target_os = "linux")]
     while !linux_process_identities_are_gone(&descendant_identities) {
-        if std::time::Instant::now() >= cleanup_expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= cleanup_expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     #[cfg(target_os = "macos")]
     while !macos_process_identities_are_gone(&descendant_identities) {
-        if std::time::Instant::now() >= cleanup_expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= cleanup_expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1926,10 +1924,10 @@ fn join_unix_reader_durably(
     };
     let expires = std::time::Instant::now() + CLEANUP_DEADLINE;
     while !reader.is_finished() {
-        if std::time::Instant::now() >= expires {
-            if let Some(sender) = result_tx.take() {
-                let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
-            }
+        if std::time::Instant::now() >= expires
+            && let Some(sender) = result_tx.take()
+        {
+            let _ = sender.send(Err(ProcessError::new(ProcessErrorCode::WaitFailed)));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -2025,7 +2023,7 @@ fn linux_process_identities_are_gone(descendants: &[LinuxDescendantIdentity]) ->
     })
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn macos_process_status_is_terminal(status: u32) -> bool {
     const SZOMB: u32 = 5;
     status == SZOMB

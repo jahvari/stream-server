@@ -5,17 +5,22 @@ use super::{
     },
     runtime_manifest::{RuntimeError, RuntimeHost, RuntimeManifest},
 };
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+use std::collections::BTreeSet;
+#[cfg(any(test, not(unix)))]
+use std::io::Read;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File},
-    io::{Read, Seek},
+    io::Seek,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -1474,11 +1479,11 @@ fn full_file_lease(
             #[cfg(not(test))]
             _observer,
         )?;
-        return Ok(FileLease {
+        Ok(FileLease {
             source_file,
             file: Arc::new(snapshot.file),
             seal: snapshot.seal,
-        });
+        })
     }
     #[cfg(not(unix))]
     {
@@ -1595,12 +1600,12 @@ fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File,
     {
         use std::os::fd::AsRawFd;
         let _ = root;
-        return linux_openat2(
+        linux_openat2(
             root_file.as_raw_fd(),
             std::ffi::OsStr::new(name),
             libc::O_RDONLY | libc::O_CLOEXEC,
             linux_child_resolve_flags(),
-        );
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -1627,7 +1632,7 @@ fn open_local_file_at(root_file: &File, root: &Path, name: &str) -> Result<File,
                 },
             );
         }
-        return Ok(unsafe { File::from_raw_fd(descriptor) });
+        Ok(unsafe { File::from_raw_fd(descriptor) })
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -1655,16 +1660,16 @@ fn open_local_root(path: &Path) -> Result<File, CandidateFailure> {
             return Err(CandidateFailure::Unsafe);
         }
         let filesystem_root = File::open("/").map_err(|_| CandidateFailure::Unsafe)?;
-        return linux_openat2(
+        linux_openat2(
             filesystem_root.as_raw_fd(),
             relative.as_os_str(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS,
-        );
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        return open_macos_root_components(path);
+        open_macos_root_components(path)
     }
     #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     let mut options = fs::OpenOptions::new();
@@ -1971,9 +1976,9 @@ fn linux_file_is_local(file: &File) -> Result<bool, CandidateFailure> {
         return Err(CandidateFailure::Unsafe);
     }
     let statistics = unsafe { statistics.assume_init() };
-    Ok(linux_filesystem_type_is_allowed_local(
-        statistics.f_type as i64,
-    ))
+    Ok(linux_filesystem_type_is_allowed_local(i128::from(
+        statistics.f_type,
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -1992,9 +1997,9 @@ fn macos_file_is_local(file: &File) -> Result<bool, CandidateFailure> {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn linux_filesystem_type_is_allowed_local(filesystem_type: i64) -> bool {
+fn linux_filesystem_type_is_allowed_local(filesystem_type: i128) -> bool {
     matches!(
-        filesystem_type as u64,
+        filesystem_type,
         0x0000_ef53 // ext2/ext3/ext4
             | 0x5846_5342 // XFS
             | 0x9123_683e // Btrfs
@@ -2039,7 +2044,7 @@ fn create_snapshot_file() -> Result<(File, Option<(tempfile::TempDir, PathBuf)>)
         if descriptor < 0 {
             return Err(CandidateFailure::Unsafe);
         }
-        return Ok((unsafe { File::from_raw_fd(descriptor) }, None));
+        Ok((unsafe { File::from_raw_fd(descriptor) }, None))
     }
     #[cfg(target_os = "macos")]
     {
@@ -2074,7 +2079,7 @@ fn create_snapshot_file() -> Result<(File, Option<(tempfile::TempDir, PathBuf)>)
         {
             return Err(CandidateFailure::Unsafe);
         }
-        return Ok((file, Some((directory, path))));
+        Ok((file, Some((directory, path))))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2381,7 +2386,7 @@ fn try_wait_snapshot_helper(
         .map_err(|_| CandidateFailure::Unsafe)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn run_snapshot_guard_try_wait_failure_for_test(
     child: std::process::Child,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -2406,6 +2411,7 @@ fn create_immutable_execution_snapshot(source: &File) -> Result<File, CandidateF
     .map(|snapshot| snapshot.file)
 }
 
+#[cfg(not(unix))]
 fn seal_open_file(
     file: &File,
     #[cfg(test)] observer: Option<&HashTestObserver>,
@@ -2704,15 +2710,20 @@ fn known_system_roots() -> Vec<PathBuf> {
     }
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const MANAGED_DOWNLOAD_IDLE_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const MANAGED_DOWNLOAD_OVERALL_DEADLINE: Duration = Duration::from_secs(10 * 60);
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const MAX_MANAGED_DOWNLOAD_REDIRECTS: usize = 5;
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const MANAGED_DOWNLOAD_HOSTS: [&str; 3] = [
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn build_managed_download_client() -> Result<reqwest::Client, RuntimeError> {
     reqwest::Client::builder()
         .user_agent(format!(
@@ -2725,6 +2736,7 @@ fn build_managed_download_client() -> Result<reqwest::Client, RuntimeError> {
         .map_err(|_| RuntimeError::DownloadFailed)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn validate_managed_download_url(
     url: &url::Url,
     redirect_count: usize,
@@ -2746,6 +2758,7 @@ fn validate_managed_download_url(
     Ok(())
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn validated_redirect(
     current: &url::Url,
     location: &str,
@@ -2759,11 +2772,13 @@ fn validated_redirect(
     Ok(target)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 enum ValidatedFetch<T> {
     Redirect(String),
     Complete(T),
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 async fn follow_validated_redirects<T, F, Fut>(
     initial_url: url::Url,
     validate_url: fn(&url::Url, usize) -> Result<(), RuntimeError>,
@@ -2804,6 +2819,7 @@ fn validate_loopback_download_url_for_test(
     Ok(())
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 async fn download_archive(
     client: &reqwest::Client,
     initial_url: url::Url,
@@ -2908,11 +2924,13 @@ async fn download_archive(
     result
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 struct PartialDownloadGuard {
     path: PathBuf,
     armed: bool,
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 impl Drop for PartialDownloadGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -2936,6 +2954,7 @@ fn remove_local_regular_file(path: &Path) -> Result<(), RuntimeError> {
 }
 
 #[derive(Clone)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 struct DownloadPolicy {
     validate_url: fn(&url::Url, usize) -> Result<(), RuntimeError>,
     idle_deadline: Duration,
@@ -3018,6 +3037,7 @@ async fn download_archive_with_cancellation_for_test(
     .await
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn extract_managed_archive(
     mut archive_file: File,
     output_root: &Path,
@@ -3143,6 +3163,7 @@ fn extract_managed_archive(
     result
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn zip_central_directory_entry_count(file: &mut File) -> Result<usize, RuntimeError> {
     const EOCD_BYTES: usize = 22;
     const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
@@ -3207,6 +3228,7 @@ struct ManagedVersionReceipt {
 }
 
 impl ManagedVersionReceipt {
+    #[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
     fn from_artifact(
         artifact: &super::runtime_manifest::RuntimeArtifact,
         install_digest: String,
@@ -3248,7 +3270,7 @@ impl ManagedVersionReceipt {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn install_verified_archive(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -3378,6 +3400,7 @@ fn validate_existing_local_components(path: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 async fn install_verified_archive_locked(
     layout: (&Path, &Path, &Path),
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -3398,6 +3421,7 @@ async fn install_verified_archive_locked(
     .await
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 async fn install_verified_archive_locked_with_hook<F>(
     layout: (&Path, &Path, &Path),
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -3433,6 +3457,7 @@ where
             )
             .ok_or(RuntimeError::ArchiveTooLarge)?;
         let extraction = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
             let _worker = observer_for_extract.blocking_worker();
             let mut archive = open_managed_archive(&archive)?;
             verify_opened_archive_identity(
@@ -3524,6 +3549,7 @@ where
     .await
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 async fn activate_managed_version_locked(
     root: &Path,
     version_root: &Path,
@@ -3727,18 +3753,6 @@ fn atomic_publish_version(
     .map_err(|_| RuntimeError::InstallFailed)
 }
 
-#[cfg(not(windows))]
-fn atomic_publish_version(
-    source: &Path,
-    destination: &Path,
-    versions: &Path,
-) -> Result<(), RuntimeError> {
-    fs::rename(source, destination).map_err(|_| RuntimeError::InstallFailed)?;
-    File::open(versions)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| RuntimeError::InstallFailed)
-}
-
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) async fn ensure_managed_runtime(
     root: &Path,
@@ -3915,16 +3929,58 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcquisitionStage {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     WaitingForInstallLock,
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     AfterInstallLockAcquired,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     PostDownload,
+    #[cfg_attr(
+        all(not(test), not(all(windows, target_arch = "x86_64"))),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     InExtraction,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     PostExtraction,
     InProbe,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     PostProbe,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     BeforeCommitAdmission,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     AfterCommitAdmission,
     BeforeRollbackCommitAdmission,
     AfterRollbackCommitAdmission,
@@ -3934,6 +3990,13 @@ enum AcquisitionStage {
 struct AcquisitionExecution<'a> {
     cancellation: &'a tokio_util::sync::CancellationToken,
     observer: &'a AcquisitionObserver,
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "managed acquisition is supported only on Windows x64; portable code remains compiled for cross-platform tests"
+        )
+    )]
     commit: Option<&'a AcquisitionCommitControl>,
 }
 
@@ -3954,6 +4017,7 @@ impl AcquisitionCommitControl {
         }
     }
 
+    #[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
     fn cancellation(&self) -> &tokio_util::sync::CancellationToken {
         &self.cancellation
     }
@@ -3990,14 +4054,15 @@ impl AcquisitionCommitControl {
 
 #[derive(Clone, Default)]
 struct AcquisitionObserver {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     test: Option<Arc<AcquisitionTestObserver>>,
 }
 
 impl AcquisitionObserver {
+    #[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
     fn owner(&self) -> AcquisitionOwnerGuard {
         AcquisitionOwnerGuard {
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             observer: self.clone(),
         }
     }
@@ -4007,7 +4072,7 @@ impl AcquisitionObserver {
         _stage: AcquisitionStage,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(), RuntimeError> {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test
             && test.target == _stage
         {
@@ -4023,7 +4088,7 @@ impl AcquisitionObserver {
     }
 
     async fn commit_checkpoint(&self, _stage: AcquisitionStage) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test
             && test.target == _stage
         {
@@ -4035,12 +4100,13 @@ impl AcquisitionObserver {
         }
     }
 
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     fn blocking_checkpoint(
         &self,
         _stage: AcquisitionStage,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(), RuntimeError> {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test
             && test.target == _stage
         {
@@ -4057,19 +4123,20 @@ impl AcquisitionObserver {
         }
     }
 
+    #[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
     fn blocking_worker(&self) -> AcquisitionBlockingWorkerGuard {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test {
             test.active_blocking_workers.fetch_add(1, Ordering::AcqRel);
         }
         AcquisitionBlockingWorkerGuard {
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             test: self.test.clone(),
         }
     }
 
     fn install_lock_deadline(&self) -> Duration {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test {
             let milliseconds = test.install_lock_deadline_millis.load(Ordering::Acquire);
             if milliseconds != 0 {
@@ -4080,7 +4147,7 @@ impl AcquisitionObserver {
     }
 
     fn observe_install_lock_contention(&self) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test
             && test.target == AcquisitionStage::WaitingForInstallLock
         {
@@ -4090,7 +4157,7 @@ impl AcquisitionObserver {
     }
 
     async fn after_install_lock_acquired(&self) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test
             && test.target == AcquisitionStage::AfterInstallLockAcquired
         {
@@ -4103,14 +4170,16 @@ impl AcquisitionObserver {
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 struct AcquisitionOwnerGuard {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     observer: AcquisitionObserver,
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 impl Drop for AcquisitionOwnerGuard {
     fn drop(&mut self) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.observer.test {
             test.owner_finished.store(true, Ordering::Release);
             test.notification.notify_waiters();
@@ -4118,21 +4187,23 @@ impl Drop for AcquisitionOwnerGuard {
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 struct AcquisitionBlockingWorkerGuard {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     test: Option<Arc<AcquisitionTestObserver>>,
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 impl Drop for AcquisitionBlockingWorkerGuard {
     fn drop(&mut self) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(test) = &self.test {
             test.active_blocking_workers.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 struct AcquisitionTestObserver {
     target: AcquisitionStage,
     reached: AtomicBool,
@@ -4143,7 +4214,7 @@ struct AcquisitionTestObserver {
     install_lock_deadline_millis: AtomicU64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 impl AcquisitionTestObserver {
     fn new(target: AcquisitionStage) -> Self {
         Self {
@@ -4186,21 +4257,25 @@ impl AcquisitionTestObserver {
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 struct AcquisitionCallerGuard {
     commit: Arc<AcquisitionCommitControl>,
     armed: bool,
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 struct AcquisitionCancellationForwarder {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 impl Drop for AcquisitionCancellationForwarder {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 impl Drop for AcquisitionCallerGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -4209,17 +4284,20 @@ impl Drop for AcquisitionCallerGuard {
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 struct OwnedStagingPathGuard {
     staging_root: PathBuf,
     path: PathBuf,
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 impl Drop for OwnedStagingPathGuard {
     fn drop(&mut self) {
         let _ = remove_owned_staging_path(&self.staging_root, &self.path);
     }
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 fn managed_version_token(
     artifact: &super::runtime_manifest::RuntimeArtifact,
 ) -> Result<&str, RuntimeError> {
@@ -4251,6 +4329,7 @@ fn is_managed_version_token(version: &str) -> bool {
         && revision.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn open_managed_archive(archive_path: &Path) -> Result<File, RuntimeError> {
     if !archive_path.is_absolute() || is_remote_or_device_path(archive_path) {
         return Err(RuntimeError::UnsafePath);
@@ -4281,6 +4360,7 @@ fn open_managed_archive(archive_path: &Path) -> Result<File, RuntimeError> {
     Ok(file)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn verify_opened_archive_identity(
     file: &mut File,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4319,6 +4399,7 @@ fn verify_opened_archive_identity(
     Ok(())
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn split_owned_version_uuid(value: &str) -> Option<(&str, &str)> {
     let split = value.len().checked_sub(37)?;
     if !value.is_char_boundary(split) || value.as_bytes().get(split) != Some(&b'-') {
@@ -4333,6 +4414,7 @@ fn is_canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn is_owned_staging_name(name: &str, is_directory: bool) -> bool {
     if is_directory {
         return name
@@ -4354,6 +4436,7 @@ fn is_owned_selection_temporary(name: &str) -> bool {
         .is_some_and(is_canonical_uuid)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn remove_owned_staging_path(staging_root: &Path, path: &Path) -> Result<(), RuntimeError> {
     if path
         .parent()
@@ -4384,6 +4467,7 @@ fn remove_owned_staging_path(staging_root: &Path, path: &Path) -> Result<(), Run
     }
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn recover_managed_install_artifacts(root: &Path, staging_root: &Path) -> Result<(), RuntimeError> {
     validate_existing_local_components(root)?;
     validate_existing_local_components(staging_root)?;
@@ -4529,6 +4613,7 @@ fn read_version_receipt(version_root: &Path) -> Result<ManagedVersionReceipt, Ru
     Ok(receipt)
 }
 
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test, windows)))]
 fn write_version_receipt(
     version_root: &Path,
     receipt: &ManagedVersionReceipt,
@@ -4674,6 +4759,7 @@ fn apply_managed_root_permissions(_root: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 async fn run_managed_acquisition_for_host<T, F, Fut>(
     host: RuntimeHost,
     acquisition: F,
@@ -4701,7 +4787,7 @@ where
     run_managed_acquisition_for_host(host, acquisition).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn install_archive_for_test(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4712,7 +4798,7 @@ async fn install_archive_for_test(
     install_verified_archive(root, artifact, archive_path, supervisor, fail_before_switch).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn install_archive_with_swap_for_test<F>(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4783,7 +4869,7 @@ where
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn prepare_managed_root_for_test(
     root: &Path,
 ) -> Result<(PathBuf, PathBuf, fslock::LockFile), RuntimeError> {
@@ -4795,7 +4881,7 @@ async fn prepare_managed_root_for_test(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn prepare_managed_root_with_observer_for_test(
     root: &Path,
     cancellation: &tokio_util::sync::CancellationToken,
@@ -4819,7 +4905,7 @@ fn recover_managed_install_artifacts_for_test(
     recover_managed_install_artifacts(root, staging_root)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn resolve_managed_runtime_for_artifact_for_test(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4834,7 +4920,7 @@ async fn resolve_managed_runtime_for_artifact_for_test(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn resolve_managed_runtime_for_artifact_with_observer_for_test(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4852,7 +4938,7 @@ async fn resolve_managed_runtime_for_artifact_with_observer_for_test(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn resolve_managed_runtime_for_artifact_with_observer(
     root: &Path,
     artifact: &super::runtime_manifest::RuntimeArtifact,
@@ -4925,7 +5011,9 @@ mod tests {
         open_pair_lease, render_fd_path,
     };
     use sha2::Digest;
-    use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc, time::Duration};
+    #[cfg(windows)]
+    use std::collections::BTreeMap;
+    use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
     #[cfg(windows)]
     fn hold_managed_install_lock(root: &std::path::Path) -> fslock::LockFile {
@@ -5155,6 +5243,7 @@ mod tests {
             .expect("Windows artifact")
     }
 
+    #[cfg(windows)]
     fn fake_jellyfin_executable(version: &str) -> Vec<u8> {
         static BINARIES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Vec<u8>>>> =
             std::sync::OnceLock::new();
@@ -5214,6 +5303,7 @@ fn main() {{
         binary
     }
 
+    #[cfg(windows)]
     fn fake_jellyfin_executable_with_side_effect(
         directory: &std::path::Path,
         version: &str,
@@ -5257,6 +5347,7 @@ fn main() {{
         fs::read(executable).expect("read side-effect Jellyfin executable")
     }
 
+    #[cfg(windows)]
     fn fake_jellyfin_executable_with_failure_switch(
         directory: &std::path::Path,
         version: &str,
@@ -5306,6 +5397,7 @@ fn main() {{
         fs::read(executable).expect("read switchable Jellyfin executable")
     }
 
+    #[cfg(windows)]
     fn fake_jellyfin_executable_stalling_with_marker(
         directory: &std::path::Path,
         marker: &std::path::Path,
@@ -5340,6 +5432,7 @@ fn main() {{
         fs::read(executable).expect("read stalling Jellyfin executable")
     }
 
+    #[cfg(windows)]
     fn runtime_archive_and_artifact(
         directory: &std::path::Path,
         version: &str,
@@ -5348,6 +5441,7 @@ fn main() {{
         runtime_archive_with_claimed_identity(directory, version, version, revision)
     }
 
+    #[cfg(windows)]
     fn runtime_archive_with_claimed_identity(
         directory: &std::path::Path,
         executable_version: &str,
@@ -5362,6 +5456,7 @@ fn main() {{
         )
     }
 
+    #[cfg(windows)]
     fn runtime_archive_with_binary_and_claimed_identity(
         directory: &std::path::Path,
         executable: &[u8],
@@ -7867,6 +7962,7 @@ fn main() {{
         std::process::exit(exit_code);
     }
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "spawned only by snapshot_helper_try_wait_failure_reaps_before_admission_returns"]
     fn snapshot_guard_sleep_helper() {

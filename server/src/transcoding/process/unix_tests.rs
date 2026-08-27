@@ -1,6 +1,17 @@
+#[cfg(target_os = "linux")]
 use super::{ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy};
+#[cfg(target_os = "linux")]
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+#[cfg(target_os = "linux")]
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn macos_process_status_only_treats_zombies_as_terminal_before_leader_reap() {
+    assert!(super::macos_process_status_is_terminal(5));
+    for running_status in [1, 2, 3, 4] {
+        assert!(!super::macos_process_status_is_terminal(running_status));
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[test]

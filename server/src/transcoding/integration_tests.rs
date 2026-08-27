@@ -133,6 +133,7 @@ fn process_is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+#[cfg(windows)]
 fn decode_arguments(bytes: &[u8]) -> Vec<String> {
     let mut decoded = Vec::new();
     let mut offset = 0;

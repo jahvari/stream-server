@@ -210,14 +210,6 @@ fn linux_group_parser_distinguishes_terminal_zombies_with_stable_start_identity(
     assert!(identity.terminal);
 }
 
-#[test]
-fn macos_process_status_only_treats_zombies_as_terminal_before_leader_reap() {
-    assert!(super::macos_process_status_is_terminal(5));
-    for running_status in [1, 2, 3, 4] {
-        assert!(!super::macos_process_status_is_terminal(running_status));
-    }
-}
-
 async fn abort_one_run_at_reader_handoff(
     supervisor: &std::sync::Arc<ProcessSupervisor>,
 ) -> Result<(), super::ProcessError> {
