@@ -74,6 +74,7 @@ pub enum RuntimeError {
     ArchiveDigestMismatch,
     UnsafeArchive,
     ExtractionFailed,
+    InstallLockDeadline,
     InstallFailed,
     ActivationFailed,
     AdministratorRuntimeRequired,
@@ -101,6 +102,9 @@ impl fmt::Display for RuntimeError {
             Self::ArchiveDigestMismatch => f.write_str("runtime archive identity did not match"),
             Self::UnsafeArchive => f.write_str("runtime archive was rejected by policy"),
             Self::ExtractionFailed => f.write_str("runtime archive extraction failed"),
+            Self::InstallLockDeadline => {
+                f.write_str("runtime installation lock exceeded its deadline")
+            }
             Self::InstallFailed => f.write_str("runtime installation failed"),
             Self::ActivationFailed => f.write_str("runtime activation failed"),
             Self::AdministratorRuntimeRequired => f.write_str(

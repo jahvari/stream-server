@@ -36,6 +36,8 @@ const HASH_DEADLINE: Duration = Duration::from_secs(10);
 const HASH_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_PATH_CANDIDATES: usize = 64;
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(30);
+const MANAGED_INSTALL_LOCK_DEADLINE: Duration = Duration::from_secs(20);
+const MANAGED_INSTALL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     explicit_root: Option<PathBuf>,
@@ -3254,11 +3256,12 @@ async fn install_verified_archive(
     supervisor: &ProcessSupervisor,
     fail_before_switch: bool,
 ) -> Result<Arc<FfmpegRuntime>, RuntimeError> {
-    let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
-    recover_managed_install_artifacts(root, &staging_root)?;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let commit = AcquisitionCommitControl::new();
     let observer = AcquisitionObserver::default();
+    let (versions, staging_root, _install_lock) =
+        prepare_managed_root(root, &cancellation, &observer).await?;
+    recover_managed_install_artifacts(root, &staging_root)?;
     install_verified_archive_locked(
         (root, &versions, &staging_root),
         artifact,
@@ -3276,7 +3279,12 @@ async fn install_verified_archive(
 
 async fn prepare_managed_root(
     root: &Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+    observer: &AcquisitionObserver,
 ) -> Result<(PathBuf, PathBuf, fslock::LockFile), RuntimeError> {
+    if cancellation.is_cancelled() {
+        return Err(RuntimeError::Cancelled);
+    }
     if !root.is_absolute() || is_remote_or_device_path(root) {
         return Err(RuntimeError::UnsafePath);
     }
@@ -3287,6 +3295,53 @@ async fn prepare_managed_root(
     fs::create_dir_all(&root).map_err(|_| RuntimeError::InstallFailed)?;
     validate_existing_local_components(&root)?;
     apply_managed_root_permissions(&root)?;
+    let lock_path = root.join("install.lock");
+    validate_managed_lock_path(&lock_path)?;
+    let mut install_lock =
+        fslock::LockFile::open(&lock_path).map_err(|_| RuntimeError::InstallFailed)?;
+    let lock_deadline = tokio::time::Instant::now() + observer.install_lock_deadline();
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= lock_deadline {
+            return Err(RuntimeError::InstallLockDeadline);
+        }
+        match install_lock
+            .try_lock()
+            .map_err(|_| RuntimeError::InstallFailed)?
+        {
+            true => {
+                if cancellation.is_cancelled() {
+                    drop(install_lock);
+                    return Err(RuntimeError::Cancelled);
+                }
+                observer.after_install_lock_acquired().await;
+                if cancellation.is_cancelled() {
+                    drop(install_lock);
+                    return Err(RuntimeError::Cancelled);
+                }
+                break;
+            }
+            false => observer.observe_install_lock_contention(),
+        }
+        let next_poll = std::cmp::min(
+            lock_deadline,
+            tokio::time::Instant::now() + MANAGED_INSTALL_LOCK_POLL_INTERVAL,
+        );
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(RuntimeError::Cancelled),
+            _ = tokio::time::sleep_until(next_poll) => {}
+        }
+    }
+    validate_existing_local_components(&root)?;
+    validate_managed_lock_path(&lock_path)?;
+    if cancellation.is_cancelled() {
+        drop(install_lock);
+        return Err(RuntimeError::Cancelled);
+    }
     validate_existing_local_components(&versions)?;
     fs::create_dir_all(&versions).map_err(|_| RuntimeError::InstallFailed)?;
     validate_existing_local_components(&versions)?;
@@ -3295,17 +3350,7 @@ async fn prepare_managed_root(
     validate_existing_local_components(&staging_root)?;
     apply_managed_root_permissions(&versions)?;
     apply_managed_root_permissions(&staging_root)?;
-    let lock_path = root.join("install.lock");
-    validate_managed_lock_path(&lock_path)?;
-    let _install_lock = tokio::task::spawn_blocking(move || {
-        let mut lock =
-            fslock::LockFile::open(&lock_path).map_err(|_| RuntimeError::InstallFailed)?;
-        lock.lock().map_err(|_| RuntimeError::InstallFailed)?;
-        Ok::<_, RuntimeError>(lock)
-    })
-    .await
-    .map_err(|_| RuntimeError::InstallFailed)??;
-    Ok((versions, staging_root, _install_lock))
+    Ok((versions, staging_root, install_lock))
 }
 
 fn validate_managed_lock_path(path: &Path) -> Result<(), RuntimeError> {
@@ -3582,7 +3627,9 @@ async fn commit_managed_rollback(
     commit: &AcquisitionCommitControl,
     observer: &AcquisitionObserver,
 ) -> Result<(), RuntimeError> {
-    let (versions, _staging, _lock) = prepare_managed_root(root).await?;
+    let supervisor_cancellation = supervisor.cancellation_token();
+    let (versions, _staging, _lock) =
+        prepare_managed_root(root, &supervisor_cancellation, observer).await?;
     if read_managed_selection(root)?.as_ref() != Some(expected) {
         return Err(RuntimeError::ActivationFailed);
     }
@@ -3804,7 +3851,8 @@ where
     let _cancellation_forwarder_guard = AcquisitionCancellationForwarder {
         task: cancellation_forwarder,
     };
-    let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
+    let (versions, staging_root, _install_lock) =
+        prepare_managed_root(root, commit.cancellation(), observer).await?;
     recover_managed_install_artifacts(root, &staging_root)?;
     let version_root = versions.join(&version);
     match fs::symlink_metadata(&version_root) {
@@ -3867,6 +3915,10 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcquisitionStage {
+    #[cfg(test)]
+    WaitingForInstallLock,
+    #[cfg(test)]
+    AfterInstallLockAcquired,
     PostDownload,
     InExtraction,
     PostExtraction,
@@ -4015,6 +4067,40 @@ impl AcquisitionObserver {
             test: self.test.clone(),
         }
     }
+
+    fn install_lock_deadline(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            let milliseconds = test.install_lock_deadline_millis.load(Ordering::Acquire);
+            if milliseconds != 0 {
+                return Duration::from_millis(milliseconds);
+            }
+        }
+        MANAGED_INSTALL_LOCK_DEADLINE
+    }
+
+    fn observe_install_lock_contention(&self) {
+        #[cfg(test)]
+        if let Some(test) = &self.test
+            && test.target == AcquisitionStage::WaitingForInstallLock
+        {
+            test.reached.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+        }
+    }
+
+    async fn after_install_lock_acquired(&self) {
+        #[cfg(test)]
+        if let Some(test) = &self.test
+            && test.target == AcquisitionStage::AfterInstallLockAcquired
+        {
+            test.reached.store(true, Ordering::Release);
+            test.notification.notify_waiters();
+            while !test.released.load(Ordering::Acquire) {
+                test.notification.notified().await;
+            }
+        }
+    }
 }
 
 struct AcquisitionOwnerGuard {
@@ -4054,6 +4140,7 @@ struct AcquisitionTestObserver {
     active_blocking_workers: AtomicUsize,
     owner_finished: AtomicBool,
     released: AtomicBool,
+    install_lock_deadline_millis: AtomicU64,
 }
 
 #[cfg(test)]
@@ -4066,6 +4153,7 @@ impl AcquisitionTestObserver {
             active_blocking_workers: AtomicUsize::new(0),
             owner_finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            install_lock_deadline_millis: AtomicU64::new(0),
         }
     }
 
@@ -4088,6 +4176,13 @@ impl AcquisitionTestObserver {
     fn release(&self) {
         self.released.store(true, Ordering::Release);
         self.notification.notify_waiters();
+    }
+
+    fn set_install_lock_deadline(&self, deadline: Duration) {
+        self.install_lock_deadline_millis.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
     }
 }
 
@@ -4628,11 +4723,12 @@ async fn install_archive_with_swap_for_test<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    let (versions, staging_root, _install_lock) = prepare_managed_root(root).await?;
-    recover_managed_install_artifacts(root, &staging_root)?;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let commit = AcquisitionCommitControl::new();
     let observer = AcquisitionObserver::default();
+    let (versions, staging_root, _install_lock) =
+        prepare_managed_root(root, &cancellation, &observer).await?;
+    recover_managed_install_artifacts(root, &staging_root)?;
     install_verified_archive_locked_with_hook(
         (root, &versions, &staging_root),
         artifact,
@@ -4681,6 +4777,34 @@ where
         supervisor,
         fetch,
         AcquisitionObserver {
+            test: Some(observer),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn prepare_managed_root_for_test(
+    root: &Path,
+) -> Result<(PathBuf, PathBuf, fslock::LockFile), RuntimeError> {
+    prepare_managed_root(
+        root,
+        &tokio_util::sync::CancellationToken::new(),
+        &AcquisitionObserver::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn prepare_managed_root_with_observer_for_test(
+    root: &Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+    observer: Arc<AcquisitionTestObserver>,
+) -> Result<(PathBuf, PathBuf, fslock::LockFile), RuntimeError> {
+    prepare_managed_root(
+        root,
+        cancellation,
+        &AcquisitionObserver {
             test: Some(observer),
         },
     )
@@ -4802,6 +4926,15 @@ mod tests {
     };
     use sha2::Digest;
     use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc, time::Duration};
+
+    #[cfg(windows)]
+    fn hold_managed_install_lock(root: &std::path::Path) -> fslock::LockFile {
+        fs::create_dir_all(root).expect("create managed lock fixture root");
+        let mut lock =
+            fslock::LockFile::open(&root.join("install.lock")).expect("open independent lock");
+        assert!(lock.try_lock().expect("hold independent install lock"));
+        lock
+    }
 
     async fn spawn_archive_fixture(
         payload: Vec<u8>,
@@ -6096,7 +6229,10 @@ fn main() {{
         .expect_err("pre-cancelled acquisition must fail");
         assert_eq!(error, super::RuntimeError::Cancelled);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
-        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        assert!(
+            !root.join("staging").exists(),
+            "pre-cancelled acquisition mutated the staging namespace"
+        );
     }
 
     #[cfg(windows)]
@@ -6211,6 +6347,260 @@ fn main() {{
         assert!(!root.join("current.json").exists());
         assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
         assert_eq!(supervisor.active_processes(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_drop_cancels_install_lock_wait_without_mutation_or_detached_worker() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("caller-drop lock fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let held_lock = hold_managed_install_lock(&root);
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::WaitingForInstallLock,
+        ));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let mut acquisition = Box::pin(
+            super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |_| async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+                Arc::clone(&observer),
+            ),
+        );
+        tokio::select! {
+            result = &mut acquisition => panic!("lock waiter completed before caller drop: {result:?}"),
+            _ = observer.wait_until_reached() => {}
+        }
+
+        drop(acquisition);
+        tokio::time::timeout(Duration::from_secs(1), observer.wait_until_owner_finished())
+            .await
+            .expect("caller drop ends the detached owner lock wait");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!root.join("current.json").exists());
+        assert!(!root.join("staging").exists());
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+        drop(held_lock);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_cancellation_returns_promptly_while_install_lock_is_held() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("supervisor lock cancellation fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let held_lock = hold_managed_install_lock(&root);
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::WaitingForInstallLock,
+        ));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let mut acquisition = Box::pin(
+            super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |_| async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+                Arc::clone(&observer),
+            ),
+        );
+        tokio::select! {
+            result = &mut acquisition => panic!("lock waiter completed before cancellation: {result:?}"),
+            _ = observer.wait_until_reached() => {}
+        }
+
+        supervisor.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut acquisition)
+            .await
+            .expect("supervisor cancellation bounds install lock wait")
+            .expect_err("cancelled install lock wait must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!root.join("current.json").exists());
+        assert!(!root.join("staging").exists());
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+        drop(held_lock);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_install_lock_acquisition_exits_before_critical_section() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("post-acquisition cancellation fixture");
+        let root = directory.path().join("runtimes");
+        let (_archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let held_lock = hold_managed_install_lock(&root);
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::AfterInstallLockAcquired,
+        ));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let mut acquisition = Box::pin(
+            super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |_| async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+                Arc::clone(&observer),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        drop(held_lock);
+        tokio::select! {
+            result = &mut acquisition => panic!("acquisition entered critical section before checkpoint: {result:?}"),
+            _ = observer.wait_until_reached() => {}
+        }
+
+        supervisor.cancel();
+        observer.release();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut acquisition)
+            .await
+            .expect("post-acquisition cancellation remains bounded")
+            .expect_err("post-acquisition cancellation must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!root.join("current.json").exists());
+        assert!(!root.join("staging").exists());
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+        let mut next = fslock::LockFile::open(&root.join("install.lock"))
+            .expect("open lock after post-acquisition cancellation");
+        assert!(next.try_lock().expect("reacquire cancelled lock"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_lock_deadline_is_typed_bounded_and_retryable_after_release() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("install lock deadline fixture");
+        let root = directory.path().join("runtimes");
+        let (archive, artifact) = runtime_archive_and_artifact(directory.path(), "7.1.4", "3");
+        let held_lock = hold_managed_install_lock(&root);
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::WaitingForInstallLock,
+        ));
+        observer.set_install_lock_deadline(Duration::from_millis(75));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::ensure_managed_runtime_with_fetch_and_observer_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |_| async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    Err(super::RuntimeError::DownloadFailed)
+                },
+                Arc::clone(&observer),
+            ),
+        )
+        .await
+        .expect("install lock deadline is bounded")
+        .expect_err("held install lock must time out");
+        assert_eq!(error, super::RuntimeError::InstallLockDeadline);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(!root.join("current.json").exists());
+        assert!(!root.join("staging").exists());
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+
+        drop(held_lock);
+        let copied_archive = archive.clone();
+        let runtime = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::ensure_managed_runtime_with_fetch_for_test(
+                &root,
+                &artifact,
+                &supervisor,
+                move |archive_path| async move {
+                    fs::copy(copied_archive, archive_path).expect("copy retry archive");
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("released lock permits retry")
+        .expect("retry installs managed runtime");
+        assert_eq!(runtime.id().jellyfin_revision.as_deref(), Some("3"));
+        assert_eq!(supervisor.active_processes(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_outer_lock_wait_future_leaves_no_detached_lock_worker() {
+        use tokio_util::sync::CancellationToken;
+
+        let directory = tempfile::tempdir().expect("outer timeout lock fixture");
+        let root = directory.path().join("runtimes");
+        let held_lock = hold_managed_install_lock(&root);
+        let cancellation = CancellationToken::new();
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::WaitingForInstallLock,
+        ));
+        observer.set_install_lock_deadline(Duration::from_secs(5));
+        let mut wait = Box::pin(super::prepare_managed_root_with_observer_for_test(
+            &root,
+            &cancellation,
+            Arc::clone(&observer),
+        ));
+        tokio::select! {
+            result = &mut wait => panic!("lock waiter completed before outer timeout: {result:?}"),
+            _ = observer.wait_until_reached() => {}
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "simulated outer deadline must expire while another process owns the lock"
+        );
+        drop(wait);
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert!(!root.join("staging").exists());
+
+        drop(held_lock);
+        let mut next = fslock::LockFile::open(&root.join("install.lock"))
+            .expect("open lock after outer timeout");
+        assert!(
+            next.try_lock().expect("acquire lock after outer timeout"),
+            "dropped outer wait retained a detached lock owner"
+        );
     }
 
     #[cfg(windows)]
@@ -6404,6 +6794,92 @@ fn main() {{
             }
             assert_eq!(supervisor.active_processes(), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_lock_wait_cancellation_preserves_selection_bytes() {
+        use crate::transcoding::process::ProcessSupervisor;
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = crate::transcoding::process::PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("rollback lock wait fixture");
+        let root = directory.path().join("runtimes");
+        let (old_archive, old_artifact) =
+            runtime_archive_and_artifact(directory.path(), "7.1.3", "1");
+        let failure_switch = directory.path().join("fail-current-during-lock-wait");
+        let executable = fake_jellyfin_executable_with_failure_switch(
+            directory.path(),
+            "7.1.4",
+            &failure_switch,
+        );
+        let (current_archive, current_artifact) = runtime_archive_with_binary_and_claimed_identity(
+            directory.path(),
+            &executable,
+            "7.1.4",
+            "3",
+        );
+        let supervisor = ProcessSupervisor::new(CancellationToken::new());
+        drop(
+            super::install_archive_for_test(&root, &old_artifact, &old_archive, &supervisor, false)
+                .await
+                .expect("install rollback runtime"),
+        );
+        drop(
+            super::install_archive_for_test(
+                &root,
+                &current_artifact,
+                &current_archive,
+                &supervisor,
+                false,
+            )
+            .await
+            .expect("install current runtime"),
+        );
+        fs::write(&failure_switch, b"fail").expect("make current runtime unhealthy");
+        let selection_before =
+            fs::read(root.join("current.json")).expect("read selection before lock wait");
+        let staging_before = fs::read_dir(root.join("staging"))
+            .expect("read staging before lock wait")
+            .map(|entry| entry.expect("read staging entry").file_name())
+            .collect::<Vec<_>>();
+        let held_lock = hold_managed_install_lock(&root);
+        let observer = Arc::new(super::AcquisitionTestObserver::new(
+            super::AcquisitionStage::WaitingForInstallLock,
+        ));
+        let mut resolution = Box::pin(
+            super::resolve_managed_runtime_for_artifact_with_observer_for_test(
+                &root,
+                &current_artifact,
+                &supervisor,
+                Arc::clone(&observer),
+            ),
+        );
+        tokio::select! {
+            result = &mut resolution => panic!("rollback completed before lock cancellation: {result:?}"),
+            _ = observer.wait_until_reached() => {}
+        }
+
+        supervisor.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut resolution)
+            .await
+            .expect("rollback lock wait responds to supervisor cancellation")
+            .expect_err("cancelled rollback lock wait must fail");
+        assert_eq!(error, super::RuntimeError::Cancelled);
+        assert_eq!(
+            fs::read(root.join("current.json")).expect("read selection after cancellation"),
+            selection_before
+        );
+        assert_eq!(
+            fs::read_dir(root.join("staging"))
+                .expect("read staging after cancellation")
+                .map(|entry| entry.expect("read staging entry").file_name())
+                .collect::<Vec<_>>(),
+            staging_before
+        );
+        assert_eq!(observer.active_blocking_workers(), 0);
+        assert_eq!(supervisor.active_processes(), 0);
+        drop(held_lock);
     }
 
     #[cfg(windows)]
@@ -7194,7 +7670,7 @@ fn main() {{
         symlink_dir(&outside, &linked_parent).expect("create directory reparse fixture");
 
         let root = linked_parent.join("runtimes");
-        let error = super::prepare_managed_root(&root)
+        let error = super::prepare_managed_root_for_test(&root)
             .await
             .expect_err("managed root beneath a reparse ancestor must be rejected");
         assert_eq!(error, super::RuntimeError::UnsafePath);
@@ -7209,7 +7685,7 @@ fn main() {{
         fs::create_dir(&outside_versions).expect("create versions reparse target");
         symlink_dir(&outside_versions, safe_root.join("versions"))
             .expect("create versions reparse fixture");
-        let error = super::prepare_managed_root(&safe_root)
+        let error = super::prepare_managed_root_for_test(&safe_root)
             .await
             .expect_err("managed versions reparse point must be rejected");
         assert_eq!(error, super::RuntimeError::UnsafePath);
@@ -7220,7 +7696,7 @@ fn main() {{
         fs::write(&outside_lock, b"operator-owned").expect("create lock reparse target");
         symlink_file(&outside_lock, lock_root.join("install.lock"))
             .expect("create lock reparse fixture");
-        let error = super::prepare_managed_root(&lock_root)
+        let error = super::prepare_managed_root_for_test(&lock_root)
             .await
             .expect_err("managed lock reparse point must be rejected");
         assert_eq!(error, super::RuntimeError::UnsafePath);
