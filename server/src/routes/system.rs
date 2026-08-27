@@ -679,19 +679,23 @@ pub async fn set_settings(
         }
     }
 }
+
+pub(crate) fn compat_device_info(profiles: Vec<String>) -> serde_json::Value {
+    json!({ "availableHardwareAccelerations": profiles })
+}
+
+pub(crate) fn compat_profiler(profiles: Vec<String>) -> serde_json::Value {
+    json!({ "success": true, "profiles": profiles })
+}
+
 pub async fn get_device_info() -> impl IntoResponse {
     let profiles = probe_hwaccel().await;
-    Json(json!({
-        "availableHardwareAccelerations": profiles
-    }))
+    Json(compat_device_info(profiles))
 }
 
 pub async fn hwaccel_profiler() -> impl IntoResponse {
     let profiles = probe_hwaccel().await;
-    Json(json!({
-        "success": true,
-        "profiles": profiles
-    }))
+    Json(compat_profiler(profiles))
 }
 
 static HWACCEL_PROFILES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
@@ -1027,10 +1031,33 @@ pub async fn get_file_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn server_version_default_uses_crate_version() {
         let settings = ServerSettings::default();
         assert_eq!(settings.server_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn device_info_shape_is_stable() {
+        let value = compat_device_info(vec!["nvenc".into(), "nvenc:verified".into()]);
+        assert_eq!(
+            value,
+            json!({
+                "availableHardwareAccelerations": ["nvenc", "nvenc:verified"]
+            })
+        );
+    }
+
+    #[test]
+    fn profiler_shape_is_stable() {
+        assert_eq!(
+            compat_profiler(vec!["qsv".into()]),
+            json!({
+                "success": true,
+                "profiles": ["qsv"]
+            })
+        );
     }
 }

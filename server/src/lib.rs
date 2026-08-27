@@ -51,6 +51,7 @@ mod local_addon;
 mod routes;
 mod ssdp;
 mod state;
+pub mod transcoding;
 mod tui;
 mod updater;
 pub mod ytdlp;

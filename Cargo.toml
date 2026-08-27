@@ -9,6 +9,8 @@ members = [
     "stremio-runtime-stub",
     "updater-helper",
     "settings-gui",
+    # Test-only FFmpeg/ffprobe process fixture; not referenced by release/package metadata.
+    "test-support/fake-media-tool",
 ]
 
 [workspace.package]

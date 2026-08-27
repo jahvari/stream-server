@@ -1,0 +1,19 @@
+[package]
+name = "fake-media-tool"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+# Test-only process fixture for FFmpeg/ffprobe characterization tests.
+# This crate must never be published or included in application packages.
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[target.'cfg(unix)'.dependencies]
+# The Unix fixture must prove SIGTERM is ignored before supervisor forced-kill tests.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
