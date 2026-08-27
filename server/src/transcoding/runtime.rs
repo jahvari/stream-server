@@ -8574,6 +8574,8 @@ fn main() {{
             let path = directory.path().join(role);
             let metadata = fs::metadata(&path).expect("capture original metadata");
             assert_eq!(replacement.len(), metadata.len() as usize);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make source writable for the same-inode mutation");
             fs::write(&path, replacement).expect("mutate same inode and size");
             fs::File::options()
                 .write(true)
@@ -8585,6 +8587,8 @@ fn main() {{
                         .set_modified(metadata.modified().expect("original modified time")),
                 )
                 .expect("restore source timestamps");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500))
+                .expect("restore executable-only source permissions");
         }
 
         let session = service

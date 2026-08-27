@@ -1382,7 +1382,7 @@ async fn session_revalidation_detects_a_path_replaced_after_validation() {
     let ffmpeg = root.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
     let original = ffmpeg.with_extension("original");
     fs::rename(&ffmpeg, &original).expect("replace executable path after validation");
-    fs::copy(&fake_process().executable, &ffmpeg).expect("install byte-identical replacement");
+    fs::copy(&original, &ffmpeg).expect("install byte-identical replacement");
 
     let replacement_session = service
         .runtime_for_session()

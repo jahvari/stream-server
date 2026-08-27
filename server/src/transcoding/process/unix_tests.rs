@@ -55,6 +55,13 @@ fn dropping_tokio_runtime_keeps_os_owner_until_child_descendant_and_readers_reap
         })
         .await
         .expect("child and descendant reached explicit barrier");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor.active_processes() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawned process reached the supervisor registry");
         assert_eq!(supervisor.active_processes(), 1);
     });
     let descendant = std::fs::read_to_string(&descendant_marker)
