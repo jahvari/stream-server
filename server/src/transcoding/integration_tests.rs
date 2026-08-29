@@ -1409,6 +1409,194 @@ async fn unavailable_service_is_side_effect_free_and_exposes_disabled_status() {
     assert_eq!(supervisor.active_processes(), 0);
 }
 
+async fn fake_probe_service(
+    root: &Path,
+    cancellation: CancellationToken,
+) -> (Arc<TranscodingService>, Arc<ProcessSupervisor>) {
+    let config = isolated_config().with_explicit_root(root.to_path_buf());
+    let supervisor = Arc::new(ProcessSupervisor::new(cancellation));
+    let runtime = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve fake probe runtime");
+    (
+        Arc::new(TranscodingService::resolved(
+            config,
+            supervisor.clone(),
+            runtime,
+        )),
+        supervisor,
+    )
+}
+
+fn synthetic_probe_source(root: &Path, version: &str) -> crate::transcoding::ValidatedMediaSource {
+    let media = root.join("media.fixture");
+    fs::write(&media, b"fixture media bytes").expect("write synthetic media source");
+    crate::transcoding::ValidatedMediaSource::synthetic_fixture_path(
+        "synthetic-probe-source",
+        version,
+        media,
+    )
+    .expect("construct sealed synthetic source")
+}
+
+#[tokio::test]
+async fn bounded_ffprobe_process_parses_output_single_flights_and_invalidates_by_version() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("probe runtime root");
+    let root = jellyfin_root(directory.path(), "probe-success");
+    fs::write(
+        root.join("ffprobe.probe"),
+        include_bytes!("../../tests/fixtures/ffprobe/compatibility.json"),
+    )
+    .expect("write probe output");
+    let (service, supervisor) = fake_probe_service(&root, CancellationToken::new()).await;
+    let source = Arc::new(synthetic_probe_source(&root, "version-one"));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let service = service.clone();
+        let source = source.clone();
+        tasks.push(tokio::spawn(async move {
+            crate::transcoding::probe_media(&service, &source)
+                .await
+                .expect("probe through paired runtime")
+        }));
+    }
+    for task in tasks {
+        assert_eq!(
+            task.await
+                .expect("join probe")
+                .probe()
+                .selected_video_stream(),
+            Some(0)
+        );
+    }
+    assert_eq!(fs::read_to_string(root.join("probe-count")).unwrap(), "1");
+
+    let changed = synthetic_probe_source(&root, "version-two");
+    crate::transcoding::probe_media(&service, &changed)
+        .await
+        .expect("changed source version reprobes");
+    assert_eq!(fs::read_to_string(root.join("probe-count")).unwrap(), "2");
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test]
+async fn bounded_ffprobe_process_rejects_nonzero_and_output_limit_failures() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    for (name, setup, expected) in [
+        (
+            "nonzero",
+            ("probe-exit-code", b"7".as_slice()),
+            crate::transcoding::ProbeErrorCode::NonZeroExit,
+        ),
+        (
+            "stdout-limit",
+            (
+                "ffprobe.probe",
+                &vec![b'o'; crate::transcoding::probe::MAX_PROBE_STDOUT_BYTES + 1],
+            ),
+            crate::transcoding::ProbeErrorCode::OutputTooLarge,
+        ),
+        (
+            "stderr-limit",
+            ("probe-stderr", &vec![b'e'; 1024 * 1024 + 1]),
+            crate::transcoding::ProbeErrorCode::ProcessFailure,
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("probe failure runtime root");
+        let root = jellyfin_root(directory.path(), name);
+        fs::write(root.join(setup.0), setup.1).expect("write probe failure control");
+        let (service, supervisor) = fake_probe_service(&root, CancellationToken::new()).await;
+        let source = synthetic_probe_source(&root, "failure-version");
+        let error = crate::transcoding::probe_media(&service, &source)
+            .await
+            .expect_err("probe failure must fail closed");
+        assert_eq!(error.code(), expected, "failure scenario {name}");
+        assert_eq!(supervisor.active_processes(), 0, "failure scenario {name}");
+    }
+}
+
+#[tokio::test]
+async fn bounded_ffprobe_process_cancellation_terminates_the_stalled_child() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("probe cancellation runtime root");
+    let root = jellyfin_root(directory.path(), "probe-cancel");
+    fs::write(root.join("probe-stall"), b"stall").expect("enable probe stall");
+    let cancellation = CancellationToken::new();
+    let (service, supervisor) = fake_probe_service(&root, cancellation.clone()).await;
+    let source = Arc::new(synthetic_probe_source(&root, "cancel-version"));
+    let probe = {
+        let service = service.clone();
+        let source = source.clone();
+        tokio::spawn(async move { crate::transcoding::probe_media(&service, &source).await })
+    };
+    let marker = root.join("probe-started");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stalled probe process started");
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(10), probe)
+        .await
+        .expect("cancelled probe completes")
+        .expect("join cancelled probe")
+        .expect_err("cancelled probe fails");
+    assert_eq!(error.code(), crate::transcoding::ProbeErrorCode::Cancelled);
+    supervisor
+        .wait_for_idle(Duration::from_secs(10))
+        .await
+        .expect("cancelled probe process reaped");
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test]
+async fn bounded_ffprobe_process_stall_hits_the_probe_inactivity_deadline_and_reaps() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("probe deadline runtime root");
+    let root = jellyfin_root(directory.path(), "probe-deadline");
+    fs::write(root.join("probe-stall"), b"stall").expect("enable probe stall");
+    let (service, supervisor) = fake_probe_service(&root, CancellationToken::new()).await;
+    let source = Arc::new(synthetic_probe_source(&root, "deadline-version"));
+    let probe = {
+        let service = service.clone();
+        let source = source.clone();
+        tokio::spawn(async move { crate::transcoding::probe_media(&service, &source).await })
+    };
+    let marker = root.join("probe-started");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stalled probe process started");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..15 {
+        if probe.is_finished() {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    tokio::time::resume();
+    let error = tokio::time::timeout(Duration::from_secs(10), probe)
+        .await
+        .expect("deadline probe cleanup completes")
+        .expect("join deadline probe")
+        .expect_err("stalled probe fails");
+    assert_eq!(error.code(), crate::transcoding::ProbeErrorCode::Inactivity);
+    supervisor
+        .wait_for_idle(Duration::from_secs(10))
+        .await
+        .expect("deadline probe process reaped");
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn explicit_unc_and_device_paths_are_rejected_without_a_probe() {
@@ -1474,6 +1662,9 @@ fn ignore_sigterm() {}
 fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     if runtime_query(&args) {
+        return;
+    }
+    if probe_query(&args) {
         return;
     }
     let mode = args.first().and_then(|arg| arg.to_str());
@@ -1546,6 +1737,36 @@ fn main() {
         }
         _ => std::process::exit(2),
     }
+}
+
+fn probe_query(args: &[OsString]) -> bool {
+    if !args.iter().any(|argument| argument == "-show_format") {
+        return false;
+    }
+    let root = env::current_dir().unwrap();
+    fs::write(root.join("probe-started"), b"started").unwrap();
+    let counter = root.join("probe-count");
+    let count = fs::read_to_string(&counter)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    fs::write(counter, count.to_string()).unwrap();
+    if root.join("probe-stall").is_file() {
+        loop { thread::sleep(Duration::from_secs(1)); }
+    }
+    if let Ok(stderr) = fs::read(root.join("probe-stderr")) {
+        io::stderr().write_all(&stderr).unwrap();
+    }
+    if let Ok(stdout) = fs::read(root.join("ffprobe.probe")) {
+        io::stdout().write_all(&stdout).unwrap();
+    } else {
+        io::stdout().write_all(b"{\"format\":{},\"streams\":[]}").unwrap();
+    }
+    if let Ok(code) = fs::read_to_string(root.join("probe-exit-code")) {
+        std::process::exit(code.trim().parse().unwrap());
+    }
+    true
 }
 
 fn runtime_query(args: &[OsString]) -> bool {

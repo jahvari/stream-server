@@ -4108,8 +4108,10 @@ fn workflow_reader_cleanup_helper_command(ready: &Path) -> Command {
 fn wait_for_workflow_reader_helper(ready: &Path) -> std::net::SocketAddr {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(address) = fs::read_to_string(ready) {
-            return address.parse().expect("helper listener address");
+        if let Ok(address) = fs::read_to_string(ready)
+            && let Ok(address) = address.parse()
+        {
+            return address;
         }
         assert!(
             Instant::now() < deadline,
@@ -4117,6 +4119,27 @@ fn wait_for_workflow_reader_helper(ready: &Path) -> std::net::SocketAddr {
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn workflow_reader_wait_ignores_partial_address_publication() {
+    let temporary = tempfile::tempdir().expect("partial readiness fixture");
+    let ready = temporary.path().join("ready");
+    fs::write(&ready, "127.0.0.").expect("publish partial helper address");
+
+    let completed_ready = ready.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        fs::write(completed_ready, "127.0.0.1:31415").expect("publish complete helper address");
+    });
+
+    assert_eq!(
+        wait_for_workflow_reader_helper(&ready),
+        "127.0.0.1:31415"
+            .parse()
+            .expect("expected helper listener address")
+    );
+    writer.join().expect("readiness writer must finish");
 }
 
 #[test]

@@ -7950,6 +7950,7 @@ dependencies = [
  "flate2",
  "fslock",
  "futures-util",
+ "getrandom 0.4.3",
  "hex 0.4.3",
  "ico",
  "if-addrs",

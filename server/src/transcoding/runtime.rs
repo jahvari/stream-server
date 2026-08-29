@@ -1,4 +1,5 @@
 use super::{
+    probe::ProbeCache,
     process::{
         BoundedOutput, ProcessError, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy,
         StdoutPolicy,
@@ -152,12 +153,33 @@ pub(crate) enum RuntimeExecutable {
 /// };
 /// ```
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RuntimeCommand {
     args: Vec<OsString>,
     stdout: StdoutPolicy,
     stderr_byte_limit: usize,
     wall_deadline: Duration,
+}
+
+impl RuntimeCommand {
+    pub(super) fn new(
+        args: Vec<OsString>,
+        stdout: StdoutPolicy,
+        stderr_byte_limit: usize,
+        wall_deadline: Duration,
+    ) -> Self {
+        Self {
+            args,
+            stdout,
+            stderr_byte_limit,
+            wall_deadline,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn args(&self) -> &[OsString] {
+        &self.args
+    }
 }
 
 #[allow(dead_code)]
@@ -222,6 +244,17 @@ impl VerifiedRuntimeSession {
         executable: RuntimeExecutable,
         command: RuntimeCommand,
     ) -> Result<BoundedOutput, RuntimeCommandError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.run_bounded_with_cancellation(executable, command, &cancellation)
+            .await
+    }
+
+    pub(super) async fn run_bounded_with_cancellation(
+        &self,
+        executable: RuntimeExecutable,
+        command: RuntimeCommand,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<BoundedOutput, RuntimeCommandError> {
         let execution_lease = open_pair_lease(
             self.runtime.lease.root.clone(),
             OpenMode::MetadataOnly {
@@ -253,16 +286,19 @@ impl VerifiedRuntimeSession {
             bound_execution_path(&execution_lease.lease._root_file, &execution_lease.root)
                 .map_err(|_| RuntimeCommandError::Runtime(RuntimeError::RuntimeChanged))?;
         self.supervisor
-            .run_bounded(ProcessSpec {
-                executable: executable_path,
-                args: command.args,
-                environment: minimal_runtime_environment(&current_dir),
-                current_dir,
-                stdin: StdinPolicy::Null,
-                stdout: command.stdout,
-                stderr_byte_limit: command.stderr_byte_limit,
-                wall_deadline: command.wall_deadline,
-            })
+            .run_bounded_with_cancellation(
+                ProcessSpec {
+                    executable: executable_path,
+                    args: command.args,
+                    environment: minimal_runtime_environment(&current_dir),
+                    current_dir,
+                    stdin: StdinPolicy::Null,
+                    stdout: command.stdout,
+                    stderr_byte_limit: command.stderr_byte_limit,
+                    wall_deadline: command.wall_deadline,
+                },
+                cancellation,
+            )
             .await
             .map_err(RuntimeCommandError::Process)
     }
@@ -308,6 +344,7 @@ impl RuntimeKind {
 pub struct TranscodingService {
     supervisor: Arc<ProcessSupervisor>,
     state: tokio::sync::RwLock<ServiceState>,
+    probe_cache: ProbeCache,
 }
 
 enum ServiceState {
@@ -323,6 +360,7 @@ impl TranscodingService {
         Self {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Unavailable),
+            probe_cache: ProbeCache::default(),
         }
     }
 
@@ -334,6 +372,7 @@ impl TranscodingService {
         Self {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Resolved { config, runtime }),
+            probe_cache: ProbeCache::default(),
         }
     }
 
@@ -345,6 +384,10 @@ impl TranscodingService {
                 kind: runtime.kind,
             }),
         }
+    }
+
+    pub(super) fn probe_cache(&self) -> &ProbeCache {
+        &self.probe_cache
     }
 
     pub async fn status(&self) -> RuntimeStatus {

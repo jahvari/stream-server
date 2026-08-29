@@ -1,16 +1,29 @@
 use enginefs::hls::{HlsEngine, ProbeResult};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::{
+    Arc, Barrier,
+    atomic::{AtomicUsize, Ordering},
+};
 
 struct CountingAllocator;
 
-static COUNTING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
+
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static REALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+fn is_counting() -> bool {
+    COUNTING
+        .try_with(|counting| counting.get())
+        .unwrap_or(false)
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
+        if is_counting() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc(layout) }
@@ -21,7 +34,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
+        if is_counting() {
             REALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -32,14 +45,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn start_counting() {
-    COUNTING.store(false, Ordering::SeqCst);
+    COUNTING.with(|counting| counting.set(false));
     ALLOCATIONS.store(0, Ordering::SeqCst);
     REALLOCATIONS.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
+    COUNTING.with(|counting| counting.set(true));
 }
 
 fn stop_counting() -> (usize, usize) {
-    COUNTING.store(false, Ordering::SeqCst);
+    COUNTING.with(|counting| counting.set(false));
     (
         ALLOCATIONS.load(Ordering::SeqCst),
         REALLOCATIONS.load(Ordering::SeqCst),
@@ -48,6 +61,30 @@ fn stop_counting() -> (usize, usize) {
 
 #[test]
 fn two_hour_playlist_avoids_per_segment_temporary_allocations() {
+    let allocation_started = Arc::new(Barrier::new(2));
+    let allocation_finished = Arc::new(Barrier::new(2));
+    let worker = {
+        let allocation_started = Arc::clone(&allocation_started);
+        let allocation_finished = Arc::clone(&allocation_finished);
+        std::thread::spawn(move || {
+            allocation_started.wait();
+            let unrelated = Box::new([0_u8; 1_024]);
+            std::hint::black_box(&unrelated);
+            allocation_finished.wait();
+        })
+    };
+
+    start_counting();
+    allocation_started.wait();
+    allocation_finished.wait();
+    let unrelated_counts = stop_counting();
+    worker.join().expect("allocation worker must finish");
+    assert_eq!(
+        unrelated_counts,
+        (0, 0),
+        "allocator measurements must ignore unrelated test-harness threads"
+    );
+
     let probe = ProbeResult {
         duration: 7_200.0,
         container: "test".to_string(),

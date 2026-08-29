@@ -235,7 +235,7 @@ impl HlsEngine {
             "Spawning ffmpeg probe command with analyzeduration={} probesize={} path={}",
             analyzeduration,
             probesize,
-            file_path
+            redact_source_capabilities(file_path)
         );
         let mut child = cmd.spawn().context("Failed to spawn ffmpeg")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -694,14 +694,14 @@ impl HlsEngine {
         // Output format: MPEG-TS for HLS with copyts to preserve timestamps
         cmd.args(["-mpegts_copyts", "1", "-f", "mpegts", "pipe:1"]);
 
-        tracing::debug!("FFmpeg video command (HLS V2): {:?}", cmd);
+        tracing::debug!("Starting FFmpeg video command for HLS V2");
 
         #[allow(clippy::zombie_processes)]
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("Failed to spawn ffmpeg for video segment: {:?}", cmd))?;
+            .context("Failed to spawn ffmpeg for video segment")?;
 
         // Spawn a task to log stderr in background (for debugging)
         if let Some(stderr) = child.stderr.take() {
@@ -711,7 +711,10 @@ impl HlsEngine {
                 let mut line = String::new();
                 while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
                     if !line.trim().is_empty() {
-                        tracing::warn!("FFmpeg video stderr: {}", line.trim());
+                        tracing::warn!(
+                            "FFmpeg video stderr: {}",
+                            redact_source_capabilities(line.trim())
+                        );
                     }
                     line.clear();
                 }
@@ -795,14 +798,14 @@ impl HlsEngine {
         // Output format: MPEG-TS for HLS
         cmd.args(["-mpegts_copyts", "1", "-f", "mpegts", "pipe:1"]);
 
-        tracing::debug!("FFmpeg audio command (HLS V2): {:?}", cmd);
+        tracing::debug!("Starting FFmpeg audio command for HLS V2");
 
         #[allow(clippy::zombie_processes)]
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("Failed to spawn ffmpeg for audio segment: {:?}", cmd))?;
+            .context("Failed to spawn ffmpeg for audio segment")?;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -811,7 +814,10 @@ impl HlsEngine {
                 let mut line = String::new();
                 while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
                     if !line.trim().is_empty() {
-                        tracing::warn!("FFmpeg audio stderr: {}", line.trim());
+                        tracing::warn!(
+                            "FFmpeg audio stderr: {}",
+                            redact_source_capabilities(line.trim())
+                        );
                     }
                     line.clear();
                 }
@@ -937,6 +943,36 @@ fn text_mentions_high_bit_depth(value: &str) -> bool {
         || value.contains("yuv444p12")
 }
 
+fn redact_source_capabilities(input: &str) -> std::borrow::Cow<'_, str> {
+    const MARKER: &str = "cap=";
+    const CREDENTIAL_LENGTH: usize = 64;
+
+    let mut remainder = input;
+    let mut output = String::new();
+    let mut redacted = false;
+    while let Some(index) = remainder.find(MARKER) {
+        let credential_start = index + MARKER.len();
+        let credential = remainder
+            .as_bytes()
+            .get(credential_start..credential_start + CREDENTIAL_LENGTH);
+        if credential.is_some_and(|bytes| bytes.iter().all(u8::is_ascii_hexdigit)) {
+            output.push_str(&remainder[..credential_start]);
+            output.push_str("<redacted>");
+            remainder = &remainder[credential_start + CREDENTIAL_LENGTH..];
+            redacted = true;
+        } else {
+            output.push_str(&remainder[..credential_start]);
+            remainder = &remainder[credential_start..];
+        }
+    }
+    if redacted {
+        output.push_str(remainder);
+        std::borrow::Cow::Owned(output)
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,5 +1029,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ffmpeg_diagnostics_redact_transcoding_source_capabilities() {
+        let credential = "a".repeat(64);
+        let diagnostic = format!(
+            "unable to open http://127.0.0.1:11470/_transcoding/source?cap={credential}: denied"
+        );
+        let redacted = redact_source_capabilities(&diagnostic);
+
+        assert!(redacted.contains("cap=<redacted>"));
+        assert!(!redacted.contains(&credential));
+        assert_eq!(
+            redact_source_capabilities("ordinary diagnostic"),
+            "ordinary diagnostic"
+        );
     }
 }

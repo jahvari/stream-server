@@ -45,12 +45,45 @@ const PLAYLIST_LIFETIME_DEADLINE: Duration = Duration::from_secs(120);
 const PROXY_BODY_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProxyError {
+pub(crate) enum ProxyError {
     InvalidRequest,
     Blocked,
     Capacity,
     Upstream,
     Cancelled,
+}
+
+pub(crate) struct FetchedMediaSource {
+    pub(crate) response: reqwest::Response,
+    pub(crate) _lease: ProxyProducerLease,
+}
+
+pub(crate) async fn fetch_media_source(
+    runtime: &ProxyRuntime,
+    target: Url,
+    method: Method,
+    range: Option<&HeaderValue>,
+) -> Result<FetchedMediaSource, ProxyError> {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return Err(ProxyError::InvalidRequest);
+    }
+    let context = runtime
+        .try_request_for_peer(None)
+        .map_err(|_| ProxyError::Capacity)?;
+    let request = ParsedProxyRequest {
+        target,
+        request_headers: HeaderMap::new(),
+        response_headers: HeaderMap::new(),
+    };
+    let mut incoming = HeaderMap::new();
+    if let Some(range) = range {
+        incoming.insert(header::RANGE, range.clone());
+    }
+    let fetched = fetch_with_redirects(runtime, &context, &request, method, &incoming).await?;
+    Ok(FetchedMediaSource {
+        response: fetched.response,
+        _lease: context.into_producer_lease(),
+    })
 }
 
 impl From<DestinationError> for ProxyError {

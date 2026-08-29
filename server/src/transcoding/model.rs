@@ -425,185 +425,38 @@ pub enum KeyframeStrategy {
     TimeForced { segment_duration_ms: NonZeroU32 },
 }
 
-/// A media source capability issued by a trusted internal owner.
-///
-/// Route/external code cannot manufacture a trusted source from JSON:
-///
-/// ```compile_fail
-/// use stream_server::transcoding::ValidatedMediaSource;
-///
-/// let _: ValidatedMediaSource = serde_json::from_str(
-///     r#"{"approvedRemote":{"id":"route-text"}}"#,
-/// ).unwrap();
-/// ```
-///
-/// It also cannot call the internal issuance seams directly:
-///
-/// ```compile_fail
-/// use stream_server::transcoding::ValidatedMediaSource;
-///
-/// let _ = ValidatedMediaSource::approved_remote("route-text");
-/// ```
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ValidatedMediaSource {
-    CompletedFile(CompletedFileSource),
-    EngineLoopback(EngineLoopbackSource),
-    ApprovedRemote(ApprovedRemoteSource),
-    SyntheticFixture(SyntheticFixtureSource),
-}
-
-#[allow(
-    dead_code,
-    reason = "sealed issuance seams are consumed by the source broker and verifier in later planned tasks"
-)]
-impl ValidatedMediaSource {
-    pub(in crate::transcoding) fn completed_file(
-        id: impl Into<String>,
-    ) -> Result<Self, ModelValidationError> {
-        Ok(Self::CompletedFile(CompletedFileSource::new(id)?))
-    }
-
-    pub(in crate::transcoding) fn engine_loopback(
-        id: impl Into<String>,
-    ) -> Result<Self, ModelValidationError> {
-        Ok(Self::EngineLoopback(EngineLoopbackSource::new(id)?))
-    }
-
-    pub(in crate::transcoding) fn approved_remote(
-        id: impl Into<String>,
-    ) -> Result<Self, ModelValidationError> {
-        Ok(Self::ApprovedRemote(ApprovedRemoteSource::new(id)?))
-    }
-
-    pub(in crate::transcoding) fn synthetic_fixture(
-        id: impl Into<String>,
-    ) -> Result<Self, ModelValidationError> {
-        Ok(Self::SyntheticFixture(SyntheticFixtureSource::new(id)?))
-    }
-
-    pub fn id(&self) -> &str {
-        match self {
-            Self::CompletedFile(source) => source.id(),
-            Self::EngineLoopback(source) => source.id(),
-            Self::ApprovedRemote(source) => source.id(),
-            Self::SyntheticFixture(source) => source.id(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompletedFileSource {
-    id: SourceId,
-}
-
-impl CompletedFileSource {
-    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
-        Ok(Self {
-            id: SourceId::new(id)?,
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineLoopbackSource {
-    id: SourceId,
-}
-
-impl EngineLoopbackSource {
-    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
-        Ok(Self {
-            id: SourceId::new(id)?,
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovedRemoteSource {
-    id: SourceId,
-}
-
-impl ApprovedRemoteSource {
-    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
-        Ok(Self {
-            id: SourceId::new(id)?,
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SyntheticFixtureSource {
-    id: SourceId,
-}
-
-impl SyntheticFixtureSource {
-    fn new(id: impl Into<String>) -> Result<Self, ModelValidationError> {
-        Ok(Self {
-            id: SourceId::new(id)?,
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-#[serde(transparent)]
-struct SourceId(String);
-
-impl SourceId {
-    fn new(value: impl Into<String>) -> Result<Self, ModelValidationError> {
-        let value = value.into();
-        if is_safe_identifier(&value) {
-            Ok(Self(value))
-        } else {
-            Err(ModelValidationError::new("invalid media source id"))
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaDescriptor {
-    source: ValidatedMediaSource,
-    frame_rate_class: FrameRateClass,
+    source: super::source::ValidatedMediaSource,
+    probe: super::probe::ProbeDocument,
 }
 
 impl MediaDescriptor {
-    pub fn new(source: ValidatedMediaSource, frame_rate_class: FrameRateClass) -> Self {
-        Self {
-            source,
-            frame_rate_class,
-        }
+    pub(crate) fn from_probe(
+        source: super::source::ValidatedMediaSource,
+        probe: super::probe::ProbeDocument,
+    ) -> Self {
+        Self { source, probe }
     }
 
-    pub fn source(&self) -> &ValidatedMediaSource {
+    pub fn source(&self) -> &super::source::ValidatedMediaSource {
         &self.source
     }
 
+    pub fn probe(&self) -> &super::probe::ProbeDocument {
+        &self.probe
+    }
+
     pub fn frame_rate_class(&self) -> FrameRateClass {
-        self.frame_rate_class
+        self.probe
+            .selected_video()
+            .map(super::probe::VideoStreamDescriptor::frame_rate_class)
+            .unwrap_or(FrameRateClass::Unknown)
+    }
+
+    pub fn media_signature(&self) -> String {
+        self.probe.media_signature()
     }
 }
 
@@ -634,14 +487,14 @@ impl OutputContract {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeRequest {
-    source: ValidatedMediaSource,
+    source: super::source::ValidatedMediaSource,
     output: OutputContract,
     acceleration_mode: AccelerationMode,
 }
 
 impl TranscodeRequest {
     pub fn new(
-        source: ValidatedMediaSource,
+        source: super::source::ValidatedMediaSource,
         output: OutputContract,
         acceleration_mode: AccelerationMode,
     ) -> Self {
@@ -652,7 +505,7 @@ impl TranscodeRequest {
         }
     }
 
-    pub fn source(&self) -> &ValidatedMediaSource {
+    pub fn source(&self) -> &super::source::ValidatedMediaSource {
         &self.source
     }
 
@@ -774,6 +627,7 @@ fn gcd(mut left: u32, mut right: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcoding::ValidatedMediaSource;
     use serde::{Serialize, de::DeserializeOwned};
     use std::num::NonZeroU32;
 

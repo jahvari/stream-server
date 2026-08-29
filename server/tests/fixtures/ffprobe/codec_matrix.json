@@ -1,0 +1,64 @@
+{
+  "format": {
+    "format_name": "matroska,webm",
+    "start_time": "0.125000",
+    "duration": "120.500000",
+    "bit_rate": "8500000"
+  },
+  "streams": [
+    {
+      "index": 2,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "codec_tag_string": "avc1",
+      "profile": "High",
+      "level": 41,
+      "width": 1920,
+      "height": 1080,
+      "sample_aspect_ratio": "1:1",
+      "display_aspect_ratio": "16:9",
+      "pix_fmt": "yuv420p",
+      "bits_per_raw_sample": "8",
+      "r_frame_rate": "24000/1001",
+      "avg_frame_rate": "24000/1001",
+      "time_base": "1/1000",
+      "codec_time_base": "1001/48000",
+      "field_order": "progressive",
+      "color_range": "tv",
+      "color_space": "bt709",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709",
+      "bit_rate": "8000000",
+      "tags": { "language": "eng" },
+      "disposition": { "default": 1, "forced": 0, "attached_pic": 0 },
+      "side_data_list": [
+        { "side_data_type": "Display Matrix", "rotation": -90 },
+        {
+          "side_data_type": "Mastering display metadata",
+          "red_x": "17/25", "red_y": "8/25",
+          "green_x": "53/200", "green_y": "69/100",
+          "blue_x": "3/20", "blue_y": "3/50",
+          "white_point_x": "3127/10000", "white_point_y": "329/1000",
+          "min_luminance": "1/10000", "max_luminance": "1000/1"
+        },
+        { "side_data_type": "Content light level metadata", "max_content": 1000, "max_average": 400 },
+        { "side_data_type": "DOVI configuration record", "dv_profile": 8, "dv_level": 6, "rpu_present_flag": 1, "el_present_flag": 0, "bl_present_flag": 1 }
+      ]
+    },
+    { "index": 3, "codec_type": "video", "codec_name": "h264", "profile": "High 10", "pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10", "r_frame_rate": "30000/1001", "avg_frame_rate": "24000/1001", "disposition": { "default": 0 } },
+    { "index": 4, "codec_type": "video", "codec_name": "hevc", "profile": "Main", "pix_fmt": "yuv420p", "bits_per_raw_sample": "8" },
+    { "index": 5, "codec_type": "video", "codec_name": "hevc", "profile": "Main 10", "pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10" },
+    { "index": 6, "codec_type": "video", "codec_name": "av1", "profile": "Main", "pix_fmt": "yuv420p", "bits_per_raw_sample": "8" },
+    { "index": 7, "codec_type": "video", "codec_name": "av1", "profile": "Main", "pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10" },
+    { "index": 8, "codec_type": "video", "codec_name": "vp9", "profile": "Profile 0", "pix_fmt": "yuv420p", "bits_per_raw_sample": "8" },
+    { "index": 9, "codec_type": "video", "codec_name": "vp9", "profile": "Profile 2", "pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10" },
+    { "index": 10, "codec_type": "video", "codec_name": "mpeg2video", "profile": "Main", "pix_fmt": "yuv420p" },
+    { "index": 11, "codec_type": "video", "codec_name": "vc1", "profile": "Advanced", "pix_fmt": "yuv420p" },
+    { "index": 12, "codec_type": "video", "codec_name": "future_codec", "profile": "Future", "pix_fmt": "future_fmt" },
+    { "index": 20, "codec_type": "audio", "codec_name": "aac", "profile": "LC", "sample_rate": "48000", "channels": 6, "channel_layout": "5.1", "bit_rate": "384000", "tags": { "language": "jpn" }, "disposition": { "default": 1 } },
+    { "index": 30, "codec_type": "subtitle", "codec_name": "subrip", "tags": { "language": "spa" }, "disposition": { "forced": 1 } }
+  ],
+  "chapters": [
+    { "id": 0, "start_time": "0.000000", "end_time": "60.000000", "tags": { "title": "Part 1" } }
+  ]
+}
