@@ -575,12 +575,18 @@ async fn run_inner(
         Arc::new(network_security::SystemClock),
         listeners,
     ));
-    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+    let proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
         network_security::ProxyPolicySettings {
             allow_private_network_sources: settings.allow_private_network_sources,
             allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
         },
         validator,
+    ));
+    state.proxy_runtime = proxy_runtime.clone();
+    state.source_broker = Arc::new(transcoding::source::SourceBroker::new(
+        state.stream_engine(),
+        bound_http_addr,
+        proxy_runtime,
     ));
 
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -972,6 +978,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
         .route(
+            "/_transcoding/source",
+            get(transcoding::source::route_source).head(transcoding::source::route_source),
+        )
+        .route(
             "/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
@@ -1084,6 +1094,7 @@ pub fn build_router_with_listeners(mut state: AppState, listeners: Vec<SocketAdd
         .try_read()
         .expect("settings must be uncontended during router construction")
         .clone();
+    let source_listener = listeners[0];
     let validator = Arc::new(network_security::DestinationValidator::new(
         Arc::new(network_security::SystemDnsResolver),
         Arc::new(network_security::SystemLocalNetworkProvider),
@@ -1093,12 +1104,18 @@ pub fn build_router_with_listeners(mut state: AppState, listeners: Vec<SocketAdd
             .map(|socket| network_security::ListenerBinding { socket })
             .collect(),
     ));
-    state.proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
+    let proxy_runtime = Arc::new(network_security::ProxyRuntime::new(
         network_security::ProxyPolicySettings {
             allow_private_network_sources: settings.allow_private_network_sources,
             allow_invalid_proxy_tls_certificates: settings.allow_invalid_proxy_tls_certificates,
         },
         validator,
+    ));
+    state.proxy_runtime = proxy_runtime.clone();
+    state.source_broker = Arc::new(transcoding::source::SourceBroker::new(
+        state.stream_engine(),
+        source_listener,
+        proxy_runtime,
     ));
     build_router(state)
 }

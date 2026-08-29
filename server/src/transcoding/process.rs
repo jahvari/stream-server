@@ -912,6 +912,10 @@ impl ProcessSupervisor {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the uncancelled wrapper remains the closed command boundary for later transcode sessions and is exercised by process lifecycle tests"
+    )]
     pub async fn run_bounded(&self, spec: ProcessSpec) -> Result<BoundedOutput, ProcessError> {
         self.run_bounded_with_cancellation(spec, &CancellationToken::new())
             .await

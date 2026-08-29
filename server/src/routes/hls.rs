@@ -7,9 +7,31 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use enginefs::backend::TorrentHandle;
+use enginefs::backend::{TorrentHandle, priorities::PlaybackIntent};
 use serde::Deserialize;
+use std::{
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
+
+struct SourceHeldReader<R> {
+    inner: R,
+    _source: crate::transcoding::ValidatedMediaSource,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for SourceHeldReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ProbeQuery {
@@ -64,6 +86,150 @@ fn stremio_probe_json(
     })
 }
 
+fn rational_as_f64(rate: crate::transcoding::RationalRate) -> f64 {
+    f64::from(rate.numerator()) / f64::from(rate.denominator().get())
+}
+
+fn stremio_probe_json_from_document(
+    info_hash: &str,
+    file_idx: usize,
+    probe: &crate::transcoding::ProbeDocument,
+) -> serde_json::Value {
+    use crate::transcoding::MediaStreamDescriptor;
+
+    let streams = probe
+        .streams()
+        .iter()
+        .map(|stream| match stream {
+            MediaStreamDescriptor::Video(video) => serde_json::json!({
+                "index": video.index(),
+                "track": "video",
+                "codec": video.codec_display(),
+                "channels": 0,
+                "width": video.width(),
+                "height": video.height(),
+                "fps": video.nominal_frame_rate().or(video.average_frame_rate()).map(rational_as_f64),
+                "bitrate": video.bitrate(),
+                "lang": video.language(),
+                "default": video.disposition().default,
+                "profile": video.profile_display(),
+            }),
+            MediaStreamDescriptor::Audio(audio) => serde_json::json!({
+                "index": audio.index(),
+                "track": "audio",
+                "codec": audio.codec_display(),
+                "channels": audio.channels().unwrap_or(2),
+                "width": null,
+                "height": null,
+                "fps": null,
+                "bitrate": audio.bitrate(),
+                "lang": audio.language(),
+                "default": audio.disposition().default,
+                "profile": audio.profile_display(),
+            }),
+            MediaStreamDescriptor::Subtitle(subtitle) => serde_json::json!({
+                "index": subtitle.index(),
+                "track": "subtitle",
+                "codec": subtitle.codec_display(),
+                "channels": 0,
+                "width": null,
+                "height": null,
+                "fps": null,
+                "bitrate": null,
+                "lang": subtitle.language(),
+                "default": subtitle.disposition().default,
+                "profile": null,
+            }),
+            MediaStreamDescriptor::Other {
+                index,
+                track_display,
+                codec_display,
+                ..
+            } => serde_json::json!({
+                "index": index,
+                "track": track_display.as_str(),
+                "codec": codec_display.as_str(),
+                "channels": 0,
+                "width": null,
+                "height": null,
+                "fps": null,
+                "bitrate": null,
+                "lang": null,
+                "default": false,
+                "profile": null,
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "infoHash": info_hash,
+        "fileIdx": file_idx,
+        "format": { "name": stremio_format_name(probe.container_display()) },
+        "duration": probe.duration_micros().map(|micros| micros as f64 / 1_000_000.0).unwrap_or(0.0),
+        "streams": streams,
+    })
+}
+
+fn schedule_typed_probe_observation(
+    state: AppState,
+    info_hash: String,
+    file_idx: usize,
+    legacy: enginefs::hls::ProbeResult,
+) {
+    static ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let admission = ADMISSION.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let Ok(permit) = admission.clone().try_acquire_owned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        observe_typed_probe_once(&state, &info_hash, file_idx, &legacy).await;
+    });
+}
+
+async fn observe_typed_probe_once(
+    state: &AppState,
+    info_hash: &str,
+    file_idx: usize,
+    legacy: &enginefs::hls::ProbeResult,
+) {
+    let source = match state
+        .source_broker
+        .issue_engine_source(
+            info_hash,
+            file_idx,
+            PlaybackIntent::InternalProbe,
+            Duration::from_secs(30 * 60),
+        )
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::debug!(error = %error, "typed HLS probe observation could not issue source");
+            return;
+        }
+    };
+    match crate::transcoding::probe_media(&state.transcoding, &source).await {
+        Ok(descriptor) => {
+            let legacy_json = stremio_probe_json(info_hash, file_idx, legacy);
+            let typed_json =
+                stremio_probe_json_from_document(info_hash, file_idx, descriptor.probe());
+            if typed_json == legacy_json {
+                tracing::debug!("typed HLS probe observation matched legacy compatibility DTO");
+            } else {
+                tracing::debug!(
+                    legacy_streams = legacy.streams.len(),
+                    typed_streams = descriptor.probe().streams().len(),
+                    "typed HLS probe observation differed from legacy compatibility DTO"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "typed HLS probe observation was unavailable");
+        }
+    }
+}
+
 /// Probe endpoint using mediaURL query parameter (for Stremio compatibility)
 /// GET /hlsv2/probe?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn probe_by_url(
@@ -109,6 +275,8 @@ pub async fn probe_by_url(
                 .into_response();
         }
     };
+
+    schedule_typed_probe_observation(state.clone(), info_hash.clone(), file_idx, probe.clone());
 
     let elapsed = start.elapsed();
     tracing::info!(
@@ -492,14 +660,71 @@ async fn get_segment(
             .unwrap_or(false)
     };
 
-    let transcode_input_path = if is_fully_downloaded {
-        engine
-            .handle
-            .get_file_path(file_idx)
+    let validated_source = if is_fully_downloaded {
+        match state
+            .source_broker
+            .issue_completed_file(&info_hash, file_idx)
             .await
-            .unwrap_or_else(|| stream_url.clone())
+        {
+            Ok(source) => source,
+            Err(crate::transcoding::SourceError::NotFound) => match state
+                .source_broker
+                .issue_engine_source(
+                    &info_hash,
+                    file_idx,
+                    if seg_index == 0 {
+                        enginefs::backend::priorities::PlaybackIntent::HlsInitial
+                    } else {
+                        enginefs::backend::priorities::PlaybackIntent::HlsSeek
+                    },
+                    Duration::from_secs(30 * 60),
+                )
+                .await
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+                }
+            },
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        }
     } else {
-        stream_url.clone()
+        match state
+            .source_broker
+            .issue_engine_source(
+                &info_hash,
+                file_idx,
+                if seg_index == 0 {
+                    enginefs::backend::priorities::PlaybackIntent::HlsInitial
+                } else {
+                    enginefs::backend::priorities::PlaybackIntent::HlsSeek
+                },
+                Duration::from_secs(30 * 60),
+            )
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        }
+    };
+    let transcode_input_path = match validated_source.input_argument() {
+        Ok(input) => match input.into_string() {
+            Ok(input) => input,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Media source path is not valid Unicode",
+                )
+                    .into_response();
+            }
+        },
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
     };
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
@@ -530,11 +755,11 @@ async fn get_segment(
     let mut child = if let Some(audio_idx) = audio_track_idx {
         // Audio-only segment
         tracing::debug!(
-            "Transcoding audio segment: track={}, segment={}, start={:.2}s, input={}",
+            "Transcoding audio segment: track={}, segment={}, start={:.2}s, source_id={}",
             audio_idx,
             seg_index,
             start,
-            transcode_input_path
+            validated_source.id()
         );
         match enginefs::hls::HlsEngine::transcode_audio_segment(
             &transcode_input_path,
@@ -635,7 +860,10 @@ async fn get_segment(
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "No stdout").into_response(),
     };
 
-    let stream = ReaderStream::new(stdout);
+    let stream = ReaderStream::new(SourceHeldReader {
+        inner: stdout,
+        _source: validated_source,
+    });
     let body = Body::from_stream(stream);
 
     tracing::info!(
@@ -678,6 +906,7 @@ pub async fn get_probe(
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    schedule_typed_probe_observation(state.clone(), info_hash.clone(), file_idx, probe.clone());
     Json(probe).into_response()
 }
 
@@ -1035,5 +1264,57 @@ fn hls_v2_segment_alias(resource: &str) -> Option<String> {
         Some(segment.to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod typed_probe_tests {
+    use super::*;
+
+    #[test]
+    fn typed_probe_projection_matches_the_legacy_compatibility_dto_fixture() {
+        let typed = crate::transcoding::parse_probe_document(include_bytes!(
+            "../../tests/fixtures/ffprobe/compatibility.json"
+        ))
+        .expect("parse typed compatibility fixture");
+        let legacy = enginefs::hls::ProbeResult {
+            duration: 12.5,
+            container: "matroska".to_owned(),
+            streams: vec![
+                enginefs::hls::VideoStream {
+                    index: 0,
+                    codec_type: "video".to_owned(),
+                    codec_name: "h264".to_owned(),
+                    width: Some(1280),
+                    height: Some(720),
+                    channels: None,
+                    bitrate: Some(3_000_000),
+                    fps: Some(30.0),
+                    lang: Some("eng".to_owned()),
+                    is_default: true,
+                    profile: Some("High".to_owned()),
+                    pix_fmt: None,
+                },
+                enginefs::hls::VideoStream {
+                    index: 1,
+                    codec_type: "audio".to_owned(),
+                    codec_name: "aac".to_owned(),
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    bitrate: Some(128_000),
+                    fps: None,
+                    lang: Some("eng".to_owned()),
+                    is_default: true,
+                    profile: Some("LC".to_owned()),
+                    pix_fmt: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            stremio_probe_json_from_document("fixture-hash", 7, &typed),
+            stremio_probe_json("fixture-hash", 7, &legacy)
+        );
     }
 }

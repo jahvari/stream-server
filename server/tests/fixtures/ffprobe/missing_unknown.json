@@ -1,0 +1,10 @@
+{
+  "format": {},
+  "streams": [
+    { "index": 0, "codec_type": "video" },
+    { "index": 1, "codec_type": "audio" },
+    { "index": 2, "codec_type": "subtitle" },
+    { "index": 3, "codec_type": "data", "codec_name": "bin_data" }
+  ],
+  "chapters": []
+}

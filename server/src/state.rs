@@ -404,6 +404,7 @@ pub struct AppState {
     pub(crate) proxy_runtime: Arc<ProxyRuntime>,
     pub(crate) settings_persistence: Arc<SettingsPersistenceCoordinator>,
     pub transcoding: Arc<TranscodingService>,
+    pub(crate) source_broker: Arc<crate::transcoding::source::SourceBroker>,
 }
 
 impl AppState {
@@ -517,6 +518,13 @@ impl AppState {
                 socket: default_http_addr,
             }],
         ));
+        let proxy_runtime = Arc::new(ProxyRuntime::new(proxy_policy, validator));
+
+        let source_broker = Arc::new(crate::transcoding::source::SourceBroker::new(
+            engine.clone(),
+            default_http_addr,
+            proxy_runtime.clone(),
+        ));
 
         Self {
             engine,
@@ -535,9 +543,10 @@ impl AppState {
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
             settings_control: SettingsControl::ephemeral(),
-            proxy_runtime: Arc::new(ProxyRuntime::new(proxy_policy, validator)),
+            proxy_runtime,
             settings_persistence: Arc::new(SettingsPersistenceCoordinator::new(initial_settings)),
             transcoding,
+            source_broker,
         }
     }
 

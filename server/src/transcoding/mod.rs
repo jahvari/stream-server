@@ -1,5 +1,7 @@
+pub mod codec;
 pub mod error;
 pub mod model;
+pub mod probe;
 /// Raw process construction is internal to the transcoding runtime.
 ///
 /// ```compile_fail
@@ -13,13 +15,28 @@ pub mod runtime;
 pub mod runtime_manifest;
 #[cfg(any(unix, test))]
 pub(crate) mod snapshot_helper;
+pub mod source;
 
+pub use codec::{
+    ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, ContainerKind,
+    FieldOrder, InputVideoCodec, OutputVideoCodec, PixelFormat, SampleEntry, VideoProfile,
+};
 pub use error::{FailureCode, TranscodeFailure};
 pub use model::{
     AccelerationClass, AccelerationMode, BackendKind, CapabilityState, DeviceClass, DeviceId,
     FrameRateClass, KeyframeStrategy, MediaDescriptor, OutputContract, PresetIntent,
     RateControlEnvelope, RateControlIntent, RationalRate, StageKind, StageMode, TranscodePlan,
-    TranscodeRequest, ValidatedMediaSource, VideoStage,
+    TranscodeRequest, VideoStage,
+};
+pub use probe::{
+    AudioStreamDescriptor, ChapterDescriptor, ColorDescriptor, ContentLightMetadata,
+    DolbyVisionMetadata, HdrMetadata, MasteringDisplayMetadata, MediaStreamDescriptor,
+    ProbeDocument, ProbeError, ProbeErrorCode, ProbeRational, SafeProbeText, StreamDisposition,
+    SubtitleStreamDescriptor, VideoStreamDescriptor, parse_probe_document, probe_media,
+};
+pub use source::{
+    CompletedFileSource, EngineSource, FixtureSource, RemoteSourceHandle, SourceActivitySnapshot,
+    SourceBroker, SourceError, SourceProtocolPolicy, ValidatedMediaSource, issue_engine_source,
 };
 
 #[cfg(test)]

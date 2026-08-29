@@ -79,6 +79,13 @@ pub(crate) struct SanitizedRequestTarget {
 }
 
 pub(crate) fn sanitize_request_target(uri: &axum::http::Uri) -> SanitizedRequestTarget {
+    if uri.path() == "/_transcoding/source" {
+        return SanitizedRequestTarget {
+            uri: "/_transcoding/source?<redacted>".to_owned(),
+            path: "/_transcoding/source".to_owned(),
+            query: String::new(),
+        };
+    }
     if uri.path().starts_with("/proxy") {
         return SanitizedRequestTarget {
             uri: "/proxy/<redacted>".to_owned(),
@@ -444,6 +451,18 @@ mod tests {
         assert_eq!(target.uri, "/proxy/<redacted>");
         assert_eq!(target.path, "/proxy/<redacted>");
         assert_eq!(target.query, "");
+    }
+
+    #[test]
+    fn transcoding_source_capabilities_are_redacted_for_every_logging_path() {
+        let uri: Uri = "/_transcoding/source?cap=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let target = sanitize_request_target(&uri);
+        assert_eq!(target.uri, "/_transcoding/source?<redacted>");
+        assert_eq!(target.path, "/_transcoding/source");
+        assert_eq!(target.query, "");
+        assert!(!target.uri.contains("aaaaaaaa"));
     }
 
     #[test]
