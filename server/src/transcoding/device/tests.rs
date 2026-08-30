@@ -11,6 +11,11 @@ use super::linux::{
     LinuxDeviceEnumerator, native_fixture_for_test, native_fixture_with_hook_for_test,
     native_no_gpu_for_test,
 };
+#[cfg(target_os = "macos")]
+use super::macos::MacosDeviceEnumerator;
+use super::macos::{
+    UnsupportedDeviceEnumerator, logical_macos_discovery, unsupported_platform_discovery,
+};
 use super::windows::{
     D3D12_GENERIC_MEDIA_ATTRIBUTE_U128, WindowsAdapterSnapshot, WindowsCandidateLists,
     WindowsDriverSnapshot, WindowsPhysicalSnapshot, map_windows_records,
@@ -21,9 +26,9 @@ use super::windows::{
     native_open_handle_count_for_test,
 };
 use super::{
-    DeviceAvailability, DeviceEnumerator, DeviceError, DeviceLocator, DriverField, DriverRecord,
-    DriverRunEpoch, PlatformDeviceRecord, Vendor, normalize_platform_records,
-    normalize_platform_records_with_deriver,
+    DeviceAvailability, DeviceDiscovery, DeviceDiscoveryStatus, DeviceEnumerator, DeviceError,
+    DeviceLocator, DriverField, DriverRecord, DriverRunEpoch, PlatformDeviceRecord, Vendor,
+    normalize_platform_records, normalize_platform_records_with_deriver,
 };
 use crate::transcoding::{BackendKind, DeviceClass};
 
@@ -34,6 +39,7 @@ static_assertions::assert_not_impl_any!(DriverIdentity: serde::Serialize);
 static_assertions::assert_not_impl_any!(DriverField: serde::Serialize);
 static_assertions::assert_not_impl_any!(DriverRecord: serde::Serialize);
 static_assertions::assert_not_impl_any!(PlatformDeviceRecord: serde::Serialize);
+static_assertions::assert_not_impl_any!(DeviceDiscovery: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsAdapterSnapshot: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsPhysicalSnapshot: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsDriverSnapshot: serde::Serialize);
@@ -42,6 +48,128 @@ static_assertions::assert_not_impl_any!(LinuxStableFields: serde::Serialize);
 static_assertions::assert_not_impl_any!(LinuxLocatorStatus: serde::Serialize);
 static_assertions::assert_not_impl_any!(LinuxRenderSnapshot: serde::Serialize);
 static_assertions::assert_not_impl_any!(LinuxDriverSnapshot: serde::Serialize);
+
+#[test]
+fn macos_logical_device_is_stable_disabled_and_per_install_seeded() {
+    let discovery = logical_macos_discovery(Some(b"23G93".to_vec())).unwrap();
+    assert_eq!(discovery.status, DeviceDiscoveryStatus::PlatformUnsupported);
+    assert_eq!(discovery.status.safe_reason(), Some("platform_unsupported"));
+    assert_eq!(discovery.records.len(), 1);
+    let record = &discovery.records[0];
+    assert_eq!(record.platform, PlatformTag::Macos);
+    assert_eq!(
+        record.persistent_identity.as_bytes(),
+        b"macos-videotoolbox-default-v1"
+    );
+    assert_eq!(record.vendor, Vendor::Apple);
+    assert_eq!(record.class, DeviceClass::Unknown);
+    assert_eq!(
+        record.availability,
+        DeviceAvailability::AdministrativelyDisabled
+    );
+    assert_eq!(record.locator, DeviceLocator::MacosDefault);
+    assert_eq!(record.backends, vec![BackendKind::VideoToolbox]);
+
+    let epoch = DriverRunEpoch::from_test_bytes([0x3c; 32]);
+    let first = normalize_platform_records(
+        discovery.records.clone(),
+        &DeviceIdSeed::from_test_bytes([0x11; 32]),
+        &epoch,
+    )
+    .unwrap();
+    let second = normalize_platform_records(
+        discovery.records,
+        &DeviceIdSeed::from_test_bytes([0x22; 32]),
+        &epoch,
+    )
+    .unwrap();
+    assert_ne!(first[0].id, second[0].id);
+    assert!(first[0].driver_identity.is_persistable());
+}
+
+#[test]
+fn macos_missing_build_is_run_scoped_and_unsafe_builds_are_bounded() {
+    let discovery = logical_macos_discovery(None).unwrap();
+    let device = normalize_platform_records(
+        discovery.records,
+        &DeviceIdSeed::from_test_bytes([0x11; 32]),
+        &DriverRunEpoch::from_test_bytes([0x3c; 32]),
+    )
+    .unwrap()
+    .remove(0);
+    assert!(!device.driver_identity.is_persistable());
+
+    assert_eq!(
+        logical_macos_discovery(Some(vec![b'X'; 257])).unwrap_err(),
+        DeviceError::Overflow
+    );
+    assert_eq!(
+        logical_macos_discovery(Some(vec![b'X'; 2_049])).unwrap_err(),
+        DeviceError::Overflow
+    );
+    assert_eq!(
+        logical_macos_discovery(Some(b"unsafe/build".to_vec())).unwrap_err(),
+        DeviceError::Invalid
+    );
+}
+
+#[test]
+fn unsupported_platform_is_a_successful_empty_hardware_discovery() {
+    let discovery = unsupported_platform_discovery();
+    assert!(discovery.records.is_empty());
+    assert_eq!(discovery.status, DeviceDiscoveryStatus::PlatformUnsupported);
+    assert_eq!(discovery.status.safe_reason(), Some("platform_unsupported"));
+    assert_eq!(DeviceDiscoveryStatus::Supported.safe_reason(), None);
+}
+
+#[tokio::test]
+async fn unsupported_platform_enumerator_honors_cancellation() {
+    let discovery = UnsupportedDeviceEnumerator
+        .enumerate(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(discovery.records.is_empty());
+    assert_eq!(discovery.status, DeviceDiscoveryStatus::PlatformUnsupported);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        UnsupportedDeviceEnumerator
+            .enumerate(cancellation)
+            .await
+            .unwrap_err(),
+        DeviceError::Cancelled
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_native_logical_device_is_packaging_disabled() {
+    let discovery = MacosDeviceEnumerator
+        .enumerate(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("bounded native sysctl failure degrades to incomplete driver identity");
+    assert_eq!(discovery.status, DeviceDiscoveryStatus::PlatformUnsupported);
+    assert_eq!(discovery.records.len(), 1);
+    assert_eq!(
+        discovery.records[0].availability,
+        DeviceAvailability::AdministrativelyDisabled
+    );
+    assert_eq!(
+        discovery.records[0].backends,
+        vec![BackendKind::VideoToolbox]
+    );
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        MacosDeviceEnumerator
+            .enumerate(cancellation)
+            .await
+            .unwrap_err(),
+        DeviceError::Cancelled
+    );
+}
 
 #[test]
 fn linux_pure_render_node_names_are_exact_checked_and_nondefault() {
@@ -1133,7 +1261,8 @@ async fn native_windows_no_gpu_is_valid() {
         .enumerate(tokio_util::sync::CancellationToken::new())
         .await
         .expect("native Windows discovery degrades to an empty inventory without a GPU");
-    assert!(records.len() <= 32);
+    assert_eq!(records.status, DeviceDiscoveryStatus::Supported);
+    assert!(records.records.len() <= 32);
     assert_eq!(native_open_handle_count_for_test(), 0);
     let cancellation = tokio_util::sync::CancellationToken::new();
     cancellation.cancel();
@@ -1597,11 +1726,11 @@ impl DeviceEnumerator for InjectedEnumerator {
     async fn enumerate(
         &self,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<PlatformDeviceRecord>, DeviceError> {
+    ) -> Result<DeviceDiscovery, DeviceError> {
         if cancellation.is_cancelled() {
             Err(DeviceError::Cancelled)
         } else {
-            Ok(self.records.clone())
+            Ok(DeviceDiscovery::supported(self.records.clone()))
         }
     }
 }
@@ -1616,6 +1745,7 @@ async fn injected_enumerator_has_a_closed_cancellation_boundary() {
             .enumerate(tokio_util::sync::CancellationToken::new())
             .await
             .unwrap()
+            .records
             .len(),
         1
     );

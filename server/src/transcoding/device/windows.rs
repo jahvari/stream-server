@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::DeviceDiscovery;
 use super::identity::{DriverField, DriverRecord, PlatformTag, PrivateDeviceIdentity};
 use super::{DeviceAvailability, DeviceError, DeviceLocator, PlatformDeviceRecord, Vendor};
 use crate::transcoding::{BackendKind, DeviceClass};
@@ -498,11 +500,13 @@ mod native {
         async fn enumerate(
             &self,
             cancellation: CancellationToken,
-        ) -> Result<Vec<PlatformDeviceRecord>, DeviceError> {
+        ) -> Result<DeviceDiscovery, DeviceError> {
             let worker_cancellation = cancellation.clone();
-            tokio::task::spawn_blocking(move || enumerate_native_windows(&worker_cancellation))
-                .await
-                .map_err(|_| DeviceError::Invalid)?
+            let records =
+                tokio::task::spawn_blocking(move || enumerate_native_windows(&worker_cancellation))
+                    .await
+                    .map_err(|_| DeviceError::Invalid)??;
+            Ok(DeviceDiscovery::supported(records))
         }
     }
 

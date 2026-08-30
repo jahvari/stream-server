@@ -5,6 +5,12 @@ use std::{collections::BTreeSet, collections::HashSet, fmt};
 pub(crate) mod identity;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
+#[cfg(any(
+    test,
+    target_os = "macos",
+    not(any(windows, target_os = "linux", target_os = "macos"))
+))]
+mod macos;
 #[cfg(any(windows, test))]
 mod windows;
 #[cfg(test)]
@@ -173,12 +179,49 @@ impl fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceDiscoveryStatus {
+    Supported,
+    PlatformUnsupported,
+}
+
+impl DeviceDiscoveryStatus {
+    pub(crate) fn safe_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Supported => None,
+            Self::PlatformUnsupported => Some("platform_unsupported"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceDiscovery {
+    pub(crate) records: Vec<PlatformDeviceRecord>,
+    pub(crate) status: DeviceDiscoveryStatus,
+}
+
+impl DeviceDiscovery {
+    pub(crate) fn supported(records: Vec<PlatformDeviceRecord>) -> Self {
+        Self {
+            records,
+            status: DeviceDiscoveryStatus::Supported,
+        }
+    }
+
+    pub(crate) fn platform_unsupported(records: Vec<PlatformDeviceRecord>) -> Self {
+        Self {
+            records,
+            status: DeviceDiscoveryStatus::PlatformUnsupported,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait DeviceEnumerator: Send + Sync {
     async fn enumerate(
         &self,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<PlatformDeviceRecord>, DeviceError>;
+    ) -> Result<DeviceDiscovery, DeviceError>;
 }
 
 #[derive(Clone)]
