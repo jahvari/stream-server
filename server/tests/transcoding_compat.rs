@@ -25,6 +25,20 @@ struct PlaylistCase {
     path: String,
 }
 
+#[derive(Debug, PartialEq)]
+struct LegacyJsonResponse {
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+    value: Value,
+}
+
+#[derive(Debug, PartialEq)]
+struct LegacyDeviceAndProfilerFixture {
+    device_info: LegacyJsonResponse,
+    profiler: LegacyJsonResponse,
+}
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -409,6 +423,61 @@ fn with_embedded_server<T>(test: impl FnOnce(&Client, String) -> T) -> T {
     result
 }
 
+fn observe_legacy_json_response(client: &Client, url: String) -> LegacyJsonResponse {
+    let response = client.get(url).send().expect("legacy route request");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .map(|value| {
+            value
+                .to_str()
+                .expect("legacy content-type is ASCII")
+                .to_owned()
+        });
+    let body = response.bytes().expect("legacy route body").to_vec();
+    let value = serde_json::from_slice(&body).expect("legacy route JSON");
+
+    LegacyJsonResponse {
+        status,
+        content_type,
+        body,
+        value,
+    }
+}
+
+fn legacy_device_and_profiler_fixture(
+    client: &Client,
+    base: &str,
+) -> LegacyDeviceAndProfilerFixture {
+    LegacyDeviceAndProfilerFixture {
+        device_info: observe_legacy_json_response(client, format!("{base}/device-info")),
+        profiler: observe_legacy_json_response(client, format!("{base}/hwaccel-profiler")),
+    }
+}
+
+fn checked_in_legacy_device_and_profiler_fixture() -> LegacyDeviceAndProfilerFixture {
+    LegacyDeviceAndProfilerFixture {
+        device_info: LegacyJsonResponse {
+            status: reqwest::StatusCode::OK,
+            content_type: Some("application/json".to_owned()),
+            body: br#"{"availableHardwareAccelerations":["nvenc","nvenc:verified"]}"#.to_vec(),
+            value: json!({
+                "availableHardwareAccelerations": ["nvenc", "nvenc:verified"]
+            }),
+        },
+        profiler: LegacyJsonResponse {
+            status: reqwest::StatusCode::OK,
+            content_type: Some("application/json".to_owned()),
+            body: br#"{"profiles":["nvenc","nvenc:verified"],"success":true}"#.to_vec(),
+            value: json!({
+                "success": true,
+                "profiles": ["nvenc", "nvenc:verified"]
+            }),
+        },
+    }
+}
+
 fn assert_contains(log: &str, needle: &str) {
     assert!(
         log.contains(needle),
@@ -678,13 +747,13 @@ fn transcode_profile_aliases_preserve_encoder_selection_contract() {
 }
 
 #[test]
-fn device_and_profiler_routes_preserve_compatibility_shapes() {
+fn pr4_keeps_legacy_device_and_profiler_contract() {
     // Every embedded-server compatibility test takes this process-local lock.
     // Hold it while the isolated helper runs so the helper owns both the fresh
     // hwaccel cache and the fixed librqbit listen ports for its lifetime.
     let _embedded_server_guard = lock_env();
     let status = run_isolated_test_bounded(
-        "device_and_profiler_routes_preserve_compatibility_shapes_isolated",
+        "pr4_keeps_legacy_device_and_profiler_contract_isolated",
         SERVER_JOIN_TIMEOUT,
     )
     .expect("bounded isolated device and profiler compatibility test");
@@ -715,39 +784,13 @@ fn compatibility_helper_subprocess_has_a_kill_and_wait_deadline() {
 }
 
 #[test]
-#[ignore = "spawned only by device_and_profiler_routes_preserve_compatibility_shapes"]
-fn device_and_profiler_routes_preserve_compatibility_shapes_isolated() {
+#[ignore = "spawned only by pr4_keeps_legacy_device_and_profiler_contract"]
+fn pr4_keeps_legacy_device_and_profiler_contract_isolated() {
     with_fake_ffmpeg("device_probe", |log_path| {
         with_embedded_server(|client, base| {
-            let device_info = client
-                .get(format!("{base}/device-info"))
-                .send()
-                .expect("device-info request")
-                .error_for_status()
-                .expect("device-info status")
-                .json::<Value>()
-                .expect("device-info json");
             assert_eq!(
-                device_info,
-                json!({
-                    "availableHardwareAccelerations": ["nvenc", "nvenc:verified"]
-                })
-            );
-
-            let profiler = client
-                .get(format!("{base}/hwaccel-profiler"))
-                .send()
-                .expect("hwaccel-profiler request")
-                .error_for_status()
-                .expect("hwaccel-profiler status")
-                .json::<Value>()
-                .expect("hwaccel-profiler json");
-            assert_eq!(
-                profiler,
-                json!({
-                    "success": true,
-                    "profiles": ["nvenc", "nvenc:verified"]
-                })
+                legacy_device_and_profiler_fixture(client, &base),
+                checked_in_legacy_device_and_profiler_fixture()
             );
         });
 
