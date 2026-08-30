@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::{collections::BTreeSet, collections::HashSet, fmt};
 
 pub(crate) mod identity;
+#[cfg(any(target_os = "linux", test))]
+mod linux;
 #[cfg(any(windows, test))]
 mod windows;
 #[cfg(test)]
@@ -43,6 +45,7 @@ pub(crate) enum DeviceLocator {
     },
     Linux {
         render_node: Vec<u8>,
+        device_number: u64,
     },
     MacosDefault,
     Unavailable,
@@ -66,8 +69,11 @@ impl DeviceLocator {
             Self::Windows { physical_index, .. } => {
                 Ok(8 + usize::from(physical_index.is_some()) * 4)
             }
-            Self::Linux { render_node } if render_node.len() <= MAX_PRIVATE_INPUT_BYTES => {
-                Ok(render_node.len())
+            Self::Linux { render_node, .. } if render_node.len() <= MAX_PRIVATE_INPUT_BYTES => {
+                render_node
+                    .len()
+                    .checked_add(8)
+                    .ok_or(DeviceError::Overflow)
             }
             Self::Linux { .. } => Err(DeviceError::Overflow),
             Self::MacosDefault | Self::Unavailable => Ok(0),

@@ -1,6 +1,16 @@
 use super::identity::{
     DeviceIdSeed, DriverIdentity, PlatformTag, PrivateDeviceIdentity, derive_device_id,
 };
+use super::linux::{
+    LinuxBusKind, LinuxClassEvidence, LinuxDriverSnapshot, LinuxIdentityInput, LinuxLocatorStatus,
+    LinuxRenderSnapshot, LinuxStableFields, build_linux_identity, map_linux_records,
+    normalize_pci_bdf, parse_render_node_name,
+};
+#[cfg(target_os = "linux")]
+use super::linux::{
+    LinuxDeviceEnumerator, native_fixture_for_test, native_fixture_with_hook_for_test,
+    native_no_gpu_for_test,
+};
 use super::windows::{
     D3D12_GENERIC_MEDIA_ATTRIBUTE_U128, WindowsAdapterSnapshot, WindowsCandidateLists,
     WindowsDriverSnapshot, WindowsPhysicalSnapshot, map_windows_records,
@@ -27,6 +37,594 @@ static_assertions::assert_not_impl_any!(PlatformDeviceRecord: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsAdapterSnapshot: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsPhysicalSnapshot: serde::Serialize);
 static_assertions::assert_not_impl_any!(WindowsDriverSnapshot: serde::Serialize);
+static_assertions::assert_not_impl_any!(LinuxIdentityInput: serde::Serialize);
+static_assertions::assert_not_impl_any!(LinuxStableFields: serde::Serialize);
+static_assertions::assert_not_impl_any!(LinuxLocatorStatus: serde::Serialize);
+static_assertions::assert_not_impl_any!(LinuxRenderSnapshot: serde::Serialize);
+static_assertions::assert_not_impl_any!(LinuxDriverSnapshot: serde::Serialize);
+
+#[test]
+fn linux_pure_render_node_names_are_exact_checked_and_nondefault() {
+    assert_eq!(parse_render_node_name(b"renderD0").unwrap(), Some(0));
+    assert_eq!(parse_render_node_name(b"renderD129").unwrap(), Some(129));
+    for ignored in [
+        b"renderD".as_slice(),
+        b"RenderD128",
+        b"renderD12x",
+        b"renderD+128",
+        b"renderD128/alias",
+        b"card0",
+        b"renderD\xff",
+    ] {
+        assert_eq!(parse_render_node_name(ignored).unwrap(), None);
+    }
+    assert_eq!(
+        parse_render_node_name(b"renderD184467440737095516160").unwrap_err(),
+        DeviceError::Overflow
+    );
+}
+
+#[test]
+fn linux_pure_pci_bdf_is_lowercase_fixed_width_and_checked() {
+    assert_eq!(normalize_pci_bdf(b"0000:0A:02.0").unwrap(), "0000:0a:02.0");
+    for invalid in [
+        b"0:0a:02.0".as_slice(),
+        b"0000:100:02.0",
+        b"0000:0a:20.0",
+        b"0000:0a:02.8",
+        b"0000:0a:02",
+        b"0000-0a-02-0",
+    ] {
+        assert_eq!(
+            normalize_pci_bdf(invalid).unwrap_err(),
+            DeviceError::Invalid
+        );
+    }
+}
+
+fn linux_identity_input(target: &[u8]) -> LinuxIdentityInput {
+    LinuxIdentityInput {
+        bus: LinuxBusKind::Pci,
+        target_relative: target.to_vec(),
+        fields: LinuxStableFields {
+            vendor: Some(0x8086),
+            device: Some(0x56a0),
+            subsystem_vendor: Some(0x1028),
+            subsystem_device: Some(0x0bda),
+            revision: Some(0x05),
+        },
+    }
+}
+
+#[test]
+fn linux_pure_identity_has_exact_versioned_framing_and_changes_on_slot_move() {
+    let identity = build_linux_identity(&linux_identity_input(b"pci0000:00/0000:00:02.0"))
+        .expect("valid PCI identity");
+    let mut expected = b"linux-device/v1\0".to_vec();
+    expected.push(1);
+    let target = b"pci0000:00/0000:00:02.0";
+    expected.extend_from_slice(&(target.len() as u32).to_be_bytes());
+    expected.extend_from_slice(target);
+    for (tag, bytes) in [
+        (1_u8, 0x8086_u16.to_be_bytes().to_vec()),
+        (2, 0x56a0_u16.to_be_bytes().to_vec()),
+        (3, 0x1028_u16.to_be_bytes().to_vec()),
+        (4, 0x0bda_u16.to_be_bytes().to_vec()),
+        (5, vec![0x05]),
+    ] {
+        expected.push(tag);
+        expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&bytes);
+    }
+    assert_eq!(identity.as_bytes(), expected);
+
+    let moved = build_linux_identity(&linux_identity_input(b"pci0000:00/0000:03:00.0"))
+        .expect("valid moved identity");
+    assert_ne!(identity.as_bytes(), moved.as_bytes());
+}
+
+#[test]
+fn linux_pure_identity_rejects_untrusted_paths_and_frames_missing_fields() {
+    for target in [
+        b"".as_slice(),
+        b"/pci0000:00/0000:00:02.0",
+        b"pci0000:00/../0000:00:02.0",
+        b"pci0000:00//0000:00:02.0",
+        b"pci0000:00\\0000:00:02.0",
+        b"pci0000:00/0000:00:02.0\0suffix",
+    ] {
+        assert_eq!(
+            build_linux_identity(&linux_identity_input(target)).unwrap_err(),
+            DeviceError::Invalid
+        );
+    }
+
+    let mut missing = linux_identity_input(b"pci0000:00/0000:00:02.0");
+    missing.fields = LinuxStableFields::default();
+    let identity = build_linux_identity(&missing).expect("stable path is sufficient");
+    let suffix = [
+        1_u8, 0, 0, 0, 0, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+    ];
+    assert!(identity.as_bytes().ends_with(&suffix));
+
+    for bus in [
+        LinuxBusKind::Platform,
+        LinuxBusKind::Virtio,
+        LinuxBusKind::Mediated,
+        LinuxBusKind::Other,
+    ] {
+        let input = LinuxIdentityInput {
+            bus,
+            target_relative: b"platform/synthetic-gpu".to_vec(),
+            fields: LinuxStableFields::default(),
+        };
+        assert!(build_linux_identity(&input).is_ok());
+    }
+}
+
+fn linux_render(render_number: u32, target: &[u8], vendor: Option<u16>) -> LinuxRenderSnapshot {
+    let identity = LinuxIdentityInput {
+        bus: LinuxBusKind::Pci,
+        target_relative: target.to_vec(),
+        fields: LinuxStableFields {
+            vendor,
+            device: Some(0x56a0),
+            subsystem_vendor: Some(0x1028),
+            subsystem_device: Some(0x0bda),
+            revision: Some(0x05),
+        },
+    };
+    LinuxRenderSnapshot {
+        render_name: format!("renderD{render_number}").into_bytes(),
+        repeated_target_relative: target.to_vec(),
+        identity,
+        display_name: b"Synthetic Linux Adapter".to_vec(),
+        locator: LinuxLocatorStatus::Available {
+            device_number: u64::from(render_number) + 4_096,
+        },
+        driver: LinuxDriverSnapshot {
+            module: Some(b"xe".to_vec()),
+            kernel_release: Some(b"6.12.0-test".to_vec()),
+            version: None,
+            srcversion: Some(b"0123456789ABCDEF".to_vec()),
+            build_identity: None,
+        },
+        class: LinuxClassEvidence::Unknown,
+    }
+}
+
+fn map_linux(
+    snapshots: Vec<LinuxRenderSnapshot>,
+) -> Result<Vec<PlatformDeviceRecord>, DeviceError> {
+    map_linux_records(snapshots, &tokio_util::sync::CancellationToken::new())
+}
+
+#[test]
+fn linux_pure_aliases_deduplicate_and_node_changes_do_not_change_identity() {
+    let first = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+    let mut alias = first.clone();
+    alias.render_name = b"renderD27".to_vec();
+    alias.locator = LinuxLocatorStatus::Available {
+        device_number: 8_219,
+    };
+
+    let mapped =
+        map_linux(vec![alias.clone(), first.clone()]).expect("aliases share physical capacity");
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(
+        mapped[0].backends,
+        vec![BackendKind::Qsv, BackendKind::Vaapi]
+    );
+    assert!(matches!(
+        &mapped[0].locator,
+        DeviceLocator::Linux {
+            render_node,
+            device_number: 4_105,
+        } if render_node == b"renderD9"
+    ));
+
+    let renumbered = map_linux(vec![alias]).expect("same target after node renumbering");
+    assert_eq!(
+        mapped[0].persistent_identity.as_bytes(),
+        renumbered[0].persistent_identity.as_bytes()
+    );
+    assert_ne!(mapped[0].locator, renumbered[0].locator);
+}
+
+#[test]
+fn linux_pure_identical_gpus_and_slot_moves_remain_distinct() {
+    let first = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x1002));
+    let second = linux_render(10, b"pci0000:00/0000:03:00.0", Some(0x1002));
+    let mapped = map_linux(vec![first, second]).expect("attachment identity separates devices");
+    assert_eq!(mapped.len(), 2);
+    assert_ne!(
+        mapped[0].persistent_identity.as_bytes(),
+        mapped[1].persistent_identity.as_bytes()
+    );
+    assert!(mapped.iter().all(|record| {
+        record.vendor == Vendor::Amd
+            && record.class == DeviceClass::Unknown
+            && record.backends == vec![BackendKind::Vaapi]
+    }));
+}
+
+#[test]
+fn linux_pure_locator_unavailable_and_permission_denied_are_non_authorizing() {
+    let mut missing = linux_render(9, b"pci0000:00/0000:00:02.0", None);
+    missing.locator = LinuxLocatorStatus::Missing;
+    let record = map_linux(vec![missing]).unwrap().remove(0);
+    assert_eq!(record.availability, DeviceAvailability::LocatorUnavailable);
+    assert_eq!(record.locator, DeviceLocator::Unavailable);
+    assert_eq!(record.vendor, Vendor::Unknown);
+    assert_eq!(record.backends, vec![BackendKind::Vaapi]);
+
+    let mut denied = linux_render(10, b"pci0000:00/0000:03:00.0", Some(0x10de));
+    denied.locator = LinuxLocatorStatus::PermissionDenied;
+    let record = map_linux(vec![denied]).unwrap().remove(0);
+    assert_eq!(record.availability, DeviceAvailability::PermissionDenied);
+    assert_eq!(record.locator, DeviceLocator::Unavailable);
+    assert_eq!(record.vendor, Vendor::Nvidia);
+    assert_eq!(
+        record.backends,
+        vec![BackendKind::Cuda, BackendKind::Nvenc, BackendKind::Vaapi]
+    );
+}
+
+#[test]
+fn linux_pure_platform_virtio_and_cancellation_are_closed_boundaries() {
+    let mut platform = linux_render(9, b"platform/soc/graphics", None);
+    platform.identity.bus = LinuxBusKind::Platform;
+    platform.identity.fields = LinuxStableFields::default();
+    let platform = map_linux(vec![platform]).expect("bounded platform attachment");
+    assert_eq!(platform[0].class, DeviceClass::Unknown);
+    assert_eq!(platform[0].vendor, Vendor::Unknown);
+
+    let mut virtio = linux_render(10, b"pci0000:00/virtio4/graphics", Some(0x1af4));
+    virtio.identity.bus = LinuxBusKind::Virtio;
+    let virtio = map_linux(vec![virtio]).expect("bounded virtio attachment");
+    assert_eq!(virtio[0].class, DeviceClass::Virtual);
+    assert_eq!(virtio[0].vendor, Vendor::Other);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        map_linux_records(
+            vec![linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086),)],
+            &cancellation,
+        )
+        .unwrap_err(),
+        DeviceError::Cancelled
+    );
+}
+
+#[test]
+fn linux_pure_driver_completeness_and_class_need_explicit_evidence() {
+    let mut complete = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+    complete.class = LinuxClassEvidence::Integrated;
+    let device = normalize_one(map_linux(vec![complete.clone()]).unwrap().remove(0));
+    assert_eq!(device.class, DeviceClass::Integrated);
+    assert!(device.driver_identity.is_persistable());
+
+    complete.driver.srcversion = None;
+    let device = normalize_one(map_linux(vec![complete]).unwrap().remove(0));
+    assert!(!device.driver_identity.is_persistable());
+
+    for (evidence, expected) in [
+        (LinuxClassEvidence::Discrete, DeviceClass::Discrete),
+        (LinuxClassEvidence::Virtual, DeviceClass::Virtual),
+        (LinuxClassEvidence::Unknown, DeviceClass::Unknown),
+    ] {
+        let mut snapshot = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+        snapshot.class = evidence;
+        assert_eq!(map_linux(vec![snapshot]).unwrap()[0].class, expected);
+    }
+}
+
+#[test]
+fn linux_pure_rejects_swaps_collisions_malformed_driver_and_overflow() {
+    let mut swapped = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+    swapped.repeated_target_relative = b"pci0000:00/0000:03:00.0".to_vec();
+    assert_eq!(map_linux(vec![swapped]).unwrap_err(), DeviceError::Invalid);
+
+    let first = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+    let second = linux_render(9, b"pci0000:00/0000:03:00.0", Some(0x8086));
+    assert_eq!(
+        map_linux(vec![first, second]).unwrap_err(),
+        DeviceError::Ambiguous
+    );
+
+    let mut conflicting = linux_render(9, b"pci0000:00/0000:00:02.0", Some(0x8086));
+    let mut alias = conflicting.clone();
+    alias.render_name = b"renderD10".to_vec();
+    alias.driver.module = Some(b"different".to_vec());
+    assert_eq!(
+        map_linux(vec![conflicting.clone(), alias]).unwrap_err(),
+        DeviceError::Ambiguous
+    );
+
+    conflicting.driver.module = Some(b"unsafe/module".to_vec());
+    assert_eq!(
+        map_linux(vec![conflicting]).unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    let too_many = (0..33)
+        .map(|index| {
+            linux_render(
+                index,
+                format!("pci0000:00/0000:{:02x}:00.0", index + 1).as_bytes(),
+                Some(0x8086),
+            )
+        })
+        .collect();
+    assert_eq!(map_linux(too_many).unwrap_err(), DeviceError::Overflow);
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_native_fixture(root: &std::path::Path, render_name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let class = root.join("class-drm");
+    let devices = root.join("devices");
+    let modules = root.join("modules");
+    let dev = root.join("dev-dri");
+    let hardware = devices.join("pci0000:00/0000:00:02.0");
+    let render = hardware.join("drm").join(render_name);
+    std::fs::create_dir_all(&class).unwrap();
+    std::fs::create_dir_all(&render).unwrap();
+    std::fs::create_dir_all(modules.join("xe")).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::create_dir_all(hardware.join("driver")).unwrap();
+    std::fs::write(render.join("dev"), b"226:9\n").unwrap();
+    std::fs::write(hardware.join("vendor"), b"0x8086\n").unwrap();
+    std::fs::write(hardware.join("device"), b"0x56a0\n").unwrap();
+    std::fs::write(hardware.join("subsystem_vendor"), b"0x1028\n").unwrap();
+    std::fs::write(hardware.join("subsystem_device"), b"0x0bda\n").unwrap();
+    std::fs::write(hardware.join("revision"), b"0x05\n").unwrap();
+    std::fs::write(
+        hardware.join("uevent"),
+        b"PCI_SLOT_NAME=0000:00:02.0\nDRIVER=xe\n",
+    )
+    .unwrap();
+    std::fs::write(modules.join("xe/srcversion"), b"0123456789ABCDEF\n").unwrap();
+    symlink(&render, class.join(render_name)).unwrap();
+    symlink(&hardware, render.join("device")).unwrap();
+    symlink(modules.join("xe"), hardware.join("driver/module")).unwrap();
+    hardware
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_native_virtual_root_missing_locator_and_aliases_are_safe() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+    let second_render = hardware.join("drm/renderD27");
+    std::fs::create_dir_all(&second_render).unwrap();
+    std::fs::write(second_render.join("dev"), b"226:27\n").unwrap();
+    symlink(&hardware, second_render.join("device")).unwrap();
+    symlink(&second_render, temporary.path().join("class-drm/renderD27")).unwrap();
+
+    let records = native_fixture_for_test(
+        temporary.path(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("anchored aliases are safe");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].availability,
+        DeviceAvailability::LocatorUnavailable
+    );
+    assert_eq!(records[0].vendor, Vendor::Intel);
+    assert_eq!(records[0].class, DeviceClass::Unknown);
+    assert_eq!(
+        records[0].backends,
+        vec![BackendKind::Qsv, BackendKind::Vaapi]
+    );
+    assert!(matches!(records[0].driver, DriverRecord::Complete(_)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_native_permission_denied_is_reported_without_mutating_access() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    create_linux_native_fixture(temporary.path(), "renderD9");
+    let dev_root = temporary.path().join("dev-dri");
+    std::fs::set_permissions(&dev_root, std::fs::Permissions::from_mode(0)).unwrap();
+    let result = native_fixture_for_test(
+        temporary.path(),
+        &tokio_util::sync::CancellationToken::new(),
+    );
+    std::fs::set_permissions(&dev_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let records = result.expect("stable sysfs identity survives inaccessible render directory");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].availability,
+        DeviceAvailability::PermissionDenied
+    );
+    assert_eq!(records[0].locator, DeviceLocator::Unavailable);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_native_rejects_loop_escape_magic_link_and_noncharacter_locator() {
+    use std::{os::fd::AsRawFd, os::unix::fs::symlink};
+
+    for attack in ["loop", "escape", "magic"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+        let class_link = temporary.path().join("class-drm/renderD9");
+        std::fs::remove_file(&class_link).unwrap();
+        let held_render = if attack == "magic" {
+            Some(std::fs::File::open(hardware.join("drm/renderD9")).unwrap())
+        } else {
+            None
+        };
+        match attack {
+            "loop" => symlink(&class_link, &class_link).unwrap(),
+            "escape" => {
+                let outside = temporary.path().join("outside");
+                std::fs::create_dir(&outside).unwrap();
+                symlink(outside, &class_link).unwrap();
+            }
+            "magic" => {
+                symlink(
+                    format!(
+                        "/proc/self/fd/{}",
+                        held_render.as_ref().unwrap().as_raw_fd()
+                    ),
+                    &class_link,
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            native_fixture_for_test(
+                temporary.path(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap_err(),
+            DeviceError::Invalid
+        );
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    create_linux_native_fixture(temporary.path(), "renderD9");
+    std::fs::write(temporary.path().join("dev-dri/renderD9"), b"not a device").unwrap();
+    assert_eq!(
+        native_fixture_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+    let non_device = temporary.path().join("devices/not-a-device");
+    std::fs::create_dir(&non_device).unwrap();
+    let device_link = hardware.join("drm/renderD9/device");
+    std::fs::remove_file(&device_link).unwrap();
+    symlink(non_device, device_link).unwrap();
+    assert_eq!(
+        native_fixture_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Invalid
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_native_detects_target_swap_and_hot_unplug() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+    let replacement = temporary.path().join("devices/pci0000:00/0000:03:00.0");
+    std::fs::create_dir_all(&replacement).unwrap();
+    let device_link = hardware.join("drm/renderD9/device");
+    let mut swap = |_: &[u8]| {
+        std::fs::remove_file(&device_link).unwrap();
+        symlink(&replacement, &device_link).unwrap();
+    };
+    assert_eq!(
+        native_fixture_with_hook_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+            &mut swap,
+        )
+        .unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+    let device_link = hardware.join("drm/renderD9/device");
+    let mut unplug = |_: &[u8]| std::fs::remove_file(&device_link).unwrap();
+    assert_eq!(
+        native_fixture_with_hook_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+            &mut unplug,
+        )
+        .unwrap_err(),
+        DeviceError::Invalid
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_native_rejects_oversized_too_many_and_cancelled_inputs() {
+    let temporary = tempfile::tempdir().unwrap();
+    let hardware = create_linux_native_fixture(temporary.path(), "renderD9");
+    std::fs::write(hardware.join("vendor"), vec![b'0'; 2_049]).unwrap();
+    assert_eq!(
+        native_fixture_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Overflow
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temporary.path().join("class-drm")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("devices")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("modules")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("dev-dri")).unwrap();
+    for number in 0..33 {
+        std::os::unix::fs::symlink(
+            temporary.path().join("devices"),
+            temporary.path().join(format!("class-drm/renderD{number}")),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        native_fixture_for_test(
+            temporary.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Overflow
+    );
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        native_fixture_for_test(temporary.path(), &cancellation).unwrap_err(),
+        DeviceError::Cancelled
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_linux_no_gpu_is_valid() {
+    let temporary = tempfile::tempdir().unwrap();
+    for directory in ["class-drm", "devices", "modules", "dev-dri"] {
+        std::fs::create_dir(temporary.path().join(directory)).unwrap();
+    }
+    assert_eq!(native_no_gpu_for_test(temporary.path()).unwrap(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_native_production_inventory_is_no_gpu_safe() {
+    let result = LinuxDeviceEnumerator
+        .enumerate(tokio_util::sync::CancellationToken::new())
+        .await;
+    assert!(result.is_ok(), "native discovery failed: {result:?}");
+}
 
 fn private_identity(bytes: impl Into<Vec<u8>>) -> PrivateDeviceIdentity {
     PrivateDeviceIdentity::new(bytes.into()).expect("bounded private identity")
@@ -769,6 +1367,7 @@ fn raw_record_count_individual_and_aggregate_bounds_fail_without_truncation() {
     let mut oversized_locator = record_with_identity(b"oversized-locator".to_vec());
     oversized_locator.locator = DeviceLocator::Linux {
         render_node: vec![b'x'; 2_049],
+        device_number: 1,
     };
     assert_eq!(
         normalize_platform_records(vec![oversized_locator], &seed, &epoch).unwrap_err(),
@@ -879,6 +1478,7 @@ fn public_projection_and_debug_output_omit_every_private_sentinel() {
         record_with_identity(b"private-identity-sentinel:account-name-sentinel".to_vec());
     record.locator = DeviceLocator::Linux {
         render_node: b"/dev/dri/private-locator-sentinel".to_vec(),
+        device_number: 2,
     };
     record.driver = DriverRecord::Complete(vec![DriverField::new(
         7,
@@ -1035,6 +1635,7 @@ fn generated_run_epoch_and_all_private_wrappers_are_redacted() {
     let record = DriverRecord::Complete(vec![field.clone()]);
     let locator = DeviceLocator::Linux {
         render_node: b"private-render-node".to_vec(),
+        device_number: 3,
     };
     let device = normalize_one(record_with_driver("private-driver-version"));
     for rendered in [
@@ -1122,6 +1723,7 @@ fn identical_private_bytes_on_distinct_platforms_are_domain_separated() {
     linux.platform = PlatformTag::Linux;
     linux.locator = DeviceLocator::Linux {
         render_node: b"synthetic-render-node".to_vec(),
+        device_number: 4,
     };
     let devices = normalize_platform_records(vec![windows, linux], &seed, &epoch).unwrap();
     assert_eq!(devices.len(), 2);
