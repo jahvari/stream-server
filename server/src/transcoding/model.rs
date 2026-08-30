@@ -1,18 +1,52 @@
+use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, num::NonZeroU32};
 
+const DEVICE_ID_PREFIX: &str = "gpu1_";
+const DEVICE_ID_DIGEST_BYTES: usize = 20;
+const DEVICE_ID_SUFFIX_BYTES: usize = 27;
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(transparent)]
+/// A validated version-one opaque public device identifier.
+///
+/// Arbitrary text cannot bypass public parsing:
+///
+/// ```compile_fail
+/// use stream_server::transcoding::DeviceId;
+///
+/// let _ = DeviceId::new("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA");
+/// ```
 pub struct DeviceId(String);
 
 impl DeviceId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ModelValidationError> {
-        let value = value.into();
-        if is_safe_identifier(&value) {
-            Ok(Self(value))
-        } else {
-            Err(ModelValidationError::new("invalid device id"))
+    pub fn parse_public(value: &str) -> Result<Self, ModelValidationError> {
+        let Some(suffix) = value.strip_prefix(DEVICE_ID_PREFIX) else {
+            return Err(ModelValidationError::new("invalid device id"));
+        };
+        if suffix.len() != DEVICE_ID_SUFFIX_BYTES {
+            return Err(ModelValidationError::new("invalid device id"));
         }
+
+        let decoded = BASE64_URL_SAFE_NO_PAD
+            .decode(suffix)
+            .map_err(|_| ModelValidationError::new("invalid device id"))?;
+        let decoded: [u8; DEVICE_ID_DIGEST_BYTES] = decoded
+            .try_into()
+            .map_err(|_| ModelValidationError::new("invalid device id"))?;
+        let canonical = Self::from_hmac_prefix(decoded);
+        if canonical.as_str() != value {
+            return Err(ModelValidationError::new("invalid device id"));
+        }
+
+        Ok(canonical)
+    }
+
+    pub(crate) fn from_hmac_prefix(value: [u8; DEVICE_ID_DIGEST_BYTES]) -> Self {
+        Self(format!(
+            "{DEVICE_ID_PREFIX}{}",
+            BASE64_URL_SAFE_NO_PAD.encode(value)
+        ))
     }
 
     pub fn as_str(&self) -> &str {
@@ -26,7 +60,7 @@ impl<'de> Deserialize<'de> for DeviceId {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        Self::parse_public(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -44,6 +78,8 @@ pub enum DeviceClass {
 #[serde(rename_all = "camelCase")]
 pub enum BackendKind {
     Amf,
+    Cuda,
+    D3d11va,
     Nvenc,
     Qsv,
     Vaapi,
@@ -54,12 +90,11 @@ pub enum BackendKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityState {
-    Unknown,
     Listed,
-    Verifying,
-    Verified,
-    Unsupported,
-    TemporarilyFailed,
+    CorrectnessVerified,
+    RealtimeQualified,
+    Failed,
+    CircuitOpen,
     AdministrativelyDisabled,
 }
 
@@ -583,14 +618,6 @@ impl fmt::Display for ModelValidationError {
 
 impl std::error::Error for ModelValidationError {}
 
-fn is_safe_identifier(value: &str) -> bool {
-    let len = value.len();
-    (1..=128).contains(&len)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
 fn validate_complete_stage_graph(stages: &[VideoStage]) -> Result<(), ModelValidationError> {
     let decode_count = stages
         .iter()
@@ -640,14 +667,26 @@ mod tests {
     }
 
     fn device(value: &str) -> DeviceId {
-        DeviceId::new(value).unwrap()
+        DeviceId::parse_public(value).unwrap()
     }
 
     fn qsv_stages_with(kind: StageKind) -> Vec<VideoStage> {
         vec![
-            VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
-            VideoStage::hardware(kind, BackendKind::Qsv, device("gpu-a")),
-            VideoStage::hardware(StageKind::Encode, BackendKind::Qsv, device("gpu-a")),
+            VideoStage::hardware(
+                StageKind::Decode,
+                BackendKind::Qsv,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
+            VideoStage::hardware(
+                kind,
+                BackendKind::Qsv,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
+            VideoStage::hardware(
+                StageKind::Encode,
+                BackendKind::Qsv,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
         ]
     }
 
@@ -663,22 +702,26 @@ mod tests {
         round_trip(
             StageMode::Hardware {
                 backend: BackendKind::Vaapi,
-                device: device("renderD128"),
+                device: device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             },
-            "{\"hardware\":{\"backend\":\"vaapi\",\"device\":\"renderD128\"}}",
+            "{\"hardware\":{\"backend\":\"vaapi\",\"device\":\"gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA\"}}",
         );
         round_trip(DeviceClass::Integrated, "\"integrated\"");
         round_trip(DeviceClass::Discrete, "\"discrete\"");
         round_trip(DeviceClass::Virtual, "\"virtual\"");
         round_trip(DeviceClass::Software, "\"software\"");
         round_trip(DeviceClass::Unknown, "\"unknown\"");
+        round_trip(BackendKind::D3d11va, "\"d3d11va\"");
+        round_trip(BackendKind::Cuda, "\"cuda\"");
         round_trip(BackendKind::VideoToolbox, "\"videoToolbox\"");
-        round_trip(CapabilityState::Unknown, "\"unknown\"");
         round_trip(CapabilityState::Listed, "\"listed\"");
-        round_trip(CapabilityState::Verifying, "\"verifying\"");
-        round_trip(CapabilityState::Verified, "\"verified\"");
-        round_trip(CapabilityState::Unsupported, "\"unsupported\"");
-        round_trip(CapabilityState::TemporarilyFailed, "\"temporarilyFailed\"");
+        round_trip(
+            CapabilityState::CorrectnessVerified,
+            "\"correctnessVerified\"",
+        );
+        round_trip(CapabilityState::RealtimeQualified, "\"realtimeQualified\"");
+        round_trip(CapabilityState::Failed, "\"failed\"");
+        round_trip(CapabilityState::CircuitOpen, "\"circuitOpen\"");
         round_trip(
             CapabilityState::AdministrativelyDisabled,
             "\"administrativelyDisabled\"",
@@ -701,18 +744,57 @@ mod tests {
     }
 
     #[test]
-    fn device_id_rejects_raw_paths_urls_credentials_and_commands() {
+    fn device_ids_accept_only_the_version_one_wire_shape() {
+        let valid = "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(DeviceId::parse_public(valid).unwrap().as_str(), valid);
+        assert_eq!(
+            serde_json::to_string(&device(valid)).unwrap(),
+            format!("\"{valid}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<DeviceId>(&format!("\"{valid}\"")).unwrap(),
+            device(valid)
+        );
+
         for raw in [
             "",
+            "gpu0_AAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gpu1_",
+            "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAA+",
+            "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAB",
             "C:\\Users\\ExampleUser\\device",
             "/dev/dri/renderD128",
             "https://user:secret@example.test/gpu?token=abc",
             "gpu 0",
             "gpu; rm -rf /",
         ] {
-            assert!(DeviceId::new(raw).is_err(), "{raw}");
+            assert!(DeviceId::parse_public(raw).is_err(), "{raw}");
         }
-        assert_eq!(device("gpu-a").as_str(), "gpu-a");
+    }
+
+    #[test]
+    fn hmac_prefix_constructor_produces_a_canonical_device_id() {
+        let id = DeviceId::from_hmac_prefix([0; DEVICE_ID_DIGEST_BYTES]);
+        assert_eq!(id.as_str(), "gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    #[test]
+    fn transitional_capability_states_never_deserialize() {
+        for raw in [
+            "unknown",
+            "verifying",
+            "verified",
+            "unsupported",
+            "temporarilyFailed",
+        ] {
+            let json = format!("\"{raw}\"");
+            assert!(
+                serde_json::from_str::<CapabilityState>(&json).is_err(),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -777,11 +859,19 @@ mod tests {
             vec![VideoStage::hardware(
                 StageKind::Encode,
                 BackendKind::Qsv,
-                device("gpu-a"),
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             )],
             vec![
-                VideoStage::hardware(StageKind::Encode, BackendKind::Qsv, device("gpu-a")),
-                VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
+                VideoStage::hardware(
+                    StageKind::Encode,
+                    BackendKind::Qsv,
+                    device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                ),
+                VideoStage::hardware(
+                    StageKind::Decode,
+                    BackendKind::Qsv,
+                    device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                ),
             ],
         ] {
             assert!(AccelerationClass::derive(&stages).is_err());
@@ -792,7 +882,11 @@ mod tests {
     fn hardware_encode_with_software_decode_is_partial() {
         let stages = vec![
             VideoStage::software(StageKind::Decode),
-            VideoStage::hardware(StageKind::Encode, BackendKind::Amf, device("gpu-a")),
+            VideoStage::hardware(
+                StageKind::Encode,
+                BackendKind::Amf,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
         ];
         assert_eq!(
             AccelerationClass::derive(&stages).unwrap(),
@@ -821,12 +915,28 @@ mod tests {
     #[test]
     fn mixed_hardware_device_or_backend_is_not_hardware_resident() {
         let mixed_device = vec![
-            VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
-            VideoStage::hardware(StageKind::Encode, BackendKind::Qsv, device("gpu-b")),
+            VideoStage::hardware(
+                StageKind::Decode,
+                BackendKind::Qsv,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
+            VideoStage::hardware(
+                StageKind::Encode,
+                BackendKind::Qsv,
+                device("gpu1_AQAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
         ];
         let mixed_backend = vec![
-            VideoStage::hardware(StageKind::Decode, BackendKind::Qsv, device("gpu-a")),
-            VideoStage::hardware(StageKind::Encode, BackendKind::Vaapi, device("gpu-a")),
+            VideoStage::hardware(
+                StageKind::Decode,
+                BackendKind::Qsv,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
+            VideoStage::hardware(
+                StageKind::Encode,
+                BackendKind::Vaapi,
+                device("gpu1_AAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ),
         ];
 
         assert_eq!(
