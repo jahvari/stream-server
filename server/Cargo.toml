@@ -51,6 +51,7 @@ tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", default-features = false }
 rayon = "1.12.0"
 sha2 = "0.11.0"
+hmac = "0.13.0"
 subtle = "2.6.1"
 thiserror = "2.0.20"
 semver = "1.0.28"
@@ -102,8 +103,14 @@ libc = "0.2.189"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Wdk_Foundation",
+    "Wdk_Graphics_Direct3D",
     "Wdk_Storage_FileSystem",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
+    "Win32_Graphics_DXCore",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",

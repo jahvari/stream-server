@@ -1,4 +1,15 @@
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod capability;
 pub mod codec;
+/// Device identity material is intentionally unavailable to external callers.
+///
+/// ```compile_fail
+/// use stream_server::transcoding::device::identity::{
+///     DeviceIdSeed, PrivateDeviceIdentity,
+/// };
+/// ```
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod device;
 pub mod error;
 pub mod model;
 pub mod probe;

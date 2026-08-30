@@ -7952,6 +7952,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex 0.4.3",
+ "hmac",
  "ico",
  "if-addrs",
  "image",
