@@ -261,6 +261,25 @@ impl TranscodingDevice {
             driver_identity_complete: self.driver_identity.is_persistable(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_identity(
+        id: DeviceId,
+        driver_identity: DriverIdentity,
+        backend: BackendKind,
+    ) -> Self {
+        Self {
+            id,
+            display_name: SafeDeviceName("Test GPU".to_owned()),
+            vendor: Vendor::Other,
+            class: DeviceClass::Unknown,
+            availability: DeviceAvailability::Available,
+            backends: BTreeSet::from([backend]),
+            private_identity: PrivateDeviceIdentity::new(vec![1]).expect("bounded fixture"),
+            locator: DeviceLocator::Unavailable,
+            driver_identity,
+        }
+    }
 }
 
 impl fmt::Debug for TranscodingDevice {

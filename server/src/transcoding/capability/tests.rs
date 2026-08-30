@@ -3,9 +3,14 @@ use super::key::{
     KeyValidationError, OutputVideoSignature, PrivateSourceDigest, SegmentationContract,
     test_common, test_input, test_output, test_requirements,
 };
+use super::registry::{
+    CapabilityRegistry, CapabilityVerifier, PlaybackPriority, RefreshState, RegistryReason,
+    SnapshotFreshness, UnknownVerifier, VerificationRequest, snapshot_validation_matrix_for_test,
+};
 use super::state::{
     EvidenceOutcome, EvidenceReason, EvidenceRecord, EvidenceTarget, EvidenceTimestamp,
-    ProjectionContext, StateError, StateNow, VerificationMode, VerificationResult, WorkState,
+    ProjectionContext, StateError, StateNow, VerificationMode, VerificationResult, VerifierMode,
+    WorkState,
 };
 use super::storage::{
     SeedStorageError, SeedStorageEvent, load_or_create_device_seed,
@@ -19,12 +24,833 @@ use std::{
     collections::HashSet,
     fs,
     num::NonZeroU32,
-    sync::{Arc, Barrier, Mutex},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 static_assertions::assert_not_impl_any!(CapabilityKey: serde::Serialize);
 static_assertions::assert_not_impl_any!(PrivateSourceDigest: serde::Serialize);
+
+#[tokio::test]
+async fn production_unknown_verifier_never_records_or_spawns() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), UnknownVerifier);
+    let before = registry.verifier_invocations_for_test();
+
+    let result = registry
+        .ensure_evidence(key, EvidenceTarget::Correctness)
+        .await;
+
+    assert!(result.is_non_passing());
+    assert_eq!(
+        result.reason(),
+        Some(RegistryReason::VerificationNotImplemented)
+    );
+    assert_eq!(registry.verifier_invocations_for_test(), before);
+    assert!(registry.snapshot().await.evidence().is_empty());
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+}
+
+#[derive(Clone)]
+struct PausedVerifier {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl PausedVerifier {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("test semaphore remains open")
+            .forget();
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl CapabilityVerifier for PausedVerifier {
+    fn mode(&self) -> VerifierMode {
+        VerifierMode::ActiveInjected
+    }
+
+    async fn verify(
+        &self,
+        request: VerificationRequest,
+        cancellation: CancellationToken,
+    ) -> VerificationResult {
+        assert_eq!(request.identity_epoch, 1);
+        let _ = &request.key;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        tokio::select! {
+            _ = cancellation.cancelled() => VerificationResult::for_test(
+                request.target,
+                EvidenceOutcome::Cancelled,
+                EvidenceReason::VerificationFailed,
+                0,
+            ),
+            permit = self.release.acquire() => {
+                permit.expect("test semaphore remains open").forget();
+                VerificationResult::for_test(
+                    request.target,
+                    if request.target == EvidenceTarget::Realtime {
+                        EvidenceOutcome::RealtimePassed
+                    } else {
+                        EvidenceOutcome::CorrectnessPassed
+                    },
+                    EvidenceReason::VerificationFailed,
+                    0,
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ImmediateVerifier {
+    calls: Arc<AtomicUsize>,
+    minute: u64,
+}
+
+impl ImmediateVerifier {
+    fn at_minute(minute: u64) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            minute,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CapabilityVerifier for ImmediateVerifier {
+    fn mode(&self) -> VerifierMode {
+        VerifierMode::ActiveInjected
+    }
+
+    async fn verify(
+        &self,
+        request: VerificationRequest,
+        _cancellation: CancellationToken,
+    ) -> VerificationResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        VerificationResult::for_test(
+            request.target,
+            if request.target == EvidenceTarget::Realtime {
+                EvidenceOutcome::RealtimePassed
+            } else {
+                EvidenceOutcome::CorrectnessPassed
+            },
+            EvidenceReason::VerificationFailed,
+            self.minute,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct TerminatingVerifier {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl TerminatingVerifier {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CapabilityVerifier for TerminatingVerifier {
+    fn mode(&self) -> VerifierMode {
+        VerifierMode::ActiveInjected
+    }
+
+    async fn verify(
+        &self,
+        _request: VerificationRequest,
+        _cancellation: CancellationToken,
+    ) -> VerificationResult {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test semaphore remains open")
+            .forget();
+        panic!("injected verifier termination")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WrongTargetVerifier;
+
+#[async_trait::async_trait]
+impl CapabilityVerifier for WrongTargetVerifier {
+    fn mode(&self) -> VerifierMode {
+        VerifierMode::ActiveInjected
+    }
+
+    async fn verify(
+        &self,
+        _request: VerificationRequest,
+        _cancellation: CancellationToken,
+    ) -> VerificationResult {
+        VerificationResult::for_test(
+            EvidenceTarget::Segmented,
+            EvidenceOutcome::CorrectnessPassed,
+            EvidenceReason::VerificationFailed,
+            0,
+        )
+    }
+}
+
+#[derive(Default)]
+struct TogglePlayback(AtomicBool);
+
+impl TogglePlayback {
+    fn set(&self, active: bool) {
+        self.0.store(active, Ordering::SeqCst);
+    }
+}
+
+impl PlaybackPriority for TogglePlayback {
+    fn playback_active(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+fn spawn_ensure(
+    registry: &Arc<CapabilityRegistry>,
+    key: CapabilityKey,
+    target: EvidenceTarget,
+) -> tokio::task::JoinHandle<super::registry::EnsureEvidenceResult> {
+    let registry = Arc::clone(registry);
+    tokio::spawn(async move { registry.ensure_evidence(key, target).await })
+}
+
+async fn wait_for_in_flight(registry: &CapabilityRegistry, expected: usize) {
+    for _ in 0..1_000 {
+        if registry.in_flight_count_for_test().await == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("in-flight count did not reach {expected}");
+}
+
+#[tokio::test]
+async fn registry_starts_uninitialized_and_publication_is_revision_consistent() {
+    let registry = CapabilityRegistry::new(Arc::new(UnknownVerifier));
+    let publication = registry.publication().await;
+    assert_eq!(
+        publication.snapshot.freshness(),
+        SnapshotFreshness::Uninitialized
+    );
+    assert_eq!(publication.snapshot.identity_epoch(), 0);
+    assert_eq!(publication.snapshot.publication_revision(), 0);
+    assert_eq!(publication.refresh.state, RefreshState::Idle);
+    assert!(publication.snapshot.evidence().is_empty());
+
+    assert_eq!(
+        [
+            SnapshotFreshness::Uninitialized,
+            SnapshotFreshness::Refreshing,
+            SnapshotFreshness::Fresh,
+            SnapshotFreshness::Stale,
+        ]
+        .len(),
+        4
+    );
+    assert_eq!(
+        [
+            RefreshState::Idle,
+            RefreshState::Running,
+            RefreshState::Succeeded,
+            RefreshState::Failed,
+            RefreshState::Cancelled,
+        ]
+        .len(),
+        5
+    );
+    for (reason, code) in [
+        (
+            RegistryReason::VerificationNotImplemented,
+            "verification_not_implemented",
+        ),
+        (RegistryReason::VerificationStale, "verification_stale"),
+        (
+            RegistryReason::VerificationPrerequisiteMissing,
+            "verification_prerequisite_missing",
+        ),
+        (
+            RegistryReason::VerificationCapacity,
+            "verification_capacity",
+        ),
+        (
+            RegistryReason::VerificationQueueTimeout,
+            "verification_queue_timeout",
+        ),
+        (
+            RegistryReason::VerificationDeferredForPlayback,
+            "verification_deferred_for_playback",
+        ),
+        (RegistryReason::CapacityExhausted, "capacity_exhausted"),
+        (RegistryReason::ServerShutdown, "server_shutdown"),
+    ] {
+        assert_eq!(reason.safe_code(), code);
+    }
+}
+
+#[test]
+fn snapshot_order_bounds_and_cross_references_are_strict() {
+    for (case, accepted) in snapshot_validation_matrix_for_test() {
+        assert!(accepted, "snapshot invariant failed: {case}");
+    }
+}
+
+#[tokio::test]
+async fn verifier_admission_rejects_every_noncurrent_or_missing_prerequisite_before_queue() {
+    let key = CapabilityKey::complete_test_keys().remove(2);
+    let cases = [
+        CapabilityRegistry::with_freshness_for_test(
+            key.clone(),
+            PausedVerifier::new(),
+            SnapshotFreshness::Refreshing,
+        ),
+        CapabilityRegistry::with_freshness_for_test(
+            key.clone(),
+            PausedVerifier::new(),
+            SnapshotFreshness::Stale,
+        ),
+        CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new()),
+        CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new()),
+        CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new()),
+        CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new()),
+        CapabilityRegistry::without_candidates_for_test(key.clone(), PausedVerifier::new()),
+        CapabilityRegistry::without_filters_for_test(key.clone(), PausedVerifier::new()),
+    ];
+    let rejected_keys = [
+        key.clone(),
+        key.clone(),
+        key.with_test_runtime(0x90),
+        key.with_test_physical_identity(0x91),
+        key.with_test_driver(0x92),
+        key.with_test_backend(crate::transcoding::BackendKind::Cuda),
+        key.clone(),
+        key.invalid_for_test(),
+    ];
+
+    for (registry, rejected) in cases.into_iter().zip(rejected_keys) {
+        let result = registry
+            .ensure_evidence(rejected, EvidenceTarget::Correctness)
+            .await;
+        assert_eq!(
+            result.reason(),
+            Some(RegistryReason::VerificationPrerequisiteMissing)
+        );
+        assert_eq!(registry.verifier_invocations_for_test(), 0);
+        assert_eq!(registry.in_flight_count_for_test().await, 0);
+        assert!(registry.snapshot().await.evidence().is_empty());
+        registry.shutdown().await;
+    }
+
+    let registry = CapabilityRegistry::without_filters_for_test(key.clone(), PausedVerifier::new());
+    let result = registry
+        .ensure_evidence(key, EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(
+        result.reason(),
+        Some(RegistryReason::VerificationPrerequisiteMissing)
+    );
+    assert_eq!(registry.verifier_invocations_for_test(), 0);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn closed_registry_rejects_before_queue_or_verifier_call() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new());
+    registry.shutdown().await;
+
+    let result = registry
+        .ensure_evidence(key, EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(result.reason(), Some(RegistryReason::ServerShutdown));
+    assert_eq!(registry.verifier_invocations_for_test(), 0);
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn same_key_is_single_flight_caller_drop_is_independent_and_old_arc_is_immutable() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test(
+        key.clone(),
+        verifier.clone(),
+    ));
+    let old_snapshot = registry.snapshot().await;
+
+    let first = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        let key = key.clone();
+        async move {
+            registry
+                .ensure_evidence(key, EvidenceTarget::Correctness)
+                .await
+        }
+    });
+    verifier.wait_until_entered().await;
+    let follower = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        let key = key.clone();
+        async move {
+            registry
+                .ensure_evidence(key, EvidenceTarget::Correctness)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(registry.in_flight_count_for_test().await, 1);
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    first.abort();
+
+    let snapshot_while_paused = registry.snapshot().await;
+    assert!(Arc::ptr_eq(&snapshot_while_paused, &old_snapshot));
+    verifier.release_one();
+    let result = follower.await.unwrap();
+    assert!(result.is_passing());
+
+    let current = registry.snapshot().await;
+    assert_eq!(current.evidence().len(), 1);
+    assert_eq!(current.publication_revision(), 2);
+    assert!(old_snapshot.evidence().is_empty());
+    assert_eq!(old_snapshot.publication_revision(), 1);
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn different_key_completions_merge_at_the_same_epoch() {
+    let base = CapabilityKey::complete_test_keys().remove(0);
+    let keys = vec![
+        base.with_test_physical_identity(0x21),
+        base.with_test_physical_identity(0x31),
+    ];
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys(
+        keys.clone(),
+        verifier.clone(),
+    ));
+    let tasks = keys
+        .iter()
+        .cloned()
+        .map(|key| spawn_ensure(&registry, key, EvidenceTarget::Correctness))
+        .collect::<Vec<_>>();
+    verifier.wait_until_entered().await;
+    verifier.wait_until_entered().await;
+    verifier.release.add_permits(2);
+
+    for task in tasks {
+        assert!(task.await.unwrap().is_passing());
+    }
+    wait_for_in_flight(&registry, 0).await;
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.evidence().len(), 2);
+    assert!(keys.iter().all(|key| snapshot.evidence().contains_key(key)));
+    assert_eq!(snapshot.publication_revision(), 3);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn verifier_capacity_is_one_per_device_and_four_globally() {
+    let same_device = CapabilityKey::distinct_copy_keys_for_test(2);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys(
+        same_device.clone(),
+        verifier.clone(),
+    ));
+    let first = spawn_ensure(
+        &registry,
+        same_device[0].clone(),
+        EvidenceTarget::Correctness,
+    );
+    let second = spawn_ensure(
+        &registry,
+        same_device[1].clone(),
+        EvidenceTarget::Correctness,
+    );
+    verifier.wait_until_entered().await;
+    tokio::task::yield_now().await;
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    verifier.release_one();
+    verifier.wait_until_entered().await;
+    verifier.release_one();
+    assert!(first.await.unwrap().is_passing());
+    assert!(second.await.unwrap().is_passing());
+    registry.shutdown().await;
+
+    let base = CapabilityKey::complete_test_keys().remove(0);
+    let different_devices = (1..=5)
+        .map(|marker| base.with_test_physical_identity(marker))
+        .collect::<Vec<_>>();
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys(
+        different_devices.clone(),
+        verifier.clone(),
+    ));
+    let tasks = different_devices
+        .into_iter()
+        .map(|key| spawn_ensure(&registry, key, EvidenceTarget::Correctness))
+        .collect::<Vec<_>>();
+    for _ in 0..4 {
+        verifier.wait_until_entered().await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 4);
+    verifier.release_one();
+    verifier.wait_until_entered().await;
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 5);
+    verifier.release.add_permits(4);
+    for task in tasks {
+        assert!(task.await.unwrap().is_passing());
+    }
+    registry.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_verification_times_out_at_five_seconds_without_invocation() {
+    let keys = CapabilityKey::distinct_copy_keys_for_test(2);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys(
+        keys.clone(),
+        verifier.clone(),
+    ));
+    let active = spawn_ensure(&registry, keys[0].clone(), EvidenceTarget::Correctness);
+    verifier.wait_until_entered().await;
+    let queued = spawn_ensure(&registry, keys[1].clone(), EvidenceTarget::Correctness);
+    wait_for_in_flight(&registry, 2).await;
+    while registry.queued_count_for_test().await != 1 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    let timed_out = queued.await.unwrap();
+    assert_eq!(
+        timed_out.reason(),
+        Some(RegistryReason::VerificationQueueTimeout)
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    verifier.release_one();
+    assert!(active.await.unwrap().is_passing());
+    wait_for_in_flight(&registry, 0).await;
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn sixty_five_distinct_flights_are_rejected_without_unbounded_queue_growth() {
+    let keys = CapabilityKey::distinct_copy_keys_for_test(65);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys(
+        keys.clone(),
+        verifier.clone(),
+    ));
+    let tasks = keys[..64]
+        .iter()
+        .cloned()
+        .map(|key| spawn_ensure(&registry, key, EvidenceTarget::Correctness))
+        .collect::<Vec<_>>();
+    wait_for_in_flight(&registry, 64).await;
+
+    let refused = registry
+        .ensure_evidence(keys[64].clone(), EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(refused.reason(), Some(RegistryReason::VerificationCapacity));
+    assert_eq!(registry.in_flight_count_for_test().await, 64);
+    assert!(registry.queued_count_for_test().await <= 64);
+    registry.begin_shutdown();
+    for task in tasks {
+        assert_eq!(
+            task.await.unwrap().reason(),
+            Some(RegistryReason::ServerShutdown)
+        );
+    }
+    registry.shutdown().await;
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+    assert_eq!(registry.device_semaphore_count_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn playback_priority_is_checked_before_queue_and_again_before_verifier() {
+    let keys = CapabilityKey::distinct_copy_keys_for_test(2);
+    let verifier = PausedVerifier::new();
+    let playback = Arc::new(TogglePlayback::default());
+    playback.set(true);
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test_keys_with(
+        keys.clone(),
+        verifier.clone(),
+        playback.clone(),
+    ));
+    let refused = registry
+        .ensure_evidence(keys[0].clone(), EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(
+        refused.reason(),
+        Some(RegistryReason::VerificationDeferredForPlayback)
+    );
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+
+    playback.set(false);
+    let active = spawn_ensure(&registry, keys[0].clone(), EvidenceTarget::Correctness);
+    verifier.wait_until_entered().await;
+    let queued = spawn_ensure(&registry, keys[1].clone(), EvidenceTarget::Correctness);
+    wait_for_in_flight(&registry, 2).await;
+    playback.set(true);
+    verifier.release_one();
+    assert!(active.await.unwrap().is_passing());
+    let deferred = queued.await.unwrap();
+    assert_eq!(
+        deferred.reason(),
+        Some(RegistryReason::VerificationDeferredForPlayback)
+    );
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.snapshot().await.evidence().len(), 1);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn refresh_invalidation_and_shutdown_wake_all_waiters_and_reap_flights() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test(
+        key.clone(),
+        verifier.clone(),
+    ));
+    let old = registry.snapshot().await;
+    let leader = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    verifier.wait_until_entered().await;
+    let follower = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    while registry.waiter_count_for_test(&key).await != 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(registry.begin_refresh_invalidation().await.unwrap(), 2);
+    for task in [leader, follower] {
+        assert_eq!(
+            task.await.unwrap().reason(),
+            Some(RegistryReason::VerificationStale)
+        );
+    }
+    let refreshing = registry.snapshot().await;
+    assert_eq!(refreshing.freshness(), SnapshotFreshness::Refreshing);
+    assert_eq!(refreshing.identity_epoch(), 2);
+    assert_eq!(refreshing.publication_revision(), 2);
+    assert_eq!(old.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(old.identity_epoch(), 1);
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+    assert_eq!(registry.queued_count_for_test().await, 0);
+    assert_eq!(registry.device_semaphore_count_for_test().await, 0);
+    registry.shutdown().await;
+
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test(
+        key.clone(),
+        verifier.clone(),
+    ));
+    let leader = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    verifier.wait_until_entered().await;
+    let follower = spawn_ensure(&registry, key, EvidenceTarget::Correctness);
+    registry.begin_shutdown();
+    for task in [leader, follower] {
+        assert_eq!(
+            task.await.unwrap().reason(),
+            Some(RegistryReason::ServerShutdown)
+        );
+    }
+    registry.shutdown().await;
+    assert_eq!(registry.in_flight_count_for_test().await, 0);
+    assert_eq!(registry.device_semaphore_count_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn evidence_capacity_prunes_expired_rows_then_uses_deterministic_oldest_key_eviction() {
+    let keys = CapabilityKey::distinct_copy_keys_for_test(3_073);
+    let verifier = ImmediateVerifier::at_minute(0);
+    let (registry, _clock) =
+        CapabilityRegistry::at_evidence_capacity_for_test(keys.clone(), verifier);
+    let result = registry
+        .ensure_evidence(keys[3_072].clone(), EvidenceTarget::Correctness)
+        .await;
+    assert!(result.is_passing());
+    wait_for_in_flight(&registry, 0).await;
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.evidence().len(), 3_072);
+    assert!(snapshot.evidence().contains_key(&keys[3_072]));
+    let oldest_tie = keys[..3_072].iter().min().unwrap();
+    assert!(!snapshot.evidence().contains_key(oldest_tie));
+    registry.shutdown().await;
+
+    let verifier = ImmediateVerifier::at_minute(1_441);
+    let (registry, clock) =
+        CapabilityRegistry::at_evidence_capacity_for_test(keys.clone(), verifier);
+    clock.set_minutes(1_441);
+    let result = registry
+        .ensure_evidence(keys[3_072].clone(), EvidenceTarget::Correctness)
+        .await;
+    assert!(result.is_passing());
+    wait_for_in_flight(&registry, 0).await;
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.evidence().len(), 1);
+    assert!(snapshot.evidence().contains_key(&keys[3_072]));
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_counter_exhaustion_closes_verifier_admission_without_mutation() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = ImmediateVerifier::at_minute(0);
+    let calls = Arc::clone(&verifier.calls);
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), verifier);
+    registry.exhaust_invocation_counter_for_test();
+    let result = registry
+        .ensure_evidence(key.clone(), EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(result.reason(), Some(RegistryReason::CapacityExhausted));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(registry.snapshot().await.evidence().is_empty());
+    assert_eq!(
+        registry
+            .ensure_evidence(key, EvidenceTarget::Correctness)
+            .await
+            .reason(),
+        Some(RegistryReason::CapacityExhausted)
+    );
+    registry.shutdown().await;
+
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = PausedVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test(
+        key.clone(),
+        verifier.clone(),
+    ));
+    registry.exhaust_publication_revision_for_test().await;
+    let task = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    verifier.wait_until_entered().await;
+    verifier.release_one();
+    assert_eq!(
+        task.await.unwrap().reason(),
+        Some(RegistryReason::CapacityExhausted)
+    );
+    assert!(registry.snapshot().await.evidence().is_empty());
+    assert_eq!(
+        registry
+            .ensure_evidence(key, EvidenceTarget::Correctness)
+            .await
+            .reason(),
+        Some(RegistryReason::CapacityExhausted)
+    );
+    registry.shutdown().await;
+
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), PausedVerifier::new());
+    registry.exhaust_identity_epoch_for_test().await;
+    assert_eq!(
+        registry.begin_refresh_invalidation().await,
+        Err(RegistryReason::CapacityExhausted)
+    );
+    assert_eq!(
+        registry
+            .ensure_evidence(key, EvidenceTarget::Correctness)
+            .await
+            .reason(),
+        Some(RegistryReason::CapacityExhausted)
+    );
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn verifier_termination_and_malformed_target_wake_waiters_without_evidence() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = TerminatingVerifier::new();
+    let registry = Arc::new(CapabilityRegistry::fresh_for_test(
+        key.clone(),
+        verifier.clone(),
+    ));
+    let leader = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    verifier
+        .entered
+        .acquire()
+        .await
+        .expect("test semaphore remains open")
+        .forget();
+    let follower = spawn_ensure(&registry, key.clone(), EvidenceTarget::Correctness);
+    while registry.waiter_count_for_test(&key).await != 2 {
+        tokio::task::yield_now().await;
+    }
+    verifier.release.add_permits(1);
+    for task in [leader, follower] {
+        assert_eq!(
+            task.await.unwrap().reason(),
+            Some(RegistryReason::ServerShutdown)
+        );
+    }
+    wait_for_in_flight(&registry, 0).await;
+    assert!(registry.snapshot().await.evidence().is_empty());
+    registry.shutdown().await;
+
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), WrongTargetVerifier);
+    let result = registry
+        .ensure_evidence(key, EvidenceTarget::Correctness)
+        .await;
+    assert_eq!(
+        result.reason(),
+        Some(RegistryReason::VerificationPrerequisiteMissing)
+    );
+    assert!(registry.snapshot().await.evidence().is_empty());
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn current_exact_evidence_is_reused_without_a_second_verifier_invocation() {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let verifier = ImmediateVerifier::at_minute(0);
+    let calls = Arc::clone(&verifier.calls);
+    let registry = CapabilityRegistry::fresh_for_test(key.clone(), verifier);
+
+    assert!(
+        registry
+            .ensure_evidence(key.clone(), EvidenceTarget::Correctness)
+            .await
+            .is_passing()
+    );
+    assert!(
+        registry
+            .ensure_evidence(key, EvidenceTarget::Correctness)
+            .await
+            .is_passing()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.snapshot().await.evidence().len(), 1);
+    registry.shutdown().await;
+}
 
 fn new_config_directory() -> tempfile::TempDir {
     tempfile::tempdir().expect("isolated config directory")

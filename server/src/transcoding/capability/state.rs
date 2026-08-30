@@ -89,9 +89,20 @@ pub(super) enum EvidenceReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum VerificationMode {
-    Active,
-    Unknown,
+pub(super) enum VerifierMode {
+    ObservationalOnly,
+    ActiveInjected,
+}
+
+#[cfg(test)]
+pub(super) type VerificationMode = VerifierMode;
+
+#[cfg(test)]
+impl VerifierMode {
+    #[allow(non_upper_case_globals)]
+    pub(super) const Active: Self = Self::ActiveInjected;
+    #[allow(non_upper_case_globals)]
+    pub(super) const Unknown: Self = Self::ObservationalOnly;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +185,14 @@ impl VerificationResult {
             return Err(StateError::ExpiredResult);
         }
         Ok(())
+    }
+
+    pub(super) const fn outcome(self) -> EvidenceOutcome {
+        self.outcome
+    }
+
+    pub(super) const fn target(self) -> EvidenceTarget {
+        self.target
     }
 
     #[cfg(test)]
@@ -418,6 +437,10 @@ impl Transition {
     pub(super) const fn remove_record(self) -> bool {
         matches!(self, Self::RemoveRecord)
     }
+
+    pub(super) const fn changes_record(self) -> bool {
+        !matches!(self, Self::NoChange)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,11 +468,11 @@ impl EvidenceRecord {
     pub(super) fn apply(
         &mut self,
         result: VerificationResult,
-        mode: VerificationMode,
+        mode: VerifierMode,
         now: StateNow,
     ) -> Result<Transition, StateError> {
         result.validate_at(now)?;
-        if mode == VerificationMode::Unknown {
+        if mode == VerifierMode::ObservationalOnly {
             return if result.outcome == EvidenceOutcome::NotPresent
                 && result.reason == Some(EvidenceReason::VerificationNotImplemented)
             {
@@ -667,6 +690,23 @@ impl EvidenceRecord {
         .into_iter()
         .flatten()
         .max()
+    }
+
+    pub(super) fn target_is_current(&self, target: EvidenceTarget, now: StateNow) -> bool {
+        match target {
+            EvidenceTarget::Correctness => self
+                .correctness
+                .as_ref()
+                .is_some_and(|observation| observation.is_current(now)),
+            EvidenceTarget::Realtime => self
+                .realtime
+                .as_ref()
+                .is_some_and(|observation| observation.is_current(now)),
+            EvidenceTarget::Segmented => self
+                .segmented
+                .as_ref()
+                .is_some_and(|observation| observation.is_current(now)),
+        }
     }
 
     #[cfg(test)]

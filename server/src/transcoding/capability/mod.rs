@@ -1,4 +1,5 @@
 pub(super) mod key;
+pub(super) mod registry;
 pub(super) mod state;
 pub(super) mod storage;
 

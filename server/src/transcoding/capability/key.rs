@@ -6,6 +6,7 @@ use crate::transcoding::{
         InputVideoCodec, OutputVideoCodec, PixelFormat, SampleEntry, VideoProfile,
     },
     device::identity::DriverIdentity,
+    inventory::ListedCodec,
     inventory::RuntimeEvidenceId,
     model::{BackendKind, DeviceId, FrameRateClass, KeyframeStrategy, RationalRate},
 };
@@ -44,6 +45,13 @@ pub(super) enum CapabilityDirection {
     FullPipeline,
     SegmentedPipeline,
     CopyRemux,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct StaticPrerequisites<'a> {
+    pub(super) decode: Option<ListedCodec>,
+    pub(super) encode: Option<ListedCodec>,
+    pub(super) requirements: Option<&'a PipelineRequirements>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -813,34 +821,238 @@ impl CapabilityKey {
     pub(super) const fn direction(&self) -> CapabilityDirection {
         self.operation.direction()
     }
+
+    pub(super) const fn runtime(&self) -> &RuntimeEvidenceId {
+        &self.runtime
+    }
+
+    pub(super) const fn device(&self) -> &DeviceId {
+        &self.device
+    }
+
+    pub(super) const fn driver(&self) -> &DriverIdentity {
+        &self.driver
+    }
+
+    pub(super) const fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    pub(super) fn static_prerequisites(&self) -> StaticPrerequisites<'_> {
+        match &self.operation {
+            CapabilityOperation::Decode {
+                input,
+                requirements,
+            } => StaticPrerequisites {
+                decode: Some(listed_input_codec(input.codec)),
+                encode: None,
+                requirements: Some(requirements),
+            },
+            CapabilityOperation::Encode {
+                output,
+                requirements,
+            } => StaticPrerequisites {
+                decode: None,
+                encode: Some(listed_output_codec(output.codec)),
+                requirements: Some(requirements),
+            },
+            CapabilityOperation::FullPipeline {
+                input,
+                output,
+                requirements,
+            }
+            | CapabilityOperation::SegmentedPipeline {
+                input,
+                output,
+                requirements,
+                ..
+            } => StaticPrerequisites {
+                decode: Some(listed_input_codec(input.codec)),
+                encode: Some(listed_output_codec(output.codec)),
+                requirements: Some(requirements),
+            },
+            CapabilityOperation::CopyRemux(_) => StaticPrerequisites {
+                decode: None,
+                encode: None,
+                requirements: None,
+            },
+        }
+    }
+
+    pub(super) fn is_valid(&self) -> bool {
+        self.versions == KeyVersions::for_direction(self.direction())
+            && validate_operation(self.direction(), &self.operation).is_ok()
+    }
+}
+
+fn listed_input_codec(codec: InputVideoCodec) -> ListedCodec {
+    match codec {
+        InputVideoCodec::H264 => ListedCodec::H264,
+        InputVideoCodec::Hevc => ListedCodec::Hevc,
+        InputVideoCodec::Av1 => ListedCodec::Av1,
+        InputVideoCodec::Vp9 => ListedCodec::Vp9,
+        InputVideoCodec::Mpeg2 => ListedCodec::Mpeg2,
+        InputVideoCodec::Vc1 => ListedCodec::Vc1,
+        InputVideoCodec::OtherProbed => unreachable!("validated keys reject open codec values"),
+    }
+}
+
+fn listed_output_codec(codec: OutputVideoCodec) -> ListedCodec {
+    match codec {
+        OutputVideoCodec::H264 => ListedCodec::H264,
+        OutputVideoCodec::Hevc => ListedCodec::Hevc,
+        OutputVideoCodec::Av1 => ListedCodec::Av1,
+    }
 }
 
 fn validate_operation(
     direction: CapabilityDirection,
     operation: &CapabilityOperation,
 ) -> Result<(), KeyValidationError> {
-    let requirements = match operation {
+    match operation {
+        CapabilityOperation::Decode { input, .. } => {
+            validate_input_video(
+                input.codec,
+                input.profile,
+                input.level,
+                input.pixel_format,
+                input.bit_depth,
+                input.chroma,
+            )?;
+            validate_color(input.color)?;
+        }
+        CapabilityOperation::Encode { output, .. } => {
+            validate_output_video(
+                output.codec,
+                output.profile,
+                output.level,
+                output.pixel_format,
+                output.bit_depth,
+                output.chroma,
+            )?;
+            validate_color(output.color)?;
+        }
+        CapabilityOperation::FullPipeline { input, output, .. }
+        | CapabilityOperation::SegmentedPipeline { input, output, .. } => {
+            validate_input_video(
+                input.codec,
+                input.profile,
+                input.level,
+                input.pixel_format,
+                input.bit_depth,
+                input.chroma,
+            )?;
+            validate_output_video(
+                output.codec,
+                output.profile,
+                output.level,
+                output.pixel_format,
+                output.bit_depth,
+                output.chroma,
+            )?;
+            validate_color(input.color)?;
+            validate_color(output.color)?;
+        }
+        CapabilityOperation::CopyRemux(signature) => {
+            if signature.source_version == 0
+                || matches!(signature.source_codec, InputVideoCodec::OtherProbed)
+                || matches!(signature.sample_entry, SampleEntry::OtherProbed)
+            {
+                return Err(KeyValidationError::NonFiniteSignature);
+            }
+            validate_color(signature.source_color)?;
+        }
+    }
+    match operation {
         CapabilityOperation::Decode { requirements, .. } => {
+            validate_requirements(requirements)?;
             if requirements.container.is_some() || requirements.output_time_base.is_some() {
                 return Err(KeyValidationError::InvalidDirectionFields);
             }
-            return Ok(());
+            Ok(())
         }
         CapabilityOperation::Encode { requirements, .. }
-        | CapabilityOperation::FullPipeline { requirements, .. } => requirements,
-        CapabilityOperation::SegmentedPipeline { requirements, .. } => {
+        | CapabilityOperation::FullPipeline { requirements, .. } => {
+            validate_requirements(requirements)?;
+            if requirements.container.is_none() || requirements.output_time_base.is_none() {
+                return Err(KeyValidationError::InvalidDirectionFields);
+            }
+            if direction == CapabilityDirection::CopyRemux {
+                return Err(KeyValidationError::InvalidDirectionFields);
+            }
+            Ok(())
+        }
+        CapabilityOperation::SegmentedPipeline {
+            requirements,
+            segmentation,
+            ..
+        } => {
+            validate_requirements(requirements)?;
             if requirements.output_time_base.is_some() || requirements.container.is_none() {
                 return Err(KeyValidationError::InvalidDirectionFields);
             }
-            return Ok(());
+            if let KeyframeStrategy::TimeForced {
+                segment_duration_ms,
+            } = segmentation.keyframe_strategy
+                && segment_duration_ms != segmentation.segment_duration_ms
+            {
+                return Err(KeyValidationError::InconsistentSegmentation);
+            }
+            Ok(())
         }
-        CapabilityOperation::CopyRemux(_) => return Ok(()),
-    };
-    if requirements.container.is_none() || requirements.output_time_base.is_none() {
-        return Err(KeyValidationError::InvalidDirectionFields);
+        CapabilityOperation::CopyRemux(_) => Ok(()),
     }
-    if direction == CapabilityDirection::CopyRemux {
-        return Err(KeyValidationError::InvalidDirectionFields);
+}
+
+fn validate_color(color: ColorSignature) -> Result<(), KeyValidationError> {
+    if matches!(color.range, ColorRange::OtherProbed)
+        || matches!(color.primaries, ColorPrimaries::OtherProbed)
+        || matches!(color.transfer, ColorTransfer::OtherProbed)
+        || matches!(color.matrix, ColorMatrix::OtherProbed)
+    {
+        return Err(KeyValidationError::NonFiniteSignature);
+    }
+    Ok(())
+}
+
+fn validate_requirements(requirements: &PipelineRequirements) -> Result<(), KeyValidationError> {
+    if requirements.transforms.len() > MAX_REQUIREMENT_ITEMS
+        || requirements.transfers.len() > MAX_REQUIREMENT_ITEMS
+        || requirements.filters.len() > MAX_REQUIREMENT_ITEMS
+        || requirements
+            .transforms
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || requirements
+            .transfers
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || requirements
+            .filters
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(KeyValidationError::NonFiniteSignature);
+    }
+    for (transform, filter) in [
+        (RequiredTransform::Scale, RequiredFilter::Scale),
+        (RequiredTransform::Deinterlace, RequiredFilter::Deinterlace),
+        (RequiredTransform::ToneMap, RequiredFilter::ToneMap),
+        (RequiredTransform::SubtitleBurnIn, RequiredFilter::Subtitles),
+        (RequiredTransform::PixelFormat, RequiredFilter::Format),
+    ] {
+        if requirements.transforms.contains(&transform) && !requirements.filters.contains(&filter) {
+            return Err(KeyValidationError::InvalidDirectionFields);
+        }
+    }
+    for (transfer, filter) in [
+        (RequiredTransfer::Upload, RequiredFilter::HardwareUpload),
+        (RequiredTransfer::Download, RequiredFilter::HardwareDownload),
+        (RequiredTransfer::HardwareMap, RequiredFilter::HardwareMap),
+    ] {
+        if requirements.transfers.contains(&transfer) && !requirements.filters.contains(&filter) {
+            return Err(KeyValidationError::InvalidDirectionFields);
+        }
     }
     Ok(())
 }
@@ -885,6 +1097,54 @@ impl CapabilityKey {
 
     pub(super) fn all_identity_mutations_for_test(&self) -> Vec<Self> {
         test_mutations(self)
+    }
+
+    pub(super) fn with_test_physical_identity(&self, marker: u8) -> Self {
+        let mut key = self.clone();
+        key.device = DeviceId::from_hmac_prefix([marker; 20]);
+        key.driver = DriverIdentity::from_test_digest([marker.wrapping_add(1); 32], true);
+        key
+    }
+
+    pub(super) fn with_test_runtime(&self, marker: u8) -> Self {
+        let mut key = self.clone();
+        key.runtime = test_runtime(marker);
+        key
+    }
+
+    pub(super) fn with_test_driver(&self, marker: u8) -> Self {
+        let mut key = self.clone();
+        key.driver = DriverIdentity::from_test_digest([marker; 32], true);
+        key
+    }
+
+    pub(super) fn with_test_backend(&self, backend: BackendKind) -> Self {
+        let mut key = self.clone();
+        key.backend = backend;
+        key
+    }
+
+    pub(super) fn invalid_for_test(&self) -> Self {
+        let mut key = self.clone();
+        key.versions.schema = 0;
+        key
+    }
+
+    pub(super) fn distinct_copy_keys_for_test(count: usize) -> Vec<Self> {
+        let base = test_keys().remove(4);
+        (0..count)
+            .map(|index| {
+                let mut key = base.clone();
+                let CapabilityOperation::CopyRemux(signature) = &mut key.operation else {
+                    unreachable!("copy fixture has the copy operation")
+                };
+                signature.source_version = u64::try_from(index)
+                    .expect("bounded test key count")
+                    .checked_add(1)
+                    .expect("bounded test source version");
+                key
+            })
+            .collect()
     }
 }
 
@@ -962,7 +1222,7 @@ pub(super) fn test_requirements(output: bool) -> PipelineRequirements {
     PipelineRequirements::new(
         [RequiredTransform::Scale],
         [RequiredTransfer::HardwareMap],
-        [RequiredFilter::Scale],
+        [RequiredFilter::Scale, RequiredFilter::HardwareMap],
         output.then_some(OutputContainerContract::MpegTsStream),
         output.then(|| RationalRate::new(1, NonZeroU32::new(90_000).unwrap()).unwrap()),
     )
@@ -1020,7 +1280,7 @@ fn test_keys() -> Vec<CapabilityKey> {
         PipelineRequirements::new(
             [RequiredTransform::Scale],
             [RequiredTransfer::HardwareMap],
-            [RequiredFilter::Scale],
+            [RequiredFilter::Scale, RequiredFilter::HardwareMap],
             Some(OutputContainerContract::MpegTsHls),
             None,
         )
