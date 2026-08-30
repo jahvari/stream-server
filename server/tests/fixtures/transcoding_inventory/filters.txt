@@ -1,0 +1,24 @@
+Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  ..C = Command support
+  A = Audio input/output
+  V = Video input/output
+  N = Dynamic number and/or type of input/output
+  | = Source or sink filter
+ ... format            Convert pixel formats
+ ... hwdownload        Download hardware frames
+ ... hwmap             Map hardware frames
+ ... hwupload          Upload hardware frames
+ ... scale             Scale software frames
+ ... scale_cuda        Scale CUDA frames
+ ... scale_qsv         Scale QSV frames
+ ... scale_vaapi       Scale VAAPI frames
+ ... deinterlace_qsv   Deinterlace QSV frames
+ ... deinterlace_vaapi Deinterlace VAAPI frames
+ ... yadif             Deinterlace software frames
+ ... tonemap           Tone map software frames
+ ... tonemap_opencl    Tone map OpenCL frames
+ ... tonemap_vaapi     Tone map VAAPI frames
+ ... subtitles         Unknown to static hardware model
+ ... scale_cuda_extra  Misleading suffix

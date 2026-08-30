@@ -590,7 +590,7 @@ impl HashTestObserver {
 }
 
 #[derive(Debug)]
-enum CandidateFailure {
+pub(super) enum CandidateFailure {
     Missing,
     Unsafe,
     Probe,
@@ -1212,7 +1212,7 @@ fn parse_version<'a>(output: &'a [u8], role: &str) -> Result<&'a str, CandidateF
     Ok(token)
 }
 
-fn build_configuration(output: &[u8]) -> Result<Vec<u8>, CandidateFailure> {
+pub(super) fn build_configuration(output: &[u8]) -> Result<Vec<u8>, CandidateFailure> {
     let output = std::str::from_utf8(output).map_err(|_| CandidateFailure::Incompatible)?;
     let mut lines = output.lines();
     let header_remainder = loop {

@@ -1,0 +1,37 @@
+Decoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V..... h264                  H.264
+ V..... hevc                  HEVC
+ V..... av1                   AV1
+ V..... vp9                   VP9
+ V..... mpeg2video            MPEG-2
+ V..... vc1                   VC-1
+ V..... h264_qsv              H.264 QSV
+ V..... hevc_qsv              HEVC QSV
+ V..... av1_qsv               AV1 QSV
+ V..... vp9_qsv               VP9 QSV
+ V..... mpeg2_qsv             MPEG-2 QSV
+ V..... vc1_qsv               VC-1 QSV
+ V..... h264_cuvid            H.264 CUVID
+ V..... hevc_cuvid            HEVC CUVID
+ V..... av1_cuvid             AV1 CUVID
+ V..... vp9_cuvid             VP9 CUVID
+ V..... mpeg2_cuvid           MPEG-2 CUVID
+ V..... vc1_cuvid             VC-1 CUVID
+ V..... h264_v4l2m2m         H.264 V4L2M2M
+ V..... hevc_v4l2m2m         HEVC V4L2M2M
+ V..... av1_v4l2m2m          AV1 V4L2M2M
+ V..... vp9_v4l2m2m          VP9 V4L2M2M
+ V..... mpeg2_v4l2m2m        MPEG-2 V4L2M2M
+ V..... vc1_v4l2m2m          VC-1 V4L2M2M
+ V..... h264_rkmpp            historical RKMPP
+ V..... h264_mediacodec      historical MediaCodec
+ V..... h264_cuvid_extra      misleading suffix

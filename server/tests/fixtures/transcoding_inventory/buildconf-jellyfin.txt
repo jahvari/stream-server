@@ -1,0 +1,10 @@
+ffmpeg version 7.1.4-Jellyfin
+configuration:
+  --enable-amf
+  --enable-cuda
+  --enable-gpl
+  --enable-libmfx
+  --enable-nvenc
+  --enable-vaapi
+  --enable-videotoolbox
+  --enable-v4l2-m2m

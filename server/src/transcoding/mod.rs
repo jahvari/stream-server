@@ -12,6 +12,8 @@ pub mod codec;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod device;
 pub mod error;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod inventory;
 pub mod model;
 pub mod probe;
 /// Raw process construction is internal to the transcoding runtime.

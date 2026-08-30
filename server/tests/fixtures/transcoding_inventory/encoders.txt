@@ -1,0 +1,32 @@
+Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V..... h264_qsv             H.264 QSV
+ V..... hevc_qsv             HEVC QSV
+ V..... av1_qsv              AV1 QSV
+ V..... h264_nvenc           H.264 NVENC
+ V..... hevc_nvenc           HEVC NVENC
+ V..... av1_nvenc            AV1 NVENC
+ V..... h264_vaapi           H.264 VAAPI
+ V..... hevc_vaapi           HEVC VAAPI
+ V..... av1_vaapi            AV1 VAAPI
+ V..... h264_amf             H.264 AMF
+ V..... hevc_amf             HEVC AMF
+ V..... av1_amf              AV1 AMF
+ V..... h264_videotoolbox    H.264 VideoToolbox
+ V..... hevc_videotoolbox    HEVC VideoToolbox
+ V..... av1_videotoolbox     AV1 VideoToolbox
+ V..... h264_v4l2m2m         H.264 V4L2M2M
+ V..... hevc_v4l2m2m         HEVC V4L2M2M
+ V..... av1_v4l2m2m          AV1 V4L2M2M
+ V..... h264_omx             historical OMX
+ V..... h264_mediacodec      historical MediaCodec
+ V..... libx264              software encoder
+ V..... h264_nvenc_extra     misleading suffix

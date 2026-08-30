@@ -1,0 +1,9 @@
+Hardware acceleration methods:
+cuda
+d3d11va
+qsv
+vaapi
+videotoolbox
+vdpau
+cuda
+cuda_like_but_unknown
