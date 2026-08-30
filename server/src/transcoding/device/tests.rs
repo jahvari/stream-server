@@ -1,6 +1,15 @@
 use super::identity::{
     DeviceIdSeed, DriverIdentity, PlatformTag, PrivateDeviceIdentity, derive_device_id,
 };
+use super::windows::{
+    D3D12_GENERIC_MEDIA_ATTRIBUTE_U128, WindowsAdapterSnapshot, WindowsCandidateLists,
+    WindowsDriverSnapshot, WindowsPhysicalSnapshot, map_windows_records,
+};
+#[cfg(windows)]
+use super::windows::{
+    WindowsDeviceEnumerator, exercise_native_handle_exit_for_test,
+    native_open_handle_count_for_test,
+};
 use super::{
     DeviceAvailability, DeviceEnumerator, DeviceError, DeviceLocator, DriverField, DriverRecord,
     DriverRunEpoch, PlatformDeviceRecord, Vendor, normalize_platform_records,
@@ -15,6 +24,9 @@ static_assertions::assert_not_impl_any!(DriverIdentity: serde::Serialize);
 static_assertions::assert_not_impl_any!(DriverField: serde::Serialize);
 static_assertions::assert_not_impl_any!(DriverRecord: serde::Serialize);
 static_assertions::assert_not_impl_any!(PlatformDeviceRecord: serde::Serialize);
+static_assertions::assert_not_impl_any!(WindowsAdapterSnapshot: serde::Serialize);
+static_assertions::assert_not_impl_any!(WindowsPhysicalSnapshot: serde::Serialize);
+static_assertions::assert_not_impl_any!(WindowsDriverSnapshot: serde::Serialize);
 
 fn private_identity(bytes: impl Into<Vec<u8>>) -> PrivateDeviceIdentity {
     PrivateDeviceIdentity::new(bytes.into()).expect("bounded private identity")
@@ -51,6 +63,501 @@ fn record_with_identity(identity: impl Into<Vec<u8>>) -> PlatformDeviceRecord {
     let mut record = record_with_driver("31.0.101.5590");
     record.persistent_identity = private_identity(identity);
     record
+}
+
+fn windows_adapter(luid: i64, instance: &str) -> WindowsAdapterSnapshot {
+    WindowsAdapterSnapshot {
+        luid,
+        display_name: b"Synthetic Windows Adapter".to_vec(),
+        vendor_id: Some(0x8086),
+        is_hardware: Some(true),
+        is_integrated: Some(true),
+        has_virtual_or_remote_evidence: false,
+        physical_adapters: vec![WindowsPhysicalSnapshot {
+            physical_index: Some(0),
+            instance_id: instance.encode_utf16().collect(),
+            repeated_instance_id: instance.encode_utf16().collect(),
+            driver: WindowsDriverSnapshot::complete_for_test("31.0.test"),
+        }],
+    }
+}
+
+fn map_windows_adapter(
+    adapter: WindowsAdapterSnapshot,
+) -> Result<Vec<PlatformDeviceRecord>, DeviceError> {
+    map_windows_records(
+        WindowsCandidateLists::DxCore {
+            d3d11_graphics: vec![adapter],
+            generic_media: None,
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+#[test]
+fn windows_dxcore_union_deduplicates_and_dxgi_is_fallback_only() {
+    assert_eq!(
+        D3D12_GENERIC_MEDIA_ATTRIBUTE_U128,
+        0x8eb2c848_82f6_4b49_aa87_aecfcf0174c6
+    );
+    let first = windows_adapter(11, r"TEST\DISPLAY\ONE");
+    let second = windows_adapter(22, r"TEST\DISPLAY\TWO");
+    let fallback = windows_adapter(33, r"TEST\DISPLAY\FALLBACK");
+
+    let union = map_windows_records(
+        WindowsCandidateLists::DxCore {
+            d3d11_graphics: vec![first.clone()],
+            generic_media: Some(vec![first.clone(), second.clone()]),
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("consistent duplicate LUID is deduplicated");
+    assert_eq!(union.len(), 2);
+    assert!(union.iter().any(|record| matches!(
+        record.locator,
+        DeviceLocator::Windows {
+            adapter_luid: 11,
+            physical_index: Some(0)
+        }
+    )));
+    assert!(union.iter().any(|record| matches!(
+        record.locator,
+        DeviceLocator::Windows {
+            adapter_luid: 22,
+            physical_index: Some(0)
+        }
+    )));
+
+    let older_os = map_windows_records(
+        WindowsCandidateLists::DxCore {
+            d3d11_graphics: vec![first],
+            generic_media: None,
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("unsupported Generic Media list does not weaken D3D11 discovery");
+    assert_eq!(older_os.len(), 1);
+    assert!(matches!(
+        older_os[0].locator,
+        DeviceLocator::Windows {
+            adapter_luid: 11,
+            physical_index: Some(0)
+        }
+    ));
+
+    let dxgi = map_windows_records(
+        WindowsCandidateLists::DxgiFallback(vec![fallback]),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("DXGI fallback uses the same PnP mapper");
+    assert_eq!(dxgi.len(), 1);
+    assert!(matches!(
+        dxgi[0].locator,
+        DeviceLocator::Windows {
+            adapter_luid: 33,
+            physical_index: Some(0)
+        }
+    ));
+}
+
+#[test]
+fn windows_union_accepts_member_reordering_but_rejects_conflicting_snapshots() {
+    let mut first = windows_adapter(77, "unused");
+    let mut second_member = first.physical_adapters[0].clone();
+    second_member.physical_index = Some(1);
+    second_member.instance_id = r"TEST\SECOND".encode_utf16().collect();
+    second_member.repeated_instance_id = second_member.instance_id.clone();
+    first.physical_adapters.push(second_member);
+    let mut reordered = first.clone();
+    reordered.physical_adapters.reverse();
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxCore {
+                d3d11_graphics: vec![first.clone()],
+                generic_media: Some(vec![reordered]),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("physical member ordering is not identity")
+        .len(),
+        2
+    );
+
+    let mut conflicting = first.clone();
+    conflicting.physical_adapters[0].driver = WindowsDriverSnapshot::complete_for_test("different");
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxCore {
+                d3d11_graphics: vec![first],
+                generic_media: Some(vec![conflicting]),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Ambiguous
+    );
+}
+
+#[test]
+fn windows_pnp_identity_is_luid_independent_and_separates_identical_models() {
+    let first =
+        map_windows_adapter(windows_adapter(11, r"TEST\DISPLAY\STABLE")).expect("first identity");
+    let rebooted = map_windows_adapter(windows_adapter(99, r"TEST\DISPLAY\STABLE"))
+        .expect("same PnP identity after LUID change");
+    assert_eq!(
+        first[0].persistent_identity.as_bytes(),
+        rebooted[0].persistent_identity.as_bytes()
+    );
+    assert_ne!(first[0].locator, rebooted[0].locator);
+
+    let other = map_windows_adapter(windows_adapter(22, r"TEST\DISPLAY\OTHER"))
+        .expect("identical model with distinct PnP identity");
+    assert_ne!(
+        first[0].persistent_identity.as_bytes(),
+        other[0].persistent_identity.as_bytes()
+    );
+}
+
+#[test]
+fn windows_pnp_identity_is_exact_utf16le_and_rejects_unsafe_reads() {
+    let mut adapter = windows_adapter(11, "A\u{00e9}");
+    let exact = map_windows_adapter(adapter.clone()).expect("valid UTF-16 identity");
+    assert_eq!(
+        exact[0].persistent_identity.as_bytes(),
+        &[0x41, 0x00, 0xe9, 0x00]
+    );
+
+    adapter.physical_adapters[0].repeated_instance_id = "changed".encode_utf16().collect();
+    assert_eq!(
+        map_windows_adapter(adapter).unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    for invalid in [Vec::new(), vec![b'A' as u16, 0, b'B' as u16], vec![1; 200]] {
+        let mut adapter = windows_adapter(11, "placeholder");
+        adapter.physical_adapters[0].instance_id = invalid.clone();
+        adapter.physical_adapters[0].repeated_instance_id = invalid;
+        assert_eq!(
+            map_windows_adapter(adapter).unwrap_err(),
+            DeviceError::Invalid
+        );
+    }
+    let maximum = vec![1; 199];
+    let mut adapter = windows_adapter(11, "placeholder");
+    adapter.physical_adapters[0].instance_id = maximum.clone();
+    adapter.physical_adapters[0].repeated_instance_id = maximum;
+    assert_eq!(
+        map_windows_adapter(adapter).expect("199 units pass").len(),
+        1
+    );
+}
+
+#[test]
+fn windows_linked_adapters_split_only_with_one_to_one_locators() {
+    let first = WindowsPhysicalSnapshot {
+        physical_index: Some(0),
+        instance_id: r"TEST\LINKED\ONE".encode_utf16().collect(),
+        repeated_instance_id: r"TEST\LINKED\ONE".encode_utf16().collect(),
+        driver: WindowsDriverSnapshot::complete_for_test("1"),
+    };
+    let mut second = first.clone();
+    second.physical_index = Some(1);
+    second.instance_id = r"TEST\LINKED\TWO".encode_utf16().collect();
+    second.repeated_instance_id = second.instance_id.clone();
+    let mut adapter = windows_adapter(44, "unused");
+    adapter.physical_adapters = vec![first.clone(), second.clone()];
+
+    let split = map_windows_adapter(adapter.clone()).expect("one-to-one physical locators");
+    assert_eq!(split.len(), 2);
+    assert!(
+        split
+            .iter()
+            .all(|record| record.class == DeviceClass::Integrated)
+    );
+
+    adapter.physical_adapters[0].physical_index = None;
+    adapter.physical_adapters[1].physical_index = None;
+    let grouped = map_windows_adapter(adapter).expect("linked logical group");
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0].class, DeviceClass::Unknown);
+    assert!(matches!(
+        grouped[0].locator,
+        DeviceLocator::Windows {
+            adapter_luid: 44,
+            physical_index: None
+        }
+    ));
+
+    let mut duplicate_locator = windows_adapter(44, "unused");
+    duplicate_locator.physical_adapters = vec![first, second];
+    duplicate_locator.physical_adapters[1].physical_index = Some(0);
+    assert_eq!(
+        map_windows_adapter(duplicate_locator).unwrap_err(),
+        DeviceError::Ambiguous
+    );
+}
+
+#[test]
+fn windows_linked_group_framing_is_sorted_deduplicated_and_topology_sensitive() {
+    let member = |identity: &str| WindowsPhysicalSnapshot {
+        physical_index: None,
+        instance_id: identity.encode_utf16().collect(),
+        repeated_instance_id: identity.encode_utf16().collect(),
+        driver: WindowsDriverSnapshot::complete_for_test("1"),
+    };
+    let mut adapter = windows_adapter(55, "unused");
+    adapter.physical_adapters = vec![
+        member(r"TEST\MEMBER\B"),
+        member(r"TEST\MEMBER\A"),
+        member(r"TEST\MEMBER\A"),
+    ];
+    let canonical = map_windows_adapter(adapter.clone()).expect("canonical group");
+
+    let mut expected = b"windows-linked-group/v1\0".to_vec();
+    expected.extend_from_slice(&2_u32.to_be_bytes());
+    for identity in [r"TEST\MEMBER\A", r"TEST\MEMBER\B"] {
+        let bytes = identity
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&bytes);
+    }
+    assert_eq!(canonical[0].persistent_identity.as_bytes(), expected);
+
+    adapter.physical_adapters.reverse();
+    let reordered = map_windows_adapter(adapter).expect("member order is irrelevant");
+    assert_eq!(
+        canonical[0].persistent_identity.as_bytes(),
+        reordered[0].persistent_identity.as_bytes()
+    );
+
+    let mut changed = windows_adapter(55, "unused");
+    changed.physical_adapters = vec![member(r"TEST\MEMBER\A"), member(r"TEST\MEMBER\C")];
+    let changed = map_windows_adapter(changed).expect("changed topology");
+    assert_ne!(
+        canonical[0].persistent_identity.as_bytes(),
+        changed[0].persistent_identity.as_bytes()
+    );
+
+    let large_identity = "X".repeat(198);
+    let mut overflow = windows_adapter(55, "unused");
+    overflow.physical_adapters = (0..6)
+        .map(|index| member(&format!("{index}{large_identity}")))
+        .collect();
+    assert_eq!(
+        map_windows_adapter(overflow).unwrap_err(),
+        DeviceError::Overflow
+    );
+}
+
+#[test]
+fn windows_mapping_excludes_software_and_uses_only_explicit_class_evidence() {
+    let mut software = windows_adapter(1, r"TEST\SOFTWARE");
+    software.is_hardware = Some(false);
+    software.physical_adapters.clear();
+    assert!(
+        map_windows_adapter(software)
+            .expect("software adapter excluded before mapping")
+            .is_empty()
+    );
+
+    let mut virtual_adapter = windows_adapter(2, r"TEST\VIRTUAL");
+    virtual_adapter.has_virtual_or_remote_evidence = true;
+    assert_eq!(
+        map_windows_adapter(virtual_adapter).unwrap()[0].class,
+        DeviceClass::Virtual
+    );
+
+    let mut unknown = windows_adapter(3, r"TEST\UNKNOWN");
+    unknown.is_integrated = None;
+    assert_eq!(
+        map_windows_adapter(unknown).unwrap()[0].class,
+        DeviceClass::Unknown
+    );
+
+    let mut discrete = windows_adapter(4, r"TEST\DISCRETE");
+    discrete.is_integrated = Some(false);
+    assert_eq!(
+        map_windows_adapter(discrete).unwrap()[0].class,
+        DeviceClass::Discrete
+    );
+}
+
+#[test]
+fn windows_missing_duplicate_and_stale_mappings_fail_closed() {
+    let mut missing = windows_adapter(1, "unused");
+    missing.physical_adapters.clear();
+    assert_eq!(
+        map_windows_adapter(missing).unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    let first = windows_adapter(2, r"TEST\DUPLICATE").physical_adapters[0].clone();
+    let mut second = first.clone();
+    second.physical_index = Some(1);
+    let mut duplicate = windows_adapter(2, "unused");
+    duplicate.physical_adapters = vec![first, second];
+    assert_eq!(
+        map_windows_adapter(duplicate).unwrap_err(),
+        DeviceError::Ambiguous
+    );
+
+    let mut stale = windows_adapter(3, r"TEST\STALE");
+    stale.physical_adapters[0].repeated_instance_id = r"TEST\REPLACED".encode_utf16().collect();
+    assert_eq!(
+        map_windows_adapter(stale).unwrap_err(),
+        DeviceError::Invalid
+    );
+
+    let first = windows_adapter(4, r"TEST\ONE");
+    let mut conflicting = first.clone();
+    conflicting.display_name = b"Different snapshot".to_vec();
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxCore {
+                d3d11_graphics: vec![first],
+                generic_media: Some(vec![conflicting]),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Ambiguous
+    );
+}
+
+#[test]
+fn windows_driver_completeness_and_cancellation_are_closed_boundaries() {
+    let complete =
+        map_windows_adapter(windows_adapter(1, r"TEST\COMPLETE")).expect("complete driver");
+    assert!(matches!(complete[0].driver, DriverRecord::Complete(_)));
+
+    let mut incomplete = windows_adapter(2, r"TEST\INCOMPLETE");
+    incomplete.physical_adapters[0].driver = WindowsDriverSnapshot::incomplete_for_test();
+    let incomplete = map_windows_adapter(incomplete).expect("incomplete is not fabricated");
+    assert_eq!(incomplete[0].driver, DriverRecord::Incomplete);
+
+    let mut oversized = windows_adapter(3, r"TEST\OVERSIZED");
+    oversized.physical_adapters[0].driver = WindowsDriverSnapshot::oversized_incomplete_for_test();
+    assert_eq!(
+        map_windows_adapter(oversized).unwrap_err(),
+        DeviceError::Overflow
+    );
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxgiFallback(vec![windows_adapter(4, r"TEST\CANCELLED")]),
+            &cancellation,
+        )
+        .unwrap_err(),
+        DeviceError::Cancelled
+    );
+}
+
+#[test]
+fn windows_linked_group_driver_is_incomplete_when_any_member_is_incomplete() {
+    let mut first = windows_adapter(71, r"TEST\GROUP\ONE")
+        .physical_adapters
+        .remove(0);
+    first.physical_index = None;
+    let mut second = windows_adapter(71, r"TEST\GROUP\TWO")
+        .physical_adapters
+        .remove(0);
+    second.physical_index = None;
+    second.driver = WindowsDriverSnapshot::incomplete_for_test();
+    let mut adapter = windows_adapter(71, "unused");
+    adapter.physical_adapters = vec![first, second];
+    let grouped = map_windows_adapter(adapter).expect("valid linked group");
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0].driver, DriverRecord::Incomplete);
+}
+
+#[test]
+fn windows_adapter_count_accepts_32_and_rejects_33_without_truncation() {
+    let candidates = (0..32)
+        .map(|index| windows_adapter(index, &format!(r"TEST\COUNT\{index}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxgiFallback(candidates.clone()),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("exact device bound")
+        .len(),
+        32
+    );
+    let mut overflow = candidates;
+    overflow.push(windows_adapter(32, r"TEST\COUNT\OVERFLOW"));
+    assert_eq!(
+        map_windows_records(
+            WindowsCandidateLists::DxgiFallback(overflow),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err(),
+        DeviceError::Overflow
+    );
+}
+
+#[test]
+fn windows_vendor_backend_aliases_are_static_candidates_not_codec_proof() {
+    for (vendor_id, vendor, backends) in [
+        (
+            Some(0x8086),
+            Vendor::Intel,
+            vec![BackendKind::D3d11va, BackendKind::Qsv],
+        ),
+        (
+            Some(0x10de),
+            Vendor::Nvidia,
+            vec![BackendKind::Cuda, BackendKind::D3d11va, BackendKind::Nvenc],
+        ),
+        (
+            Some(0x1002),
+            Vendor::Amd,
+            vec![BackendKind::Amf, BackendKind::D3d11va],
+        ),
+        (None, Vendor::Unknown, vec![BackendKind::D3d11va]),
+    ] {
+        let mut adapter = windows_adapter(88, "TEST");
+        adapter.vendor_id = vendor_id;
+        let record = map_windows_adapter(adapter).unwrap().remove(0);
+        assert_eq!(record.vendor, vendor);
+        assert_eq!(record.backends, backends);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn native_windows_no_gpu_is_valid() {
+    let records = WindowsDeviceEnumerator
+        .enumerate(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("native Windows discovery degrades to an empty inventory without a GPU");
+    assert!(records.len() <= 32);
+    assert_eq!(native_open_handle_count_for_test(), 0);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        WindowsDeviceEnumerator
+            .enumerate(cancellation)
+            .await
+            .unwrap_err(),
+        DeviceError::Cancelled
+    );
+    assert_eq!(native_open_handle_count_for_test(), 0);
+    for result in [
+        Ok(()),
+        Err(DeviceError::Invalid),
+        Err(DeviceError::Cancelled),
+        Err(DeviceError::Overflow),
+        Err(DeviceError::Ambiguous),
+    ] {
+        let expected = result;
+        assert_eq!(exercise_native_handle_exit_for_test(result), expected);
+        assert_eq!(native_open_handle_count_for_test(), 0);
+    }
 }
 
 #[test]

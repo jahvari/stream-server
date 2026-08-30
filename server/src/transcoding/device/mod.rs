@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::{collections::BTreeSet, collections::HashSet, fmt};
 
 pub(crate) mod identity;
+#[cfg(any(windows, test))]
+mod windows;
 #[cfg(test)]
 pub(crate) use identity::DriverField;
 use identity::{
