@@ -212,7 +212,7 @@ impl fmt::Display for DriverRunEpoch {
     }
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DriverIdentity {
     digest: [u8; 32],
     persistable: bool,
@@ -226,6 +226,14 @@ impl DriverIdentity {
     #[cfg(test)]
     pub(crate) fn as_test_digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_digest(digest: [u8; 32], persistable: bool) -> Self {
+        Self {
+            digest,
+            persistable,
+        }
     }
 }
 

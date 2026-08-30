@@ -6,7 +6,7 @@ const DEVICE_ID_PREFIX: &str = "gpu1_";
 const DEVICE_ID_DIGEST_BYTES: usize = 20;
 const DEVICE_ID_SUFFIX_BYTES: usize = 27;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize)]
 #[serde(transparent)]
 /// A validated version-one opaque public device identifier.
 ///
@@ -228,7 +228,7 @@ impl VideoStage {
 ///     denominator: NonZeroU32::new(2_000).unwrap(),
 /// };
 /// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RationalRate {
     numerator: u32,
@@ -275,7 +275,7 @@ impl RationalRate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FrameRateClass {
     Constant,
@@ -453,7 +453,7 @@ impl RateControlEnvelope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KeyframeStrategy {
     FixedGop { frames: NonZeroU32 },
