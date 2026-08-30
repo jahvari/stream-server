@@ -5,8 +5,9 @@ pub mod codec;
 ///
 /// ```compile_fail
 /// use stream_server::transcoding::device::identity::{
-///     DeviceIdSeed, PrivateDeviceIdentity,
+///     DeviceIdSeed, DriverIdentity, PrivateDeviceIdentity,
 /// };
+/// use stream_server::transcoding::device::DeviceLocator;
 /// ```
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod device;

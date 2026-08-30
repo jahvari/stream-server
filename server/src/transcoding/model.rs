@@ -74,7 +74,7 @@ pub enum DeviceClass {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BackendKind {
     Amf,
