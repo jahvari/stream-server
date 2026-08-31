@@ -564,7 +564,7 @@ fn linux_native_permission_denied_is_reported_without_mutating_access() {
     let temporary = tempfile::tempdir().unwrap();
     create_linux_native_fixture(temporary.path(), "renderD9");
     let dev_root = temporary.path().join("dev-dri");
-    std::fs::set_permissions(&dev_root, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&dev_root, std::fs::Permissions::from_mode(0o0)).unwrap();
     let result = native_fixture_for_test(
         temporary.path(),
         &tokio_util::sync::CancellationToken::new(),
