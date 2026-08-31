@@ -2180,7 +2180,20 @@ async fn cache_storage_replacement_failure_is_closed_and_preserves_the_wrong_obj
 }
 
 fn new_config_directory() -> tempfile::TempDir {
-    tempfile::tempdir().expect("isolated config directory")
+    #[cfg(windows)]
+    {
+        // Windows hosted-runner temp roots can contain reparse aliases. The
+        // production storage policy correctly rejects those paths, so keep
+        // protected-storage fixtures under the checked-out workspace.
+        tempfile::Builder::new()
+            .prefix(".stream-server-protected-test-")
+            .tempdir_in(std::env::current_dir().expect("test workspace directory"))
+            .expect("isolated protected config directory")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("isolated config directory")
+    }
 }
 
 #[test]
