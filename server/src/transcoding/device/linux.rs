@@ -1223,8 +1223,9 @@ mod native {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) use native::LinuxDeviceEnumerator;
 #[cfg(all(target_os = "linux", test))]
 pub(super) use native::{
-    LinuxDeviceEnumerator, native_fixture_for_test, native_fixture_with_hook_for_test,
-    native_no_gpu_for_test,
+    native_fixture_for_test, native_fixture_with_hook_for_test, native_no_gpu_for_test,
 };

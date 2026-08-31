@@ -1,6 +1,6 @@
 use crate::transcoding::{BackendKind, DeviceClass, DeviceId};
 use serde::Serialize;
-use std::{collections::BTreeSet, collections::HashSet, fmt};
+use std::{collections::BTreeSet, collections::HashSet, fmt, sync::Arc};
 
 pub(crate) mod identity;
 #[cfg(any(target_os = "linux", test))]
@@ -222,6 +222,25 @@ pub(crate) trait DeviceEnumerator: Send + Sync {
         &self,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<DeviceDiscovery, DeviceError>;
+}
+
+pub(crate) fn production_device_enumerator() -> Arc<dyn DeviceEnumerator> {
+    #[cfg(windows)]
+    {
+        Arc::new(windows::WindowsDeviceEnumerator)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(linux::LinuxDeviceEnumerator)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(macos::MacosDeviceEnumerator)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        Arc::new(macos::UnsupportedDeviceEnumerator)
+    }
 }
 
 #[derive(Clone)]

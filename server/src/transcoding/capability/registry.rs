@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
     panic::AssertUnwindSafe,
+    path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,7 +14,18 @@ use futures_util::FutureExt;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::transcoding::{CapabilityState, device::DeviceAvailability};
+use crate::transcoding::{
+    CapabilityState,
+    device::{
+        DeviceAvailability, DeviceDiscoveryStatus, DeviceEnumerator, DeviceError, DriverRunEpoch,
+        identity::DeviceIdSeed, normalize_platform_records, production_device_enumerator,
+    },
+    inventory::{
+        InventoryError, PairedRuntimeInventorySource, StaticInventorySource, coarse_candidates,
+    },
+    runtime::TranscodingService,
+    runtime_manifest::RuntimeError,
+};
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -24,6 +36,7 @@ use super::{
         EvidenceOutcome, EvidenceReason, EvidenceRecord, EvidenceTarget, EvidenceTimestamp,
         StateNow, VerificationResult, VerifierMode,
     },
+    storage::{EvidenceStorage, StorageStatus, load_or_create_device_seed},
 };
 use crate::transcoding::{
     device::TranscodingDevice,
@@ -42,9 +55,11 @@ const MAX_QUEUED_KEYS: usize = 64;
 const MAX_ACTIVE_GLOBAL: usize = 4;
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MANUAL_REFRESH_WINDOW: Duration = Duration::from_secs(60);
+const REFRESH_WORKER_DEADLINE: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SnapshotFreshness {
+pub(crate) enum SnapshotFreshness {
     Uninitialized,
     Refreshing,
     Fresh,
@@ -54,6 +69,39 @@ pub(super) enum SnapshotFreshness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RefreshMetadata {
     pub(super) state: RefreshState,
+    pub(super) id: Option<u64>,
+    pub(super) cause: Option<RefreshCause>,
+    pub(super) started_at: Option<EvidenceTimestamp>,
+    pub(super) completed_at: Option<EvidenceTimestamp>,
+    pub(super) outcome_reason: Option<RefreshOutcomeReason>,
+    pub(super) persistence_status: StorageStatus,
+}
+
+impl RefreshMetadata {
+    fn idle(persistence_status: StorageStatus) -> Self {
+        Self {
+            state: RefreshState::Idle,
+            id: None,
+            cause: None,
+            started_at: None,
+            completed_at: None,
+            outcome_reason: None,
+            persistence_status,
+        }
+    }
+
+    #[cfg(test)]
+    fn succeeded_for_test() -> Self {
+        Self {
+            state: RefreshState::Succeeded,
+            id: Some(1),
+            cause: Some(RefreshCause::Startup),
+            started_at: Some(EvidenceTimestamp::new(0).expect("zero is bounded")),
+            completed_at: Some(EvidenceTimestamp::new(1).expect("one is bounded")),
+            outcome_reason: None,
+            persistence_status: StorageStatus::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,8 +113,91 @@ pub(super) enum RefreshState {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefreshCause {
+    Startup,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RefreshOutcomeReason {
+    PlatformUnsupported,
+    DeviceIdentityUnavailable,
+    DeviceMappingAmbiguous,
+    DeviceEnumerationFailed,
+    RuntimeUnavailable,
+    InventoryTimeout,
+    InventoryOverflow,
+    InventoryMalformed,
+    InventoryProcessFailed,
+    RefreshCancelled,
+    RefreshFailed,
+}
+
+impl RefreshOutcomeReason {
+    #[allow(dead_code)]
+    pub(super) const fn safe_code(self) -> &'static str {
+        match self {
+            Self::PlatformUnsupported => "platform_unsupported",
+            Self::DeviceIdentityUnavailable => "device_identity_unavailable",
+            Self::DeviceMappingAmbiguous => "device_mapping_ambiguous",
+            Self::DeviceEnumerationFailed => "device_enumeration_failed",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::InventoryTimeout => "inventory_timeout",
+            Self::InventoryOverflow => "inventory_overflow",
+            Self::InventoryMalformed => "inventory_malformed",
+            Self::InventoryProcessFailed => "inventory_process_failed",
+            Self::RefreshCancelled => "refresh_cancelled",
+            Self::RefreshFailed => "refresh_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefreshAdmission {
+    Started { id: u64 },
+    Existing { id: u64 },
+    RateLimited { retry_after_seconds: u64 },
+    Rejected { reason: RegistryReason },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshFailure {
+    Cancelled,
+    Device(DeviceError),
+    Inventory(InventoryError),
+    RuntimeUnavailable,
+    SnapshotInvalid,
+}
+
+impl RefreshFailure {
+    const fn outcome_reason(self) -> RefreshOutcomeReason {
+        match self {
+            Self::Cancelled | Self::Device(DeviceError::Cancelled) => {
+                RefreshOutcomeReason::RefreshCancelled
+            }
+            Self::Device(DeviceError::Ambiguous) => RefreshOutcomeReason::DeviceMappingAmbiguous,
+            Self::Device(DeviceError::Overflow) => RefreshOutcomeReason::InventoryOverflow,
+            Self::Device(DeviceError::Invalid) => RefreshOutcomeReason::DeviceEnumerationFailed,
+            Self::Inventory(InventoryError::Timeout) => RefreshOutcomeReason::InventoryTimeout,
+            Self::Inventory(InventoryError::Bounds) => RefreshOutcomeReason::InventoryOverflow,
+            Self::Inventory(InventoryError::IdentityMismatch | InventoryError::Malformed) => {
+                RefreshOutcomeReason::InventoryMalformed
+            }
+            Self::Inventory(InventoryError::ProcessFailed) => {
+                RefreshOutcomeReason::InventoryProcessFailed
+            }
+            Self::Inventory(InventoryError::RuntimeChanged) | Self::RuntimeUnavailable => {
+                RefreshOutcomeReason::RuntimeUnavailable
+            }
+            Self::Inventory(InventoryError::Cancelled) => RefreshOutcomeReason::RefreshCancelled,
+            Self::SnapshotInvalid => RefreshOutcomeReason::RefreshFailed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub(super) struct CapabilitySnapshot {
+pub(crate) struct CapabilitySnapshot {
     freshness: SnapshotFreshness,
     identity_epoch: u64,
     publication_revision: u64,
@@ -117,7 +248,7 @@ impl CapabilitySnapshot {
         &self.evidence
     }
 
-    pub(super) const fn freshness(&self) -> SnapshotFreshness {
+    pub(crate) const fn freshness(&self) -> SnapshotFreshness {
         self.freshness
     }
 
@@ -127,6 +258,16 @@ impl CapabilitySnapshot {
 
     pub(super) const fn publication_revision(&self) -> u64 {
         self.publication_revision
+    }
+
+    #[cfg(test)]
+    pub(super) fn devices_for_test(&self) -> &[TranscodingDevice] {
+        &self.devices
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_for_test(&self) -> Option<&RuntimeInventory> {
+        self.runtime.as_ref()
     }
 
     fn validate(&self, now: StateNow) -> Result<(), SnapshotError> {
@@ -301,7 +442,7 @@ pub(super) struct RegistryPublication {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RegistryReason {
+pub(crate) enum RegistryReason {
     VerificationNotImplemented,
     VerificationStale,
     VerificationPrerequisiteMissing,
@@ -492,6 +633,80 @@ impl FlightState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EmptyDeviceEnumerator;
+
+#[async_trait]
+impl DeviceEnumerator for EmptyDeviceEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, DeviceError> {
+        if cancellation.is_cancelled() {
+            Err(DeviceError::Cancelled)
+        } else {
+            Ok(crate::transcoding::device::DeviceDiscovery::supported(
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+struct RefreshDependencies {
+    enumerator: Arc<dyn DeviceEnumerator>,
+    inventory: Arc<dyn StaticInventorySource>,
+    seed: Option<DeviceIdSeed>,
+    driver_run_epoch: Option<DriverRunEpoch>,
+    storage: Arc<EvidenceStorage>,
+    worker_deadline: Duration,
+}
+
+impl RefreshDependencies {
+    fn ephemeral() -> Self {
+        Self {
+            enumerator: Arc::new(EmptyDeviceEnumerator),
+            inventory: Arc::new(PairedRuntimeInventorySource),
+            seed: None,
+            driver_run_epoch: None,
+            storage: Arc::new(EvidenceStorage::disabled(
+                StorageStatus::Unavailable,
+                CancellationToken::new(),
+            )),
+            worker_deadline: REFRESH_WORKER_DEADLINE,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RunningRefresh {
+    id: u64,
+    cause: RefreshCause,
+    epoch: u64,
+    admitted_revision: u64,
+}
+
+#[derive(Default)]
+struct RefreshControl {
+    next_id: u64,
+    running: Option<RunningRefresh>,
+    startup_id: Option<u64>,
+    last_manual_monotonic_ms: Option<u64>,
+}
+
+struct RefreshInvalidation {
+    epoch: u64,
+    admitted_revision: u64,
+    previous: Arc<CapabilitySnapshot>,
+}
+
+struct RefreshCandidate {
+    runtime: Option<RuntimeInventory>,
+    devices: Vec<TranscodingDevice>,
+    candidates: Vec<CoarseCandidate>,
+    evidence: BTreeMap<CapabilityKey, EvidenceRecord>,
+    outcome_reason: Option<RefreshOutcomeReason>,
+}
+
 struct RegistryShared {
     publication: RwLock<RegistryPublication>,
     flights: Mutex<FlightState>,
@@ -503,10 +718,14 @@ struct RegistryShared {
     global_semaphore: Arc<Semaphore>,
     tasks: TaskTracker,
     flights_changed: Notify,
+    refresh: Mutex<RefreshControl>,
+    refresh_changed: Notify,
+    refresh_dependencies: RefreshDependencies,
+    lifecycle_gate: StdMutex<()>,
     shutdown: CancellationToken,
 }
 
-pub(super) struct CapabilityRegistry {
+pub(crate) struct CapabilityRegistry {
     shared: Arc<RegistryShared>,
 }
 
@@ -518,12 +737,179 @@ impl CapabilityRegistry {
             Arc::new(SystemRegistryClock::new()),
             RegistryPublication {
                 snapshot: Arc::new(CapabilitySnapshot::uninitialized()),
-                refresh: RefreshMetadata {
-                    state: RefreshState::Idle,
-                },
+                refresh: RefreshMetadata::idle(StorageStatus::Unavailable),
             },
             0,
         )
+    }
+
+    pub(crate) fn uninitialized() -> Arc<Self> {
+        Arc::new(Self::new(Arc::new(UnknownVerifier)))
+    }
+
+    pub(crate) async fn production(config_directory: PathBuf) -> Arc<Self> {
+        let seed_directory = config_directory.clone();
+        let seed_cancellation = CancellationToken::new();
+        let seed_worker_cancellation = seed_cancellation.clone();
+        let seed = tokio::task::spawn_blocking(move || {
+            load_or_create_device_seed(&seed_directory, &seed_worker_cancellation)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let driver_run_epoch = DriverRunEpoch::generate().ok();
+        let storage = Arc::new(
+            EvidenceStorage::open(config_directory, seed_cancellation.child_token()).await,
+        );
+        Arc::new(Self::with_publication_and_dependencies(
+            Arc::new(UnknownVerifier),
+            Arc::new(NoPlaybackPriority),
+            Arc::new(SystemRegistryClock::new()),
+            RegistryPublication {
+                snapshot: Arc::new(CapabilitySnapshot::uninitialized()),
+                refresh: RefreshMetadata::idle(storage.status()),
+            },
+            0,
+            RefreshDependencies {
+                enumerator: production_device_enumerator(),
+                inventory: Arc::new(PairedRuntimeInventorySource),
+                seed,
+                driver_run_epoch,
+                storage,
+                worker_deadline: REFRESH_WORKER_DEADLINE,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ephemeral_for_test() -> Arc<Self> {
+        Self::uninitialized()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_refresh_dependencies_for_test(
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+        seed: Option<DeviceIdSeed>,
+        driver_run_epoch: Option<DriverRunEpoch>,
+    ) -> Arc<Self> {
+        Self::with_refresh_dependencies_and_deadline_for_test(
+            enumerator,
+            inventory,
+            seed,
+            driver_run_epoch,
+            REFRESH_WORKER_DEADLINE,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_refresh_dependencies_and_clock_for_test(
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+        seed: Option<DeviceIdSeed>,
+        driver_run_epoch: Option<DriverRunEpoch>,
+    ) -> (Arc<Self>, TestRegistryClock) {
+        let clock = TestRegistryClock::new();
+        let registry = Arc::new(Self::with_publication_and_dependencies(
+            Arc::new(UnknownVerifier),
+            Arc::new(NoPlaybackPriority),
+            Arc::new(clock.clone()),
+            RegistryPublication {
+                snapshot: Arc::new(CapabilitySnapshot::uninitialized()),
+                refresh: RefreshMetadata::idle(StorageStatus::Unavailable),
+            },
+            0,
+            RefreshDependencies {
+                enumerator,
+                inventory,
+                seed,
+                driver_run_epoch,
+                storage: Arc::new(EvidenceStorage::disabled(
+                    StorageStatus::Unavailable,
+                    CancellationToken::new(),
+                )),
+                worker_deadline: REFRESH_WORKER_DEADLINE,
+            },
+        ));
+        (registry, clock)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_refresh_dependencies_and_storage_status_for_test(
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+        seed: Option<DeviceIdSeed>,
+        driver_run_epoch: Option<DriverRunEpoch>,
+        storage_status: StorageStatus,
+    ) -> Arc<Self> {
+        Arc::new(Self::with_publication_and_dependencies(
+            Arc::new(UnknownVerifier),
+            Arc::new(NoPlaybackPriority),
+            Arc::new(FixedRegistryClock),
+            RegistryPublication {
+                snapshot: Arc::new(CapabilitySnapshot::uninitialized()),
+                refresh: RefreshMetadata::idle(storage_status),
+            },
+            0,
+            RefreshDependencies {
+                enumerator,
+                inventory,
+                seed,
+                driver_run_epoch,
+                storage: Arc::new(EvidenceStorage::disabled(
+                    storage_status,
+                    CancellationToken::new(),
+                )),
+                worker_deadline: REFRESH_WORKER_DEADLINE,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_persist_failed_storage_for_test(
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+        seed: Option<DeviceIdSeed>,
+        driver_run_epoch: Option<DriverRunEpoch>,
+    ) -> Arc<Self> {
+        Self::with_refresh_dependencies_and_storage_status_for_test(
+            enumerator,
+            inventory,
+            seed,
+            driver_run_epoch,
+            StorageStatus::PersistFailed,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_refresh_dependencies_and_deadline_for_test(
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+        seed: Option<DeviceIdSeed>,
+        driver_run_epoch: Option<DriverRunEpoch>,
+        worker_deadline: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self::with_publication_and_dependencies(
+            Arc::new(UnknownVerifier),
+            Arc::new(NoPlaybackPriority),
+            Arc::new(FixedRegistryClock),
+            RegistryPublication {
+                snapshot: Arc::new(CapabilitySnapshot::uninitialized()),
+                refresh: RefreshMetadata::idle(StorageStatus::Unavailable),
+            },
+            0,
+            RefreshDependencies {
+                enumerator,
+                inventory,
+                seed,
+                driver_run_epoch,
+                storage: Arc::new(EvidenceStorage::disabled(
+                    StorageStatus::Unavailable,
+                    CancellationToken::new(),
+                )),
+                worker_deadline,
+            },
+        ))
     }
 
     fn with_publication(
@@ -532,6 +918,24 @@ impl CapabilityRegistry {
         clock: Arc<dyn RegistryClock>,
         publication: RegistryPublication,
         identity_epoch: u64,
+    ) -> Self {
+        Self::with_publication_and_dependencies(
+            verifier,
+            playback,
+            clock,
+            publication,
+            identity_epoch,
+            RefreshDependencies::ephemeral(),
+        )
+    }
+
+    fn with_publication_and_dependencies(
+        verifier: Arc<dyn CapabilityVerifier>,
+        playback: Arc<dyn PlaybackPriority>,
+        clock: Arc<dyn RegistryClock>,
+        publication: RegistryPublication,
+        identity_epoch: u64,
+        refresh_dependencies: RefreshDependencies,
     ) -> Self {
         Self {
             shared: Arc::new(RegistryShared {
@@ -545,12 +949,16 @@ impl CapabilityRegistry {
                 global_semaphore: Arc::new(Semaphore::new(MAX_ACTIVE_GLOBAL)),
                 tasks: TaskTracker::new(),
                 flights_changed: Notify::new(),
+                refresh: Mutex::new(RefreshControl::default()),
+                refresh_changed: Notify::new(),
+                refresh_dependencies,
+                lifecycle_gate: StdMutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
         }
     }
 
-    pub(super) async fn snapshot(&self) -> Arc<CapabilitySnapshot> {
+    pub(crate) async fn snapshot(&self) -> Arc<CapabilitySnapshot> {
         Arc::clone(&self.shared.publication.read().await.snapshot)
     }
 
@@ -651,18 +1059,58 @@ impl CapabilityRegistry {
         flights.flights.insert(key.clone(), Arc::clone(&flight));
         drop(flights);
 
-        let shared = Arc::clone(&self.shared);
-        self.shared.tasks.spawn(async move {
-            run_verification(shared, key, flight, device_semaphore).await;
-        });
+        let mut pending_task = Some((key, flight, device_semaphore));
+        let spawned = {
+            let _lifecycle = self
+                .shared
+                .lifecycle_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.shared.shutdown.is_cancelled() {
+                false
+            } else {
+                let (task_key, task_flight, task_device_semaphore) = pending_task
+                    .take()
+                    .expect("verification task ownership is present");
+                let shared = Arc::clone(&self.shared);
+                self.shared.tasks.spawn(async move {
+                    run_verification(shared, task_key, task_flight, task_device_semaphore).await;
+                });
+                true
+            }
+        };
+        if !spawned {
+            let (key, flight, device_semaphore) = pending_task
+                .take()
+                .expect("unspawned verification ownership is present");
+            decrement_queued(&self.shared).await;
+            let result = EnsureEvidenceResult::non_passing(RegistryReason::ServerShutdown);
+            finish_flight(
+                &self.shared,
+                &key,
+                &flight,
+                &device_semaphore,
+                result.clone(),
+            )
+            .await;
+            return result;
+        }
         wait_for_flight(receiver, self.shared.shutdown.clone()).await
     }
 
-    pub(super) fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
+        let _lifecycle = self
+            .shared
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.shared.shutdown.cancel();
+        self.shared.tasks.close();
+        self.shared.refresh_dependencies.storage.begin_shutdown();
+        self.shared.refresh_changed.notify_waiters();
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
         let cancellations = {
             let mut flights = self.shared.flights.lock().await;
@@ -676,8 +1124,8 @@ impl CapabilityRegistry {
         for cancellation in cancellations {
             cancellation.cancel();
         }
-        self.shared.tasks.close();
         self.shared.tasks.wait().await;
+        self.shared.refresh_dependencies.storage.shutdown().await;
     }
 
     #[cfg(test)]
@@ -686,6 +1134,52 @@ impl CapabilityRegistry {
         verifier: impl CapabilityVerifier + 'static,
     ) -> Self {
         Self::fresh_for_test_with(key, verifier, Arc::new(NoPlaybackPriority))
+    }
+
+    #[cfg(test)]
+    pub(super) fn circuit_open_with_refresh_dependencies_for_test(
+        key: CapabilityKey,
+        enumerator: Arc<dyn DeviceEnumerator>,
+        inventory: Arc<dyn StaticInventorySource>,
+    ) -> Arc<Self> {
+        let mut snapshot = test_snapshot_for_keys(std::slice::from_ref(&key));
+        let now = StateNow::from_test_minutes(0);
+        let mut record = EvidenceRecord::new(key.clone());
+        record
+            .apply(
+                VerificationResult::for_test(
+                    EvidenceTarget::Correctness,
+                    EvidenceOutcome::TemporaryFailure,
+                    EvidenceReason::VerificationFailed,
+                    0,
+                ),
+                VerifierMode::ActiveInjected,
+                now,
+            )
+            .expect("valid circuit-open fixture");
+        snapshot.evidence.insert(key, record);
+        snapshot.validate(now).expect("valid circuit-open snapshot");
+        Arc::new(Self::with_publication_and_dependencies(
+            Arc::new(UnknownVerifier),
+            Arc::new(NoPlaybackPriority),
+            Arc::new(FixedRegistryClock),
+            RegistryPublication {
+                snapshot: Arc::new(snapshot),
+                refresh: RefreshMetadata::succeeded_for_test(),
+            },
+            1,
+            RefreshDependencies {
+                enumerator,
+                inventory,
+                seed: None,
+                driver_run_epoch: None,
+                storage: Arc::new(EvidenceStorage::disabled(
+                    StorageStatus::Unavailable,
+                    CancellationToken::new(),
+                )),
+                worker_deadline: REFRESH_WORKER_DEADLINE,
+            },
+        ))
     }
 
     #[cfg(test)]
@@ -790,9 +1284,7 @@ impl CapabilityRegistry {
             Arc::new(FixedRegistryClock),
             RegistryPublication {
                 snapshot: Arc::new(snapshot),
-                refresh: RefreshMetadata {
-                    state: RefreshState::Succeeded,
-                },
+                refresh: RefreshMetadata::succeeded_for_test(),
             },
             1,
         )
@@ -841,9 +1333,7 @@ impl CapabilityRegistry {
             Arc::new(clock.clone()),
             RegistryPublication {
                 snapshot: Arc::new(snapshot),
-                refresh: RefreshMetadata {
-                    state: RefreshState::Succeeded,
-                },
+                refresh: RefreshMetadata::succeeded_for_test(),
             },
             1,
         );
@@ -926,7 +1416,113 @@ impl CapabilityRegistry {
         publication.snapshot = Arc::new(snapshot);
     }
 
-    pub(super) async fn begin_refresh_invalidation(&self) -> Result<u64, RegistryReason> {
+    pub(crate) async fn start_refresh(
+        self: &Arc<Self>,
+        service: Weak<TranscodingService>,
+        cause: RefreshCause,
+    ) -> RefreshAdmission {
+        if self.shared.shutdown.is_cancelled() {
+            return RefreshAdmission::Rejected {
+                reason: RegistryReason::ServerShutdown,
+            };
+        }
+        if self.shared.capacity_exhausted.is_cancelled() {
+            return RefreshAdmission::Rejected {
+                reason: RegistryReason::CapacityExhausted,
+            };
+        }
+        let now = match self.shared.clock.now() {
+            Ok(now) => now,
+            Err(reason) => return RefreshAdmission::Rejected { reason },
+        };
+        let mut refresh = self.shared.refresh.lock().await;
+        if let Some(running) = refresh.running {
+            return RefreshAdmission::Existing { id: running.id };
+        }
+        if cause == RefreshCause::Startup
+            && let Some(id) = refresh.startup_id
+        {
+            return RefreshAdmission::Existing { id };
+        }
+        if cause == RefreshCause::Manual
+            && let Some(last) = refresh.last_manual_monotonic_ms
+        {
+            let elapsed = now.monotonic_milliseconds().saturating_sub(last);
+            let window_ms =
+                u64::try_from(MANUAL_REFRESH_WINDOW.as_millis()).unwrap_or(MAX_SAFE_INTEGER);
+            if elapsed < window_ms {
+                return RefreshAdmission::RateLimited {
+                    retry_after_seconds: window_ms.saturating_sub(elapsed).div_ceil(1_000),
+                };
+            }
+        }
+        let Some(id) = refresh
+            .next_id
+            .checked_add(1)
+            .filter(|id| *id <= MAX_SAFE_INTEGER)
+        else {
+            self.shared.capacity_exhausted.cancel();
+            return RefreshAdmission::Rejected {
+                reason: RegistryReason::CapacityExhausted,
+            };
+        };
+        let invalidation = match self.admit_refresh_invalidation(id, cause).await {
+            Ok(invalidation) => invalidation,
+            Err(reason) => return RefreshAdmission::Rejected { reason },
+        };
+        refresh.next_id = id;
+        if cause == RefreshCause::Startup {
+            refresh.startup_id = Some(id);
+        } else {
+            refresh.last_manual_monotonic_ms = Some(now.monotonic_milliseconds());
+        }
+        let running = RunningRefresh {
+            id,
+            cause,
+            epoch: invalidation.epoch,
+            admitted_revision: invalidation.admitted_revision,
+        };
+        refresh.running = Some(running);
+        drop(refresh);
+
+        let spawned = {
+            let _lifecycle = self
+                .shared
+                .lifecycle_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.shared.shutdown.is_cancelled() {
+                false
+            } else {
+                let shared = Arc::clone(&self.shared);
+                let previous = Arc::clone(&invalidation.previous);
+                self.shared.tasks.spawn(async move {
+                    run_refresh(shared, service, running, previous).await;
+                });
+                true
+            }
+        };
+        if !spawned {
+            publish_failed_refresh(
+                &self.shared,
+                running,
+                &invalidation.previous,
+                true,
+                RefreshOutcomeReason::RefreshCancelled,
+            )
+            .await;
+            return RefreshAdmission::Rejected {
+                reason: RegistryReason::ServerShutdown,
+            };
+        }
+        RefreshAdmission::Started { id }
+    }
+
+    async fn admit_refresh_invalidation(
+        &self,
+        refresh_id: u64,
+        cause: RefreshCause,
+    ) -> Result<RefreshInvalidation, RegistryReason> {
         if self.shared.shutdown.is_cancelled() {
             return Err(RegistryReason::ServerShutdown);
         }
@@ -983,6 +1579,7 @@ impl CapabilityRegistry {
             return Err(RegistryReason::CapacityExhausted);
         };
         let now = self.shared.clock.now()?;
+        let previous = Arc::clone(&publication.snapshot);
         let refreshing = CapabilitySnapshot::from_parts(
             SnapshotFreshness::Refreshing,
             next_epoch,
@@ -997,15 +1594,488 @@ impl CapabilityRegistry {
         flights.admission_paused = true;
         flights.identity_epoch = next_epoch;
         publication.snapshot = Arc::new(refreshing);
-        publication.refresh.state = RefreshState::Running;
+        publication.refresh = RefreshMetadata {
+            state: RefreshState::Running,
+            id: Some(refresh_id),
+            cause: Some(cause),
+            started_at: Some(now.wall()),
+            completed_at: None,
+            outcome_reason: None,
+            persistence_status: self.shared.refresh_dependencies.storage.status(),
+        };
         drop(publication);
         drop(flights);
         for cancellation in cancellations {
             cancellation.cancel();
         }
-        wait_for_all_flights(&self.shared).await;
-        Ok(next_epoch)
+        Ok(RefreshInvalidation {
+            epoch: next_epoch,
+            admitted_revision: next_revision,
+            previous,
+        })
     }
+
+    pub(super) async fn begin_refresh_invalidation(&self) -> Result<u64, RegistryReason> {
+        let invalidation = self
+            .admit_refresh_invalidation(1, RefreshCause::Startup)
+            .await?;
+        wait_for_all_flights(&self.shared).await;
+        Ok(invalidation.epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_refresh_for_test(&self) {
+        loop {
+            let changed = self.shared.refresh_changed.notified();
+            if self.shared.refresh.lock().await.running.is_none() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn exhaust_refresh_counter_for_test(&self) {
+        if let Ok(mut refresh) = self.shared.refresh.try_lock() {
+            refresh.next_id = MAX_SAFE_INTEGER;
+        } else {
+            panic!("test refresh control unexpectedly locked");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn refresh_persistence_status_for_test(&self) -> StorageStatus {
+        self.shared
+            .publication
+            .read()
+            .await
+            .refresh
+            .persistence_status
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn refresh_persistence_failed_for_test(&self) -> bool {
+        self.refresh_persistence_status_for_test().await == StorageStatus::PersistFailed
+    }
+}
+
+async fn run_refresh(
+    shared: Arc<RegistryShared>,
+    service: Weak<TranscodingService>,
+    running: RunningRefresh,
+    previous: Arc<CapabilitySnapshot>,
+) {
+    let cancellation = shared.shutdown.child_token();
+    let completed = AssertUnwindSafe(run_refresh_inner(
+        &shared,
+        service,
+        running,
+        previous.as_ref(),
+        cancellation.clone(),
+    ))
+    .catch_unwind()
+    .await;
+    if completed.is_err() {
+        cancellation.cancel();
+        let cancelled = shared.shutdown.is_cancelled();
+        publish_failed_refresh(
+            &shared,
+            running,
+            &previous,
+            cancelled,
+            if cancelled {
+                RefreshOutcomeReason::RefreshCancelled
+            } else {
+                RefreshOutcomeReason::RefreshFailed
+            },
+        )
+        .await;
+    }
+}
+
+async fn run_refresh_inner(
+    shared: &RegistryShared,
+    service: Weak<TranscodingService>,
+    running: RunningRefresh,
+    previous: &CapabilitySnapshot,
+    cancellation: CancellationToken,
+) {
+    let deadline_at = tokio::time::Instant::now() + shared.refresh_dependencies.worker_deadline;
+    let work = async {
+        wait_for_all_flights(shared).await;
+        build_refresh_candidate(shared, service, running, previous, cancellation.clone()).await
+    };
+    tokio::pin!(work);
+    let deadline = tokio::time::sleep_until(deadline_at);
+    tokio::pin!(deadline);
+    let result = tokio::select! {
+        result = &mut work => result,
+        () = shared.shutdown.cancelled() => {
+            cancellation.cancel();
+            let _ = work.await;
+            Err(RefreshFailure::Cancelled)
+        }
+        () = &mut deadline => {
+            cancellation.cancel();
+            let _ = work.await;
+            Err(RefreshFailure::Inventory(InventoryError::Timeout))
+        }
+    };
+    match result {
+        Ok(candidate) if !shared.shutdown.is_cancelled() => {
+            publish_fresh_refresh(shared, running, previous, candidate, deadline_at).await;
+        }
+        Ok(_) | Err(RefreshFailure::Cancelled | RefreshFailure::Device(DeviceError::Cancelled)) => {
+            publish_failed_refresh(
+                shared,
+                running,
+                previous,
+                true,
+                RefreshOutcomeReason::RefreshCancelled,
+            )
+            .await;
+        }
+        Err(failure) => {
+            let reason = failure.outcome_reason();
+            publish_failed_refresh(shared, running, previous, false, reason).await;
+        }
+    }
+}
+
+async fn build_refresh_candidate(
+    shared: &RegistryShared,
+    service: Weak<TranscodingService>,
+    running: RunningRefresh,
+    previous: &CapabilitySnapshot,
+    cancellation: CancellationToken,
+) -> Result<RefreshCandidate, RefreshFailure> {
+    if cancellation.is_cancelled() {
+        return Err(RefreshFailure::Cancelled);
+    }
+    let service = service.upgrade().ok_or(RefreshFailure::Cancelled)?;
+    let session_result = service.runtime_for_session().await;
+    drop(service);
+    let session = match session_result {
+        Ok(session) => Some(session),
+        Err(RuntimeError::Unavailable) => None,
+        Err(_) => return Err(RefreshFailure::RuntimeUnavailable),
+    };
+    if cancellation.is_cancelled() {
+        return Err(RefreshFailure::Cancelled);
+    }
+    let discovery = shared
+        .refresh_dependencies
+        .enumerator
+        .enumerate(cancellation.child_token())
+        .await
+        .map_err(RefreshFailure::Device)?;
+    if cancellation.is_cancelled() {
+        return Err(RefreshFailure::Cancelled);
+    }
+
+    let discovery_status = discovery.status;
+    let mut outcome_reason =
+        (session.is_none()).then_some(RefreshOutcomeReason::RuntimeUnavailable);
+    let devices = match (
+        &shared.refresh_dependencies.seed,
+        &shared.refresh_dependencies.driver_run_epoch,
+    ) {
+        (Some(seed), Some(run_epoch)) => {
+            match normalize_platform_records(discovery.records, seed, run_epoch) {
+                Ok(devices) => devices,
+                Err(DeviceError::Ambiguous) => {
+                    outcome_reason = Some(RefreshOutcomeReason::DeviceMappingAmbiguous);
+                    Vec::new()
+                }
+                Err(error) => return Err(RefreshFailure::Device(error)),
+            }
+        }
+        _ => {
+            outcome_reason = Some(RefreshOutcomeReason::DeviceIdentityUnavailable);
+            Vec::new()
+        }
+    };
+    if outcome_reason.is_none() && discovery_status == DeviceDiscoveryStatus::PlatformUnsupported {
+        outcome_reason = Some(RefreshOutcomeReason::PlatformUnsupported);
+    }
+    let runtime = match session.as_ref() {
+        Some(session) => Some(
+            shared
+                .refresh_dependencies
+                .inventory
+                .collect(session, cancellation.child_token())
+                .await
+                .map_err(RefreshFailure::Inventory)?,
+        ),
+        None => None,
+    };
+    if cancellation.is_cancelled() {
+        return Err(RefreshFailure::Cancelled);
+    }
+    let candidates = match (session.as_ref(), runtime.as_ref()) {
+        (Some(session), Some(runtime)) => {
+            coarse_candidates(session, runtime, &devices).map_err(RefreshFailure::Inventory)?
+        }
+        _ => Vec::new(),
+    };
+    let now = shared
+        .clock
+        .now()
+        .map_err(|_| RefreshFailure::SnapshotInvalid)?;
+    let identity_snapshot = CapabilitySnapshot::from_parts(
+        SnapshotFreshness::Fresh,
+        running.epoch,
+        running.admitted_revision,
+        runtime.clone(),
+        devices.clone(),
+        candidates.clone(),
+        BTreeMap::new(),
+        now,
+    )
+    .map_err(|_| RefreshFailure::SnapshotInvalid)?;
+    let mut evidence = previous.evidence.clone();
+    evidence.retain(|key, record| evidence_record_is_current(&identity_snapshot, key, record, now));
+    if let Some(runtime) = &runtime {
+        for (key, mut record) in shared
+            .refresh_dependencies
+            .storage
+            .load_evidence(runtime.runtime_id.clone(), now)
+            .await
+        {
+            let current = evidence_record_is_current(&identity_snapshot, &key, &mut record, now);
+            if current && (evidence.contains_key(&key) || evidence.len() < MAX_EVIDENCE) {
+                evidence.entry(key).or_insert(record);
+            }
+        }
+    } else {
+        evidence.clear();
+    }
+    if running.cause == RefreshCause::Manual {
+        for record in evidence.values_mut() {
+            record.clear_cooldown_after_refresh(now);
+        }
+    }
+    Ok(RefreshCandidate {
+        runtime,
+        devices,
+        candidates,
+        evidence,
+        outcome_reason,
+    })
+}
+
+fn evidence_record_is_current(
+    snapshot: &CapabilitySnapshot,
+    key: &CapabilityKey,
+    record: &mut EvidenceRecord,
+    now: StateNow,
+) -> bool {
+    record.prune_expired(now);
+    &record.key == key
+        && snapshot.key_identity_matches(key)
+        && snapshot.has_static_prerequisites(key)
+        && record.last_observed_at().is_some()
+        && record.validate(now).is_ok()
+}
+
+async fn publish_fresh_refresh(
+    shared: &RegistryShared,
+    running: RunningRefresh,
+    previous: &CapabilitySnapshot,
+    candidate: RefreshCandidate,
+    deadline_at: tokio::time::Instant,
+) {
+    if tokio::time::Instant::now() >= deadline_at {
+        publish_failed_refresh(
+            shared,
+            running,
+            previous,
+            false,
+            RefreshOutcomeReason::InventoryTimeout,
+        )
+        .await;
+        return;
+    }
+    let now = match shared.clock.now() {
+        Ok(now) => now,
+        Err(_) => {
+            publish_failed_refresh(
+                shared,
+                running,
+                previous,
+                false,
+                RefreshOutcomeReason::RefreshFailed,
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(revision) = running
+        .admitted_revision
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+    else {
+        shared.capacity_exhausted.cancel();
+        publish_failed_refresh(
+            shared,
+            running,
+            previous,
+            false,
+            RefreshOutcomeReason::RefreshFailed,
+        )
+        .await;
+        return;
+    };
+    let snapshot = match CapabilitySnapshot::from_parts(
+        SnapshotFreshness::Fresh,
+        running.epoch,
+        revision,
+        candidate.runtime,
+        candidate.devices,
+        candidate.candidates,
+        candidate.evidence,
+        now,
+    ) {
+        Ok(snapshot) => Arc::new(snapshot),
+        Err(_) => {
+            publish_failed_refresh(
+                shared,
+                running,
+                previous,
+                false,
+                RefreshOutcomeReason::RefreshFailed,
+            )
+            .await;
+            return;
+        }
+    };
+    if let Some(runtime) = &snapshot.runtime {
+        let requested = shared.refresh_dependencies.storage.request_persist(
+            revision,
+            runtime.runtime_id.clone(),
+            snapshot.evidence.clone(),
+            now,
+        );
+        if requested {
+            tokio::select! {
+                biased;
+                () = shared.shutdown.cancelled() => {
+                    publish_failed_refresh(
+                        shared,
+                        running,
+                        previous,
+                        true,
+                        RefreshOutcomeReason::RefreshCancelled,
+                    ).await;
+                    return;
+                }
+                () = tokio::time::sleep_until(deadline_at) => {
+                    publish_failed_refresh(
+                        shared,
+                        running,
+                        previous,
+                        false,
+                        RefreshOutcomeReason::InventoryTimeout,
+                    ).await;
+                    return;
+                }
+                _ = shared.refresh_dependencies.storage.wait_for_persisted(revision) => {}
+            }
+        }
+    }
+    if shared.shutdown.is_cancelled() {
+        publish_failed_refresh(
+            shared,
+            running,
+            previous,
+            true,
+            RefreshOutcomeReason::RefreshCancelled,
+        )
+        .await;
+        return;
+    }
+    let mut publication = shared.publication.write().await;
+    if publication.snapshot.identity_epoch != running.epoch
+        || publication.snapshot.publication_revision != running.admitted_revision
+    {
+        drop(publication);
+        finish_refresh_control(shared, running).await;
+        return;
+    }
+    publication.snapshot = snapshot;
+    publication.refresh.state = RefreshState::Succeeded;
+    publication.refresh.completed_at = Some(now.wall());
+    publication.refresh.outcome_reason = candidate.outcome_reason;
+    publication.refresh.persistence_status = shared.refresh_dependencies.storage.status();
+    drop(publication);
+    resume_after_refresh(shared, running.epoch).await;
+    finish_refresh_control(shared, running).await;
+}
+
+async fn publish_failed_refresh(
+    shared: &RegistryShared,
+    running: RunningRefresh,
+    previous: &CapabilitySnapshot,
+    cancelled: bool,
+    reason: RefreshOutcomeReason,
+) {
+    let now = shared.clock.now().ok();
+    let revision = running
+        .admitted_revision
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER);
+    if let (Some(now), Some(revision)) = (now, revision) {
+        let stale = CapabilitySnapshot::from_parts(
+            SnapshotFreshness::Stale,
+            running.epoch,
+            revision,
+            previous.runtime.clone(),
+            previous.devices.clone(),
+            previous.candidates.clone(),
+            previous.evidence.clone(),
+            now,
+        );
+        if let Ok(stale) = stale {
+            let mut publication = shared.publication.write().await;
+            if publication.snapshot.identity_epoch == running.epoch
+                && publication.snapshot.publication_revision == running.admitted_revision
+            {
+                publication.snapshot = Arc::new(stale);
+                publication.refresh.state = if cancelled {
+                    RefreshState::Cancelled
+                } else {
+                    RefreshState::Failed
+                };
+                publication.refresh.completed_at = Some(now.wall());
+                publication.refresh.outcome_reason = Some(reason);
+                publication.refresh.persistence_status =
+                    shared.refresh_dependencies.storage.status();
+            }
+        }
+    } else {
+        shared.capacity_exhausted.cancel();
+    }
+    resume_after_refresh(shared, running.epoch).await;
+    finish_refresh_control(shared, running).await;
+}
+
+async fn resume_after_refresh(shared: &RegistryShared, epoch: u64) {
+    let mut flights = shared.flights.lock().await;
+    if flights.identity_epoch == epoch && !shared.shutdown.is_cancelled() {
+        flights.admission_paused = false;
+    }
+}
+
+async fn finish_refresh_control(shared: &RegistryShared, running: RunningRefresh) {
+    let mut refresh = shared.refresh.lock().await;
+    if refresh
+        .running
+        .is_some_and(|current| current.id == running.id)
+    {
+        refresh.running = None;
+    }
+    drop(refresh);
+    shared.refresh_changed.notify_waiters();
 }
 
 impl Drop for CapabilityRegistry {
@@ -1277,7 +2347,19 @@ async fn merge_verification(
             );
         }
     };
-    publication.snapshot = Arc::new(snapshot);
+    let snapshot = Arc::new(snapshot);
+    let persistence = snapshot
+        .runtime
+        .as_ref()
+        .map(|runtime| (runtime.runtime_id.clone(), snapshot.evidence.clone()));
+    publication.snapshot = snapshot;
+    drop(publication);
+    if let Some((runtime, evidence)) = persistence {
+        let _ = shared
+            .refresh_dependencies
+            .storage
+            .request_persist(revision, runtime, evidence, now);
+    }
     EnsureEvidenceResult::from_outcome(outcome)
 }
 
@@ -1539,4 +2621,69 @@ pub(super) fn snapshot_validation_matrix_for_test() -> Vec<(&'static str, bool)>
         ("missing_runtime", rejects_missing_runtime),
         ("evidence_overflow", rejects_evidence_overflow),
     ]
+}
+
+#[cfg(test)]
+pub(super) fn cache_identity_filter_matrix_for_test() -> Vec<(&'static str, bool)> {
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let snapshot = test_snapshot_for_keys(std::slice::from_ref(&key));
+    let now = StateNow::from_test_minutes(0);
+    let cases = [
+        ("exact", key.clone(), true),
+        ("runtime", key.with_test_runtime(0x71), false),
+        ("device", key.with_test_physical_identity(0x72), false),
+        ("driver", key.with_test_driver(0x73), false),
+        (
+            "backend",
+            key.with_test_backend(crate::transcoding::BackendKind::Cuda),
+            false,
+        ),
+    ];
+    let mut results = cases
+        .into_iter()
+        .map(|(name, candidate, expected)| {
+            let mut record = EvidenceRecord::new(candidate.clone());
+            record
+                .apply(
+                    VerificationResult::for_test(
+                        EvidenceTarget::Correctness,
+                        EvidenceOutcome::TemporaryFailure,
+                        EvidenceReason::VerificationFailed,
+                        0,
+                    ),
+                    VerifierMode::ActiveInjected,
+                    now,
+                )
+                .expect("valid cache-filter fixture");
+            (
+                name,
+                evidence_record_is_current(&snapshot, &candidate, &mut record, now) == expected,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut missing_prerequisite = snapshot.clone();
+    missing_prerequisite
+        .runtime
+        .as_mut()
+        .expect("cache-filter fixture has a runtime")
+        .filters
+        .clear();
+    let mut record = EvidenceRecord::new(key.clone());
+    record
+        .apply(
+            VerificationResult::for_test(
+                EvidenceTarget::Correctness,
+                EvidenceOutcome::TemporaryFailure,
+                EvidenceReason::VerificationFailed,
+                0,
+            ),
+            VerifierMode::ActiveInjected,
+            now,
+        )
+        .expect("valid cache-filter prerequisite fixture");
+    results.push((
+        "static_prerequisite",
+        !evidence_record_is_current(&missing_prerequisite, &key, &mut record, now),
+    ));
+    results
 }

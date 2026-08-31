@@ -50,6 +50,10 @@ impl StateNow {
         self.wall
     }
 
+    pub(super) const fn monotonic_milliseconds(self) -> u64 {
+        self.monotonic_ms
+    }
+
     #[cfg(test)]
     pub(super) fn from_test_minutes(minutes: u64) -> Self {
         Self::from_test_times(minutes, minutes)

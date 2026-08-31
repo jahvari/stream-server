@@ -1392,8 +1392,7 @@ mod native {
     }
 }
 
+#[cfg(windows)]
+pub(super) use native::WindowsDeviceEnumerator;
 #[cfg(all(windows, test))]
-pub(super) use native::{
-    WindowsDeviceEnumerator, exercise_native_handle_exit_for_test,
-    native_open_handle_count_for_test,
-};
+pub(super) use native::{exercise_native_handle_exit_for_test, native_open_handle_count_for_test};

@@ -398,7 +398,7 @@ async fn run_inner(
             .inspect_err(|error| tracing::error!(%error, "FFmpeg setup failed"))
             .context("FFmpeg setup failed")?
     } else {
-        ffmpeg_setup::unavailable_service(process_supervisor.clone())
+        ffmpeg_setup::unavailable_service(&config_dir, process_supervisor.clone()).await
     };
 
     tracing::info!("Config Dir: {:?}", config_dir);

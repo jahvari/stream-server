@@ -16,9 +16,15 @@ use crate::transcoding::process::{
 use crate::transcoding::runtime::verify_unchanged;
 use crate::transcoding::runtime::{
     HASH_ADMISSION_DEADLINE, RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService,
-    resolve_runtime,
+    resolve_runtime, test_capability_registry,
 };
 use crate::transcoding::runtime_manifest::RuntimeError;
+use crate::transcoding::{
+    capability::registry::{CapabilityRegistry, RefreshAdmission, RefreshCause, SnapshotFreshness},
+    device::{
+        DeviceDiscovery, DeviceEnumerator, DeviceError, DriverRunEpoch, identity::DeviceIdSeed,
+    },
+};
 #[cfg(windows)]
 use sha2::Digest;
 use tempfile::TempDir;
@@ -27,6 +33,23 @@ use tokio_util::sync::CancellationToken;
 struct FakeProcess {
     _directory: TempDir,
     executable: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct IntegrationEmptyEnumerator;
+
+#[async_trait::async_trait]
+impl DeviceEnumerator for IntegrationEmptyEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<DeviceDiscovery, DeviceError> {
+        if cancellation.is_cancelled() {
+            Err(DeviceError::Cancelled)
+        } else {
+            Ok(DeviceDiscovery::supported(Vec::new()))
+        }
+    }
 }
 
 fn fake_process() -> &'static FakeProcess {
@@ -1384,7 +1407,12 @@ async fn verified_session_keeps_the_pair_leased_and_publishes_only_safe_identity
         .await
         .expect("resolve initial runtime");
     let initial_digest = initial.id().install_digest.clone();
-    let service = TranscodingService::resolved(config, supervisor.clone(), initial);
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        initial,
+        test_capability_registry(),
+    );
     let snapshot = service
         .current()
         .await
@@ -1418,7 +1446,8 @@ async fn session_revalidation_detects_a_path_replaced_after_validation() {
     let initial = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve initial runtime");
-    let service = TranscodingService::resolved(config, supervisor, initial);
+    let service =
+        TranscodingService::resolved(config, supervisor, initial, test_capability_registry());
     let original_session = service
         .runtime_for_session()
         .await
@@ -1442,7 +1471,7 @@ async fn session_revalidation_detects_a_path_replaced_after_validation() {
 #[tokio::test]
 async fn unavailable_service_is_side_effect_free_and_exposes_disabled_status() {
     let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
-    let service = TranscodingService::unavailable(supervisor.clone());
+    let service = TranscodingService::unavailable(supervisor.clone(), test_capability_registry());
 
     assert_eq!(service.status().await, RuntimeStatus::Unavailable);
     assert!(matches!(
@@ -1467,6 +1496,7 @@ async fn fake_probe_service(
             config,
             supervisor.clone(),
             runtime,
+            test_capability_registry(),
         )),
         supervisor,
     )
@@ -1687,7 +1717,12 @@ async fn paired_runtime_inventory_uses_six_supervised_processes() {
     let runtime = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve inventory runtime");
-    let service = TranscodingService::resolved(config, supervisor.clone(), runtime);
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        test_capability_registry(),
+    );
     let session = service
         .runtime_for_session()
         .await
@@ -1721,6 +1756,56 @@ async fn paired_runtime_inventory_uses_six_supervised_processes() {
 }
 
 #[tokio::test]
+async fn capability_refresh_uses_one_verified_session_and_inventory_failure_becomes_stale() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("refresh inventory runtime directory");
+    let root = inventory_runtime_root(directory.path(), "refresh-inventory");
+    let config = RuntimeConfig::isolated().with_explicit_root(root.clone());
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let runtime = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve refresh inventory runtime");
+    let registry = CapabilityRegistry::with_persist_failed_storage_for_test(
+        Arc::new(IntegrationEmptyEnumerator),
+        Arc::new(PairedRuntimeInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x51; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x61; 32])),
+    );
+    let service = Arc::new(TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        Arc::clone(&registry),
+    ));
+
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let fresh = service.capability_snapshot().await;
+    assert_eq!(fresh.freshness(), SnapshotFreshness::Fresh);
+    assert!(fresh.runtime_for_test().is_some());
+    assert!(registry.refresh_persistence_failed_for_test().await);
+    assert_eq!(supervisor.active_processes(), 0);
+
+    fs::write(root.join("inventory-exit-query"), b"-encoders")
+        .expect("write refresh inventory failure control");
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Started { id: 2 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let stale = service.capability_snapshot().await;
+    assert_eq!(stale.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(fresh.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(supervisor.active_processes(), 0);
+    service.shutdown_capabilities().await;
+}
+
+#[tokio::test]
 async fn paired_runtime_inventory_reaps_nonzero_overflow_and_cancelled_children() {
     let _guard = PROCESS_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().expect("inventory failure runtime directory");
@@ -1730,7 +1815,12 @@ async fn paired_runtime_inventory_reaps_nonzero_overflow_and_cancelled_children(
     let runtime = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve inventory runtime");
-    let service = TranscodingService::resolved(config, supervisor.clone(), runtime);
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        test_capability_registry(),
+    );
     let session = service
         .runtime_for_session()
         .await

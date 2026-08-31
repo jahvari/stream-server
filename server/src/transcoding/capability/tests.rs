@@ -5,7 +5,8 @@ use super::key::{
 };
 use super::registry::{
     CapabilityRegistry, CapabilityVerifier, PlaybackPriority, RefreshState, RegistryReason,
-    SnapshotFreshness, UnknownVerifier, VerificationRequest, snapshot_validation_matrix_for_test,
+    SnapshotFreshness, UnknownVerifier, VerificationRequest, cache_identity_filter_matrix_for_test,
+    snapshot_validation_matrix_for_test,
 };
 use super::state::{
     EvidenceOutcome, EvidenceReason, EvidenceRecord, EvidenceTarget, EvidenceTimestamp,
@@ -36,6 +37,745 @@ use tokio_util::sync::CancellationToken;
 
 static_assertions::assert_not_impl_any!(CapabilityKey: serde::Serialize);
 static_assertions::assert_not_impl_any!(PrivateSourceDigest: serde::Serialize);
+
+#[test]
+fn service_owns_one_registry() {
+    use crate::transcoding::{process::ProcessSupervisor, runtime::TranscodingService};
+
+    let registry = Arc::new(CapabilityRegistry::new(Arc::new(UnknownVerifier)));
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let service = TranscodingService::unavailable(supervisor, Arc::clone(&registry));
+
+    assert!(Arc::ptr_eq(
+        service.capability_registry_for_test(),
+        &registry
+    ));
+}
+
+#[derive(Clone, Copy)]
+struct EmptyDeviceEnumerator;
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for EmptyDeviceEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        if cancellation.is_cancelled() {
+            Err(crate::transcoding::device::DeviceError::Cancelled)
+        } else {
+            Ok(crate::transcoding::device::DeviceDiscovery::supported(
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PanickingDeviceEnumerator {
+    cancelled: Arc<Semaphore>,
+}
+
+impl PanickingDeviceEnumerator {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn wait_until_cancelled(&self) {
+        self.cancelled
+            .acquire()
+            .await
+            .expect("panic cancellation semaphore remains open")
+            .forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for PanickingDeviceEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        let cancelled = Arc::clone(&self.cancelled);
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            cancelled.add_permits(1);
+        });
+        panic!("injected device-enumerator panic")
+    }
+}
+
+#[derive(Clone)]
+struct PanicAfterCancellationEnumerator {
+    entered: Arc<Semaphore>,
+}
+
+impl PanicAfterCancellationEnumerator {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("shutdown-panic entry semaphore remains open")
+            .forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for PanicAfterCancellationEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        self.entered.add_permits(1);
+        cancellation.cancelled().await;
+        panic!("injected shutdown-time device-enumerator panic")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnexpectedInventorySource;
+
+#[async_trait::async_trait]
+impl crate::transcoding::inventory::StaticInventorySource for UnexpectedInventorySource {
+    async fn collect(
+        &self,
+        _session: &crate::transcoding::runtime::VerifiedRuntimeSession,
+        _cancellation: CancellationToken,
+    ) -> Result<
+        crate::transcoding::inventory::RuntimeInventory,
+        crate::transcoding::inventory::InventoryError,
+    > {
+        panic!("runtime-unavailable refresh must not execute inventory")
+    }
+}
+
+#[derive(Clone)]
+struct PausedDeviceEnumerator {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl PausedDeviceEnumerator {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("enumerator entry semaphore remains open")
+            .forget();
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for PausedDeviceEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        self.entered.add_permits(1);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(crate::transcoding::device::DeviceError::Cancelled),
+            permit = self.release.acquire() => {
+                permit.expect("enumerator release semaphore remains open").forget();
+                Ok(crate::transcoding::device::DeviceDiscovery::supported(Vec::new()))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct FailAfterFirstEnumerator(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for FailAfterFirstEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        if cancellation.is_cancelled() {
+            return Err(crate::transcoding::device::DeviceError::Cancelled);
+        }
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(crate::transcoding::device::DeviceDiscovery::supported(
+                Vec::new(),
+            ))
+        } else {
+            Err(crate::transcoding::device::DeviceError::Invalid)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FixedDeviceEnumerator(Vec<crate::transcoding::device::PlatformDeviceRecord>);
+
+#[async_trait::async_trait]
+impl crate::transcoding::device::DeviceEnumerator for FixedDeviceEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::transcoding::device::DeviceDiscovery, crate::transcoding::device::DeviceError>
+    {
+        if cancellation.is_cancelled() {
+            Err(crate::transcoding::device::DeviceError::Cancelled)
+        } else {
+            Ok(crate::transcoding::device::DeviceDiscovery::supported(
+                self.0.clone(),
+            ))
+        }
+    }
+}
+
+fn refresh_test_device(
+    availability: crate::transcoding::device::DeviceAvailability,
+) -> crate::transcoding::device::PlatformDeviceRecord {
+    use crate::transcoding::{
+        BackendKind, DeviceClass,
+        device::{
+            DeviceLocator, DriverField, DriverRecord, PlatformDeviceRecord, Vendor,
+            identity::{PlatformTag, PrivateDeviceIdentity},
+        },
+    };
+
+    PlatformDeviceRecord {
+        platform: PlatformTag::Windows,
+        display_name: b"Refresh Test GPU".to_vec(),
+        vendor: Vendor::Intel,
+        class: DeviceClass::Integrated,
+        availability,
+        persistent_identity: PrivateDeviceIdentity::new(b"refresh-test-gpu".to_vec())
+            .expect("bounded test identity"),
+        locator: DeviceLocator::Unavailable,
+        driver: DriverRecord::Complete(vec![DriverField::new(1, b"test-driver".to_vec())]),
+        backends: vec![BackendKind::Qsv],
+    }
+}
+
+#[tokio::test]
+async fn runtime_unavailable_refresh_publishes_fresh_empty() {
+    use super::registry::{RefreshAdmission, RefreshCause};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(EmptyDeviceEnumerator),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x31; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x41; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    let admission = service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    assert_eq!(admission, RefreshAdmission::Started { id: 1 });
+    registry.wait_for_refresh_for_test().await;
+
+    let publication = registry.publication().await;
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(publication.snapshot.identity_epoch(), 1);
+    assert_eq!(publication.snapshot.publication_revision(), 2);
+    assert!(publication.snapshot.devices_for_test().is_empty());
+    assert_eq!(publication.refresh.state, RefreshState::Succeeded);
+}
+
+#[tokio::test]
+async fn refresh_is_single_flight_and_startup_does_not_consume_manual_rate_window() {
+    use super::registry::{RefreshAdmission, RefreshCause};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PausedDeviceEnumerator::new();
+    let (registry, clock) = CapabilityRegistry::with_refresh_dependencies_and_clock_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x32; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x42; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    enumerator.wait_until_entered().await;
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Existing { id: 1 }
+    );
+    enumerator.release_one();
+    registry.wait_for_refresh_for_test().await;
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Existing { id: 1 }
+    );
+
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Started { id: 2 }
+    );
+    enumerator.wait_until_entered().await;
+    enumerator.release_one();
+    registry.wait_for_refresh_for_test().await;
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::RateLimited {
+            retry_after_seconds: 60
+        }
+    );
+    clock.set_minutes(1);
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Started { id: 3 }
+    );
+    enumerator.wait_until_entered().await;
+    enumerator.release_one();
+    registry.wait_for_refresh_for_test().await;
+}
+
+#[tokio::test]
+async fn failed_refresh_republishes_previous_data_stale_without_mutating_old_arc() {
+    use super::registry::{RefreshAdmission, RefreshCause};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(FailAfterFirstEnumerator::default()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x33; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x43; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let old = registry.snapshot().await;
+    assert_eq!(old.freshness(), SnapshotFreshness::Fresh);
+
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Started { id: 2 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let publication = registry.publication().await;
+
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.snapshot.identity_epoch(), 2);
+    assert_eq!(publication.snapshot.publication_revision(), 4);
+    assert_eq!(publication.refresh.state, RefreshState::Failed);
+    assert_eq!(old.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(old.identity_epoch(), 1);
+    assert!(!Arc::ptr_eq(&old, &publication.snapshot));
+}
+
+#[tokio::test]
+async fn failed_manual_refresh_does_not_clear_existing_circuit_history() {
+    use super::registry::{RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{process::ProcessSupervisor, runtime::TranscodingService};
+
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let failing = FailAfterFirstEnumerator(Arc::new(AtomicUsize::new(1)));
+    let registry = CapabilityRegistry::circuit_open_with_refresh_dependencies_for_test(
+        key.clone(),
+        Arc::new(failing),
+        Arc::new(UnexpectedInventorySource),
+    );
+    let before = registry.snapshot().await;
+    let before_record = before.evidence().get(&key).expect("fixture evidence");
+    assert_eq!(before_record.failure_streak_for_test(), Some(1));
+    assert_eq!(
+        before_record.cooldown_minutes_for_test(StateNow::from_test_minutes(0)),
+        Some(10)
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    let _ = service.start_capability_refresh(RefreshCause::Manual).await;
+    registry.wait_for_refresh_for_test().await;
+    let publication = registry.publication().await;
+    let after_record = publication
+        .snapshot
+        .evidence()
+        .get(&key)
+        .expect("failed refresh retains circuit evidence");
+
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.refresh.state, RefreshState::Failed);
+    assert_eq!(
+        publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::DeviceEnumerationFailed)
+    );
+    assert_eq!(after_record.failure_streak_for_test(), Some(1));
+    assert_eq!(
+        after_record.cooldown_minutes_for_test(StateNow::from_test_minutes(0)),
+        Some(10)
+    );
+}
+
+#[tokio::test]
+async fn dropping_refresh_caller_does_not_cancel_registry_owned_work() {
+    use super::registry::{RefreshAdmission, RefreshCause};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PausedDeviceEnumerator::new();
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x34; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x44; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    enumerator.wait_until_entered().await;
+    enumerator.release_one();
+    registry.wait_for_refresh_for_test().await;
+
+    assert_eq!(
+        registry.snapshot().await.freshness(),
+        SnapshotFreshness::Fresh
+    );
+}
+
+#[tokio::test]
+async fn seed_failure_and_identity_ambiguity_publish_fresh_zero_hardware() {
+    use super::registry::{RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{
+        device::{DeviceAvailability, DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let seedless = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(FixedDeviceEnumerator(vec![refresh_test_device(
+            DeviceAvailability::Available,
+        )])),
+        Arc::new(UnexpectedInventorySource),
+        None,
+        Some(DriverRunEpoch::from_test_bytes([0x45; 32])),
+    );
+    let seedless_service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&seedless),
+    ));
+    let _ = seedless_service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    seedless.wait_for_refresh_for_test().await;
+    let seedless_publication = seedless.publication().await;
+    assert_eq!(
+        seedless_publication.snapshot.freshness(),
+        SnapshotFreshness::Fresh
+    );
+    assert!(seedless_publication.snapshot.devices_for_test().is_empty());
+    assert_eq!(
+        seedless_publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::DeviceIdentityUnavailable)
+    );
+
+    let duplicate = refresh_test_device(DeviceAvailability::Available);
+    let ambiguous = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(FixedDeviceEnumerator(vec![duplicate.clone(), duplicate])),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x35; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x46; 32])),
+    );
+    let ambiguous_service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&ambiguous),
+    ));
+    let _ = ambiguous_service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    ambiguous.wait_for_refresh_for_test().await;
+    let ambiguous_publication = ambiguous.publication().await;
+    assert_eq!(
+        ambiguous_publication.snapshot.freshness(),
+        SnapshotFreshness::Fresh
+    );
+    assert!(ambiguous_publication.snapshot.devices_for_test().is_empty());
+    assert_eq!(
+        ambiguous_publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::DeviceMappingAmbiguous)
+    );
+}
+
+#[tokio::test]
+async fn permission_unavailable_device_keeps_stable_public_identity() {
+    use super::registry::RefreshCause;
+    use crate::transcoding::{
+        device::{DeviceAvailability, DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(FixedDeviceEnumerator(vec![refresh_test_device(
+            DeviceAvailability::PermissionDenied,
+        )])),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x36; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x47; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+    let _ = service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    registry.wait_for_refresh_for_test().await;
+
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(snapshot.devices_for_test().len(), 1);
+    assert_eq!(
+        snapshot.devices_for_test()[0].availability,
+        DeviceAvailability::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn refresh_worker_deadline_cancels_and_reaps_enumeration_before_stale_publish() {
+    use super::registry::{RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PausedDeviceEnumerator::new();
+    let registry = CapabilityRegistry::with_refresh_dependencies_and_deadline_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x37; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x48; 32])),
+        Duration::from_millis(20),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+    let _ = service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    enumerator.wait_until_entered().await;
+    tokio::time::timeout(Duration::from_secs(1), registry.wait_for_refresh_for_test())
+        .await
+        .expect("bounded refresh worker must finish after cancellation");
+
+    let publication = registry.publication().await;
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.refresh.state, RefreshState::Failed);
+    assert_eq!(
+        publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::InventoryTimeout)
+    );
+}
+
+#[tokio::test]
+async fn refresh_worker_panic_fails_closed_and_releases_single_flight() {
+    use super::registry::{RefreshAdmission, RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PanickingDeviceEnumerator::new();
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x72; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x73; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    tokio::time::timeout(Duration::from_secs(1), registry.wait_for_refresh_for_test())
+        .await
+        .expect("panicked refresh must release single-flight admission");
+    tokio::time::timeout(Duration::from_secs(1), enumerator.wait_until_cancelled())
+        .await
+        .expect("panicked refresh must cancel dependency-owned work");
+
+    let publication = registry.publication().await;
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.refresh.state, RefreshState::Failed);
+    assert_eq!(
+        publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::RefreshFailed)
+    );
+}
+
+#[tokio::test]
+async fn shutdown_time_refresh_panic_remains_cancelled() {
+    use super::registry::{RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PanicAfterCancellationEnumerator::new();
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x74; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x75; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    let _ = service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    enumerator.wait_until_entered().await;
+    service.shutdown_capabilities().await;
+
+    let publication = registry.publication().await;
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.refresh.state, RefreshState::Cancelled);
+    assert_eq!(
+        publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::RefreshCancelled)
+    );
+}
+
+#[tokio::test]
+async fn capability_shutdown_cancels_refresh_and_joins_owned_work() {
+    use super::registry::{RefreshCause, RefreshOutcomeReason};
+    use crate::transcoding::{
+        device::{DriverRunEpoch, identity::DeviceIdSeed},
+        process::ProcessSupervisor,
+        runtime::TranscodingService,
+    };
+
+    let enumerator = PausedDeviceEnumerator::new();
+    let registry = CapabilityRegistry::with_refresh_dependencies_for_test(
+        Arc::new(enumerator.clone()),
+        Arc::new(UnexpectedInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x38; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x49; 32])),
+    );
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+    let _ = service
+        .start_capability_refresh(RefreshCause::Startup)
+        .await;
+    enumerator.wait_until_entered().await;
+    tokio::time::timeout(Duration::from_secs(1), service.shutdown_capabilities())
+        .await
+        .expect("capability shutdown must join cancelled enumeration");
+
+    let publication = registry.publication().await;
+    assert_eq!(publication.snapshot.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(publication.refresh.state, RefreshState::Cancelled);
+    assert_eq!(
+        publication.refresh.outcome_reason,
+        Some(RefreshOutcomeReason::RefreshCancelled)
+    );
+}
+
+#[tokio::test]
+async fn refresh_counter_exhaustion_closes_admission_without_publication() {
+    use super::registry::{RefreshAdmission, RefreshCause};
+    use crate::transcoding::{process::ProcessSupervisor, runtime::TranscodingService};
+
+    let registry = CapabilityRegistry::ephemeral_for_test();
+    registry.exhaust_refresh_counter_for_test();
+    let service = Arc::new(TranscodingService::unavailable(
+        Arc::new(ProcessSupervisor::new(CancellationToken::new())),
+        Arc::clone(&registry),
+    ));
+
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Rejected {
+            reason: RegistryReason::CapacityExhausted
+        }
+    );
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.freshness(), SnapshotFreshness::Uninitialized);
+    assert_eq!(snapshot.identity_epoch(), 0);
+    assert_eq!(snapshot.publication_revision(), 0);
+}
 
 #[tokio::test]
 async fn production_unknown_verifier_never_records_or_spawns() {
@@ -325,6 +1065,13 @@ async fn registry_starts_uninitialized_and_publication_is_revision_consistent() 
 fn snapshot_order_bounds_and_cross_references_are_strict() {
     for (case, accepted) in snapshot_validation_matrix_for_test() {
         assert!(accepted, "snapshot invariant failed: {case}");
+    }
+}
+
+#[test]
+fn cached_evidence_requires_exact_current_identity_and_prerequisites() {
+    for (case, accepted) in cache_identity_filter_matrix_for_test() {
+        assert!(accepted, "cache identity filter failed: {case}");
     }
 }
 

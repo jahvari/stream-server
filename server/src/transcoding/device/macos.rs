@@ -154,5 +154,5 @@ mod native {
     }
 }
 
-#[cfg(all(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(super) use native::MacosDeviceEnumerator;

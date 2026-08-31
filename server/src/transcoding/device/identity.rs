@@ -17,7 +17,7 @@ impl DeviceIdSeed {
     }
 
     #[cfg(test)]
-    pub(super) fn from_test_bytes(bytes: [u8; DEVICE_ID_SEED_BYTES]) -> Self {
+    pub(crate) fn from_test_bytes(bytes: [u8; DEVICE_ID_SEED_BYTES]) -> Self {
         Self(bytes)
     }
 
