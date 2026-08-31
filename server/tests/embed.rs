@@ -2,22 +2,6 @@ use std::time::Duration;
 
 const SERVER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn protected_config_tempdir() -> anyhow::Result<tempfile::TempDir> {
-    #[cfg(windows)]
-    {
-        // Windows hosted-runner temp roots can contain reparse aliases. The
-        // production storage policy correctly rejects those paths, so keep
-        // this writable-lock fixture under the checked-out workspace instead.
-        Ok(tempfile::Builder::new()
-            .prefix(".stream-server-protected-test-")
-            .tempdir_in(std::env::current_dir()?)?)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(tempfile::tempdir()?)
-    }
-}
-
 fn stop_and_join(
     handle: stream_server::ServerHandle,
 ) -> anyhow::Result<Option<stream_server::ShutdownSource>> {
@@ -69,7 +53,7 @@ fn start_and_stop_embedded_server() -> anyhow::Result<()> {
 
 #[test]
 fn capability_storage_lock_is_released_before_embedded_shutdown_returns() -> anyhow::Result<()> {
-    let config_dir = protected_config_tempdir()?;
+    let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let server_config_dir = config_dir.path().join("config");
 

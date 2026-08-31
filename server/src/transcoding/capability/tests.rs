@@ -2180,20 +2180,7 @@ async fn cache_storage_replacement_failure_is_closed_and_preserves_the_wrong_obj
 }
 
 fn new_config_directory() -> tempfile::TempDir {
-    #[cfg(windows)]
-    {
-        // Windows hosted-runner temp roots can contain reparse aliases. The
-        // production storage policy correctly rejects those paths, so keep
-        // protected-storage fixtures under the checked-out workspace.
-        tempfile::Builder::new()
-            .prefix(".stream-server-protected-test-")
-            .tempdir_in(std::env::current_dir().expect("test workspace directory"))
-            .expect("isolated protected config directory")
-    }
-    #[cfg(not(windows))]
-    {
-        tempfile::tempdir().expect("isolated config directory")
-    }
+    tempfile::tempdir().expect("isolated config directory")
 }
 
 #[test]
@@ -3136,6 +3123,10 @@ fn seed_unix_objects_use_private_modes_and_reject_symlink_parents() {
 fn seed_windows_objects_use_protected_dacls_and_reject_reparse_parents() {
     use std::os::windows::fs::{symlink_dir, symlink_file};
 
+    assert!(
+        super::storage::windows::creation_descriptor_owner_is_current_user_for_test(),
+        "protected object creation must override an administrative token's default owner"
+    );
     let config = new_config_directory();
     load_or_create_device_seed(config.path(), &CancellationToken::new()).unwrap();
     let root = config.path().join("transcoding");

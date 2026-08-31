@@ -28,8 +28,8 @@ use windows::{
         Globalization::{CSTR_EQUAL, CompareStringOrdinal},
         Security::{
             Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-                SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
             },
             DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorControl,
             GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION,
@@ -824,6 +824,12 @@ struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
 impl SecurityDescriptor {
     fn new(sddl: &str) -> Result<Self, SeedStorageError> {
+        // A process token's default owner can be an administrative group even
+        // when TokenUser is the local account. Bind every new protected object
+        // to TokenUser explicitly so the later owner check is reliable and no
+        // other administrator gains owner privileges through the default.
+        let owner = current_user_sid_string()?;
+        let sddl = format!("O:{owner}{sddl}");
         let sddl = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         unsafe {
@@ -841,6 +847,85 @@ impl SecurityDescriptor {
     fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
         self.0.0.cast()
     }
+}
+
+struct TokenHandle(HANDLE);
+
+impl Drop for TokenHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct CurrentUserSid {
+    storage: Vec<usize>,
+}
+
+impl CurrentUserSid {
+    fn as_psid(&self) -> PSID {
+        unsafe { (&*self.storage.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+}
+
+fn current_user_sid() -> Result<CurrentUserSid, SeedStorageError> {
+    const MAX_TOKEN_USER_BYTES: usize = 64 * 1024;
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }
+        .map_err(|_| SeedStorageError::Unavailable)?;
+    let token = TokenHandle(token);
+    let mut required = 0_u32;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &raw mut required) };
+    let required_bytes = usize::try_from(required).map_err(|_| SeedStorageError::Unavailable)?;
+    if required_bytes < std::mem::size_of::<TOKEN_USER>() || required_bytes > MAX_TOKEN_USER_BYTES {
+        return Err(SeedStorageError::Unavailable);
+    }
+    let words = required_bytes
+        .checked_add(std::mem::size_of::<usize>() - 1)
+        .map(|bytes| bytes / std::mem::size_of::<usize>())
+        .ok_or(SeedStorageError::Unavailable)?;
+    let mut storage = vec![0_usize; words];
+    let storage_bytes = u32::try_from(storage.len() * std::mem::size_of::<usize>())
+        .map_err(|_| SeedStorageError::Unavailable)?;
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(storage.as_mut_ptr().cast()),
+            storage_bytes,
+            &raw mut required,
+        )
+    }
+    .map_err(|_| SeedStorageError::Unavailable)?;
+    let sid = unsafe { (&*storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if sid.is_invalid() {
+        return Err(SeedStorageError::Unavailable);
+    }
+    Ok(CurrentUserSid { storage })
+}
+
+fn current_user_sid_string() -> Result<String, SeedStorageError> {
+    const MAX_SDDL_SID_BYTES: usize = 256;
+
+    let current_user = current_user_sid()?;
+    let mut string_sid = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(current_user.as_psid(), &raw mut string_sid) }
+        .map_err(|_| SeedStorageError::Unavailable)?;
+    if string_sid.is_null() {
+        return Err(SeedStorageError::Unavailable);
+    }
+    let converted = unsafe { string_sid.to_string() };
+    let _ = unsafe { LocalFree(Some(HLOCAL(string_sid.0.cast()))) };
+    let sid = converted.map_err(|_| SeedStorageError::Unavailable)?;
+    if sid.len() > MAX_SDDL_SID_BYTES
+        || !sid.starts_with("S-1-")
+        || !sid[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(SeedStorageError::Unavailable);
+    }
+    Ok(sid)
 }
 
 impl Drop for SecurityDescriptor {
@@ -910,50 +995,9 @@ fn dacl_is_protected(file: &File) -> bool {
 }
 
 fn owner_is_current_user(file: &File) -> bool {
-    const MAX_TOKEN_USER_BYTES: usize = 64 * 1024;
-
-    struct TokenHandle(HANDLE);
-    impl Drop for TokenHandle {
-        fn drop(&mut self) {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    let mut token = HANDLE::default();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
-        return false;
-    }
-    let token = TokenHandle(token);
-    let mut required = 0_u32;
-    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &raw mut required) };
-    let Ok(required_bytes) = usize::try_from(required) else {
+    let Ok(current_user) = current_user_sid() else {
         return false;
     };
-    if required_bytes < std::mem::size_of::<TOKEN_USER>() || required_bytes > MAX_TOKEN_USER_BYTES {
-        return false;
-    }
-    let words = match required_bytes.checked_add(std::mem::size_of::<usize>() - 1) {
-        Some(bytes) => bytes / std::mem::size_of::<usize>(),
-        None => return false,
-    };
-    let mut token_storage = vec![0_usize; words];
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            Some(token_storage.as_mut_ptr().cast()),
-            match u32::try_from(token_storage.len() * std::mem::size_of::<usize>()) {
-                Ok(length) => length,
-                Err(_) => return false,
-            },
-            &raw mut required,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-    let current_user = unsafe { &*token_storage.as_ptr().cast::<TOKEN_USER>() };
 
     let mut owner = PSID::default();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -975,7 +1019,7 @@ fn owner_is_current_user(file: &File) -> bool {
         }
         return false;
     }
-    let matches = unsafe { EqualSid(owner, current_user.User.Sid) }.is_ok();
+    let matches = unsafe { EqualSid(owner, current_user.as_psid()) }.is_ok();
     let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
     matches
 }
@@ -993,4 +1037,29 @@ pub(crate) fn dacl_is_protected_for_test(path: &Path) -> bool {
             options.open(path).map_err(|_| SeedStorageError::Untrusted)
         })
         .is_ok_and(|file| dacl_is_protected(&file))
+}
+
+#[cfg(test)]
+pub(crate) fn creation_descriptor_owner_is_current_user_for_test() -> bool {
+    let Ok(descriptor) = SecurityDescriptor::new(DIRECTORY_SDDL) else {
+        return false;
+    };
+    let Ok(current_user) = current_user_sid() else {
+        return false;
+    };
+    let mut owner = PSID::default();
+    let mut defaulted = windows::core::BOOL::default();
+    if unsafe {
+        windows::Win32::Security::GetSecurityDescriptorOwner(
+            descriptor.0,
+            &raw mut owner,
+            &raw mut defaulted,
+        )
+    }
+    .is_err()
+        || owner.is_invalid()
+    {
+        return false;
+    }
+    unsafe { EqualSid(owner, current_user.as_psid()) }.is_ok()
 }
