@@ -331,6 +331,31 @@ async fn get_requires_actual_loopback_before_browser_headers_or_work() {
 }
 
 #[tokio::test]
+async fn router_construction_never_starts_the_process_lifecycle_refresh() {
+    let _engine_guard = crate::TEST_ENGINE_MUTEX.lock().await;
+    let (_temp, state) = test_state().await;
+    let registry = Arc::clone(state.transcoding.capability_registry_for_test());
+    let _first = crate::build_router(state.clone());
+    let second = crate::build_router(state);
+
+    let mut request = Request::builder()
+        .uri("/transcoding/capabilities")
+        .header(header::HOST, "localhost:11470")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = second.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(value["freshness"], "uninitialized");
+    assert!(value["refresh"]["id"].is_null());
+    assert_eq!(registry.api_dto_invocations_for_test(), 1);
+}
+
+#[tokio::test]
 async fn real_tcp_router_uses_socket_connect_info_and_never_emits_cors() {
     let _engine_guard = crate::TEST_ENGINE_MUTEX.lock().await;
     let (_temp, state) = test_state().await;

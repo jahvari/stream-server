@@ -45,7 +45,13 @@ fn public_server_exposes_the_isolated_loopback_capability_api() -> anyhow::Resul
     );
     let body: serde_json::Value = response.json()?;
     assert_eq!(body["schemaVersion"], 1);
-    assert_eq!(body["freshness"], "uninitialized");
+    assert_ne!(body["freshness"], "uninitialized");
+    assert_eq!(body["refresh"]["id"], 1);
+    assert_eq!(body["refresh"]["cause"], "startup");
+    assert!(matches!(
+        body["refresh"]["state"].as_str(),
+        Some("running" | "succeeded" | "failed")
+    ));
 
     let forbidden = reqwest::blocking::Client::new()
         .get(format!("http://{address}/transcoding/capabilities"))

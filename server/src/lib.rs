@@ -261,6 +261,7 @@ struct StartupBindings {
 struct PreparedHttpsListener {
     bound_addr: SocketAddr,
     server: axum_server::Server<SocketAddr, axum_server::tls_rustls::RustlsAcceptor>,
+    shutdown: axum_server::Handle<SocketAddr>,
 }
 
 async fn prepare_https_listener(
@@ -272,8 +273,13 @@ async fn prepare_https_listener(
     let listener = std::net::TcpListener::bind(configured_addr)?;
     listener.set_nonblocking(true)?;
     let bound_addr = listener.local_addr()?;
-    let server = axum_server::from_tcp_rustls(listener, tls)?;
-    Ok(PreparedHttpsListener { bound_addr, server })
+    let shutdown = axum_server::Handle::new();
+    let server = axum_server::from_tcp_rustls(listener, tls)?.handle(shutdown.clone());
+    Ok(PreparedHttpsListener {
+        bound_addr,
+        server,
+        shutdown,
+    })
 }
 
 async fn run_inner(
@@ -709,28 +715,20 @@ async fn run_inner(
 
     let settings_persistence_for_shutdown = state.settings_persistence.clone();
     let settings_persistence_for_drain = state.settings_persistence.clone();
+    let transcoding_for_lifecycle = Arc::clone(&state.transcoding);
     let app = build_router(state);
-
-    tracing::info!("listening on {}", bound_http_addr);
-    if cfg.print_startup {
-        println!("listening on {}", bound_http_addr);
-        println!("EngineFS server started at {}", base_url);
-    }
-    if let Some(ready_tx) = ready_tx {
-        let _ = ready_tx.send(bound_http_addr);
-    }
-    if let Some(startup_ready_tx) = startup_ready_tx {
-        let _ = startup_ready_tx.send(StartupBindings {
-            http: bound_http_addr,
-            https: bound_https_addr,
-        });
-    }
 
     let (shutdown_started_tx, mut shutdown_started_rx) =
         tokio::sync::oneshot::channel::<ShutdownSource>();
     let listen_for_ctrl_c = cfg.listen_for_ctrl_c;
-    let cancellation_on_shutdown = server_cancellation.clone();
-    let supervisor_on_shutdown = Arc::clone(&process_supervisor);
+    let http_shutdown = tokio_util::sync::CancellationToken::new();
+    let http_shutdown_on_signal = http_shutdown.clone();
+    let https_shutdown = prepared_https
+        .as_ref()
+        .map(|_| tokio_util::sync::CancellationToken::new());
+    let https_shutdown_on_signal = https_shutdown.clone();
+    let transcoding_on_signal = Arc::clone(&transcoding_for_lifecycle);
+    let graceful_shutdown_timeout = cfg.graceful_shutdown_timeout;
     let shutdown = async move {
         let source = tokio::select! {
             _ = maybe_ctrl_c(listen_for_ctrl_c) => {
@@ -747,41 +745,81 @@ async fn run_inner(
             }
         };
 
+        // Close capability admission before either listener can accept more
+        // work. Signal both servers before awaiting any registry-owned task;
+        // the main lifecycle keeps polling the HTTP drain concurrently.
+        transcoding_on_signal.begin_capability_shutdown();
+        http_shutdown_on_signal.cancel();
+        if let Some(cancellation) = https_shutdown_on_signal {
+            cancellation.cancel();
+        }
         settings_persistence_for_shutdown.close();
-        // Close supervised child/selection admission synchronously before the
-        // broader server token wakes asynchronous shutdown observers.
-        supervisor_on_shutdown.cancel();
-        cancellation_on_shutdown.cancel();
         let _ = shutdown_started_tx.send(source);
     };
 
+    let mut https_server_task = None;
     if let Some(prepared_https) = prepared_https {
         tracing::info!(
             "Found HTTPS certificates, starting HTTPS server on {}",
             prepared_https.bound_addr
         );
         let https_app = app.clone();
-        background_tasks.push(diagnostics::logging::spawn_logged(
-            "https-server",
-            async move {
-                if prepared_https
+        let cancellation = https_shutdown
+            .as_ref()
+            .expect("prepared HTTPS has a lifecycle token")
+            .clone();
+        https_server_task = Some(tokio::spawn(async move {
+            let handle = prepared_https.shutdown;
+            let mut serving = Box::pin(
+                prepared_https
                     .server
-                    .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                    .is_err()
-                {
-                    tracing::error!("HTTPS server failed");
+                    .serve(https_app.into_make_service_with_connect_info::<SocketAddr>()),
+            );
+            let result = tokio::select! {
+                biased;
+                result = &mut serving => result,
+                _ = cancellation.cancelled() => {
+                    handle.graceful_shutdown(Some(graceful_shutdown_timeout));
+                    serving.await
                 }
-            },
-        ));
+            };
+            if result.is_err() {
+                tracing::error!("HTTPS server failed");
+            }
+        }));
+    }
+
+    // Listener binding, optional HTTPS task ownership, and final state
+    // construction are complete before startup admission. Admission publishes
+    // `refreshing` atomically and the registry owns all subsequent work, so
+    // HTTP readiness never waits for enumeration or inventory completion.
+    let _ = transcoding_for_lifecycle
+        .start_capability_refresh(transcoding::capability::registry::RefreshCause::Startup)
+        .await;
+
+    tracing::info!("listening on {}", bound_http_addr);
+    if cfg.print_startup {
+        println!("listening on {}", bound_http_addr);
+        println!("EngineFS server started at {}", base_url);
+    }
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(bound_http_addr);
+    }
+    if let Some(startup_ready_tx) = startup_ready_tx {
+        let _ = startup_ready_tx.send(StartupBindings {
+            http: bound_http_addr,
+            https: bound_https_addr,
+        });
     }
 
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
+    .with_graceful_shutdown(http_shutdown.cancelled_owned())
     .into_future();
+
+    let shutdown_signal_task = tokio::spawn(shutdown);
 
     tokio::pin!(server);
 
@@ -797,7 +835,11 @@ async fn run_inner(
             }
         }
         Ok(source) = &mut shutdown_started_rx => {
-            match tokio::time::timeout(cfg.graceful_shutdown_timeout, &mut server).await {
+            let ((), graceful_result) = tokio::join!(
+                transcoding_for_lifecycle.shutdown_capabilities(),
+                tokio::time::timeout(cfg.graceful_shutdown_timeout, &mut server),
+            );
+            match graceful_result {
                 Ok(result) => {
                     server_result = result;
                 }
@@ -822,6 +864,33 @@ async fn run_inner(
         }
     };
 
+    if !shutdown_signal_task.is_finished() {
+        shutdown_signal_task.abort();
+    }
+    let _ = shutdown_signal_task.await;
+
+    // A listener can also terminate without an explicit shutdown signal.
+    // Registry drain is idempotent and must still precede supervisor/server
+    // cancellation so no owned child can be orphaned.
+    transcoding_for_lifecycle.shutdown_capabilities().await;
+    if let Some(cancellation) = https_shutdown {
+        cancellation.cancel();
+    }
+    if let Some(mut task) = https_server_task {
+        let https_drain_timeout = cfg
+            .graceful_shutdown_timeout
+            .saturating_add(Duration::from_secs(1));
+        match tokio::time::timeout(https_drain_timeout, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "HTTPS server task failed during shutdown");
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
     process_supervisor.cancel();
     server_cancellation.cancel();
 
