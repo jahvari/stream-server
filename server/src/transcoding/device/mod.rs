@@ -1,5 +1,5 @@
 use crate::transcoding::{BackendKind, DeviceClass, DeviceId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, collections::HashSet, fmt, sync::Arc};
 
 pub(crate) mod identity;
@@ -21,7 +21,7 @@ use identity::{
 };
 pub(crate) use identity::{DriverRecord, DriverRunEpoch};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Vendor {
     Intel,
@@ -33,7 +33,7 @@ pub(crate) enum Vendor {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum DeviceAvailability {
     Available,

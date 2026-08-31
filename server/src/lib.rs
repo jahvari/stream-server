@@ -1077,6 +1077,7 @@ pub fn build_router(state: AppState) -> Router {
             reject_proxy_hop_reentry,
         ))
         .layer(CorsLayer::permissive())
+        .merge(routes::transcoding::router())
         .with_state(state)
 }
 

@@ -12,5 +12,6 @@ pub mod proxy;
 pub mod stream;
 pub mod subtitles;
 pub mod system;
+pub(crate) mod transcoding;
 pub mod update;
 pub mod youtube;

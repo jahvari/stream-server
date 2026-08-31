@@ -40,7 +40,8 @@ impl KeyVersions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum CapabilityDirection {
     Decode,
     Encode,
@@ -759,6 +760,17 @@ pub(super) struct CapabilityKey {
     operation: CapabilityOperation,
 }
 
+pub(super) struct SafeCapabilityKeyView<'a> {
+    pub(super) device: &'a DeviceId,
+    pub(super) backend: BackendKind,
+    pub(super) direction: CapabilityDirection,
+    pub(super) input: Option<&'a InputVideoSignature>,
+    pub(super) output: Option<&'a OutputVideoSignature>,
+    pub(super) requirements: Option<&'a PipelineRequirements>,
+    pub(super) segmentation: Option<&'a SegmentationContract>,
+    pub(super) copy_container: Option<OutputContainerContract>,
+}
+
 impl CapabilityKey {
     fn new(
         runtime: RuntimeEvidenceId,
@@ -947,6 +959,49 @@ impl CapabilityKey {
     pub(super) fn is_valid(&self) -> bool {
         self.versions == KeyVersions::for_direction(self.direction())
             && validate_operation(self.direction(), &self.operation).is_ok()
+    }
+
+    pub(super) fn safe_view(&self) -> SafeCapabilityKeyView<'_> {
+        let (input, output, requirements, segmentation, copy_container) = match &self.operation {
+            CapabilityOperation::Decode {
+                input,
+                requirements,
+            } => (Some(input), None, Some(requirements), None, None),
+            CapabilityOperation::Encode {
+                output,
+                requirements,
+            } => (None, Some(output), Some(requirements), None, None),
+            CapabilityOperation::FullPipeline {
+                input,
+                output,
+                requirements,
+            } => (Some(input), Some(output), Some(requirements), None, None),
+            CapabilityOperation::SegmentedPipeline {
+                input,
+                output,
+                requirements,
+                segmentation,
+            } => (
+                Some(input),
+                Some(output),
+                Some(requirements),
+                Some(segmentation),
+                None,
+            ),
+            CapabilityOperation::CopyRemux(signature) => {
+                (None, None, None, None, Some(signature.container))
+            }
+        };
+        SafeCapabilityKeyView {
+            device: &self.device,
+            backend: self.backend,
+            direction: self.operation.direction(),
+            input,
+            output,
+            requirements,
+            segmentation,
+            copy_container,
+        }
     }
 }
 
@@ -1358,6 +1413,21 @@ impl CapabilityKey {
     pub(super) fn invalid_for_test(&self) -> Self {
         let mut key = self.clone();
         key.versions.schema = 0;
+        key
+    }
+
+    pub(super) fn with_test_open_input_codec(&self) -> Self {
+        let mut key = self.clone();
+        match &mut key.operation {
+            CapabilityOperation::Decode { input, .. }
+            | CapabilityOperation::FullPipeline { input, .. }
+            | CapabilityOperation::SegmentedPipeline { input, .. } => {
+                input.codec = InputVideoCodec::OtherProbed;
+            }
+            CapabilityOperation::Encode { .. } | CapabilityOperation::CopyRemux(_) => {
+                panic!("test key must contain an input signature")
+            }
+        }
         key
     }
 

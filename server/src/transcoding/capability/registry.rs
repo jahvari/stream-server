@@ -31,6 +31,7 @@ use crate::transcoding::{
 use std::collections::BTreeSet;
 
 use super::{
+    dto::{CapabilitiesDto, DtoError, RefreshAcceptedDto},
     key::{CapabilityKey, RequiredFilter, RequiredTransfer, StaticPrerequisites},
     state::{
         EvidenceOutcome, EvidenceReason, EvidenceRecord, EvidenceTarget, EvidenceTimestamp,
@@ -45,6 +46,8 @@ use crate::transcoding::{
 
 #[cfg(test)]
 use crate::transcoding::inventory::{InventoryUnknownCounts, SafeRuntimeVersion};
+#[cfg(test)]
+use crate::transcoding::runtime::RuntimeKind;
 
 const MAX_DEVICES: usize = 32;
 const MAX_CANDIDATES: usize = 1_024;
@@ -198,13 +201,13 @@ impl RefreshFailure {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CapabilitySnapshot {
-    freshness: SnapshotFreshness,
-    identity_epoch: u64,
-    publication_revision: u64,
-    runtime: Option<RuntimeInventory>,
-    devices: Vec<TranscodingDevice>,
-    candidates: Vec<CoarseCandidate>,
-    evidence: BTreeMap<CapabilityKey, EvidenceRecord>,
+    pub(super) freshness: SnapshotFreshness,
+    pub(super) identity_epoch: u64,
+    pub(super) publication_revision: u64,
+    pub(super) runtime: Option<RuntimeInventory>,
+    pub(super) devices: Vec<TranscodingDevice>,
+    pub(super) candidates: Vec<CoarseCandidate>,
+    pub(super) evidence: BTreeMap<CapabilityKey, EvidenceRecord>,
 }
 
 impl CapabilitySnapshot {
@@ -714,6 +717,8 @@ struct RegistryShared {
     playback: Arc<dyn PlaybackPriority>,
     clock: Arc<dyn RegistryClock>,
     verifier_invocations: AtomicU64,
+    #[cfg(test)]
+    api_dto_invocations: AtomicU64,
     capacity_exhausted: CancellationToken,
     global_semaphore: Arc<Semaphore>,
     tasks: TaskTracker,
@@ -945,6 +950,8 @@ impl CapabilityRegistry {
                 playback,
                 clock,
                 verifier_invocations: AtomicU64::new(0),
+                #[cfg(test)]
+                api_dto_invocations: AtomicU64::new(0),
                 capacity_exhausted: CancellationToken::new(),
                 global_semaphore: Arc::new(Semaphore::new(MAX_ACTIVE_GLOBAL)),
                 tasks: TaskTracker::new(),
@@ -964,6 +971,29 @@ impl CapabilityRegistry {
 
     pub(super) async fn publication(&self) -> RegistryPublication {
         self.shared.publication.read().await.clone()
+    }
+
+    pub(crate) async fn api_dto(&self) -> Result<CapabilitiesDto, DtoError> {
+        #[cfg(test)]
+        self.shared
+            .api_dto_invocations
+            .fetch_add(1, Ordering::Relaxed);
+        let publication = self.shared.publication.read().await.clone();
+        let now = self.shared.clock.now().map_err(|_| DtoError::Bounds)?;
+        CapabilitiesDto::project(publication, now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn api_dto_invocations_for_test(&self) -> u64 {
+        self.shared.api_dto_invocations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn api_refresh_dto(
+        &self,
+        expected_id: u64,
+    ) -> Result<RefreshAcceptedDto, DtoError> {
+        let refresh = self.shared.publication.read().await.refresh.clone();
+        RefreshAcceptedDto::project_running(refresh, expected_id)
     }
 
     pub(super) async fn ensure_evidence(
@@ -1635,7 +1665,7 @@ impl CapabilityRegistry {
     }
 
     #[cfg(test)]
-    pub(super) fn exhaust_refresh_counter_for_test(&self) {
+    pub(crate) fn exhaust_refresh_counter_for_test(&self) {
         if let Ok(mut refresh) = self.shared.refresh.try_lock() {
             refresh.next_id = MAX_SAFE_INTEGER;
         } else {
@@ -2429,7 +2459,7 @@ impl RegistryClock for TestRegistryClock {
 }
 
 #[cfg(test)]
-fn test_snapshot_for_keys(keys: &[CapabilityKey]) -> CapabilitySnapshot {
+pub(super) fn test_snapshot_for_keys(keys: &[CapabilityKey]) -> CapabilitySnapshot {
     build_test_snapshot_for_keys(keys).expect("valid test snapshot")
 }
 
@@ -2441,6 +2471,7 @@ fn build_test_snapshot_for_keys(
     assert!(keys.iter().all(|key| key.runtime() == first.runtime()));
     let runtime = RuntimeInventory {
         runtime_id: first.runtime().clone(),
+        runtime_kind: RuntimeKind::Jellyfin,
         safe_version: SafeRuntimeVersion {
             ffmpeg: Some("7.1.4".to_owned()),
             jellyfin_revision: Some("3".to_owned()),

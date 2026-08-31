@@ -391,6 +391,25 @@ impl TranscodingService {
         self.capability_registry.snapshot().await
     }
 
+    pub(crate) async fn capability_api_bytes(
+        &self,
+    ) -> Result<Vec<u8>, super::capability::dto::DtoError> {
+        self.capability_registry
+            .api_dto()
+            .await?
+            .serialize_bounded()
+    }
+
+    pub(crate) async fn capability_refresh_api_bytes(
+        &self,
+        expected_id: u64,
+    ) -> Result<Vec<u8>, super::capability::dto::DtoError> {
+        self.capability_registry
+            .api_refresh_dto(expected_id)
+            .await?
+            .serialize_bounded()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn start_capability_refresh(
         self: &Arc<Self>,

@@ -331,6 +331,7 @@ impl TerminalObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FailureHistory {
     pub(super) streak: u8,
+    pub(super) reason: EvidenceReason,
     pub(super) last_failure_at: EvidenceTimestamp,
     pub(super) expires_at: EvidenceTimestamp,
     pub(super) cooldown_until: Option<EvidenceTimestamp>,
@@ -341,9 +342,16 @@ pub(super) struct FailureHistory {
 impl FailureHistory {
     fn next(
         previous: Option<&Self>,
+        reason: EvidenceReason,
         observed_at: EvidenceTimestamp,
         now: StateNow,
     ) -> Result<Self, StateError> {
+        if !matches!(
+            reason,
+            EvidenceReason::VerificationFailed | EvidenceReason::VerificationTimeout
+        ) {
+            return Err(StateError::InvalidResult);
+        }
         let previous_streak = previous
             .filter(|history| now.wall < history.expires_at)
             .map_or(0, |history| history.streak);
@@ -353,6 +361,7 @@ impl FailureHistory {
         let remaining_ms = cooldown_until.0.saturating_sub(now.wall.0).min(cooldown_ms);
         Ok(Self {
             streak,
+            reason,
             last_failure_at: observed_at,
             expires_at: observed_at.checked_add(MAX_EVIDENCE_TTL_MS)?,
             cooldown_until: Some(cooldown_until),
@@ -518,6 +527,7 @@ impl EvidenceRecord {
             EvidenceOutcome::TemporaryFailure => {
                 self.failure_history = Some(FailureHistory::next(
                     self.failure_history.as_ref(),
+                    result.reason.ok_or(StateError::InvalidResult)?,
                     result.observed_at,
                     now,
                 )?);
@@ -659,6 +669,10 @@ impl EvidenceRecord {
         if let Some(history) = &self.failure_history
             && (history.streak == 0
                 || history.streak > MAX_FAILURE_STREAK
+                || !matches!(
+                    history.reason,
+                    EvidenceReason::VerificationFailed | EvidenceReason::VerificationTimeout
+                )
                 || history.expires_at <= history.last_failure_at
                 || history.expires_at.0 - history.last_failure_at.0 > MAX_EVIDENCE_TTL_MS
                 || history.cooldown_until.is_some()
@@ -788,6 +802,7 @@ struct PersistedTerminalObservation {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PersistedFailureHistory {
     streak: u8,
+    reason: EvidenceReason,
     last_failure_at: u64,
     expires_at: u64,
     cooldown_until: Option<u64>,
@@ -921,6 +936,7 @@ impl From<&FailureHistory> for PersistedFailureHistory {
     fn from(history: &FailureHistory) -> Self {
         Self {
             streak: history.streak,
+            reason: history.reason,
             last_failure_at: history.last_failure_at.0,
             expires_at: history.expires_at.0,
             cooldown_until: history.cooldown_until.map(|timestamp| timestamp.0),
@@ -966,6 +982,7 @@ impl PersistedFailureHistory {
         };
         Ok(FailureHistory {
             streak: self.streak,
+            reason: self.reason,
             last_failure_at,
             expires_at,
             cooldown_until,

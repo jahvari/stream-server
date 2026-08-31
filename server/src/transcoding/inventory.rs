@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, ffi::OsString, fmt, time::Duration};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +24,8 @@ const PHASE_DEADLINE: Duration = Duration::from_secs(60);
 const STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum HardwareAccelerator {
     Cuda,
     D3d11va,
@@ -32,7 +34,8 @@ pub(crate) enum HardwareAccelerator {
     VideoToolbox,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum DecoderComponent {
     BaseH264,
     BaseHevc,
@@ -60,7 +63,8 @@ pub(crate) enum DecoderComponent {
     V4l2m2mVc1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum EncoderComponent {
     QsvH264,
     QsvHevc,
@@ -82,7 +86,8 @@ pub(crate) enum EncoderComponent {
     V4l2m2mAv1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum FilterComponent {
     Format,
     HardwareDownload,
@@ -129,6 +134,7 @@ impl fmt::Debug for RuntimeEvidenceId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeInventory {
     pub(crate) runtime_id: RuntimeEvidenceId,
+    pub(crate) runtime_kind: RuntimeKind,
     pub(crate) safe_version: SafeRuntimeVersion,
     pub(crate) accelerators: BTreeSet<HardwareAccelerator>,
     pub(crate) decoders: BTreeSet<DecoderComponent>,
@@ -137,7 +143,8 @@ pub(crate) struct RuntimeInventory {
     pub(crate) unknown_counts: InventoryUnknownCounts,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum ListedCodec {
     H264,
     Hevc,
@@ -147,7 +154,8 @@ pub(crate) enum ListedCodec {
     Vc1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum ListedDirection {
     Decode,
     Encode,
@@ -1031,6 +1039,7 @@ fn parse_inventory_outputs(
     let filters = parse_filters(outputs.filters, &mut unknown_counts)?;
     Ok(RuntimeInventory {
         runtime_id: runtime_evidence_id,
+        runtime_kind,
         safe_version: SafeRuntimeVersion {
             ffmpeg: safe_token(&runtime.ffmpeg_version, 96),
             jellyfin_revision: runtime
