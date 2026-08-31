@@ -1,8 +1,10 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::transcoding::CapabilityState;
 
-use super::key::CapabilityKey;
+use super::key::{CapabilityKey, PersistedCapabilityKey};
 
 const MINUTE_MS: u64 = 60_000;
 const MAX_EVIDENCE_TTL_MS: u64 = 24 * 60 * MINUTE_MS;
@@ -61,14 +63,16 @@ impl StateNow {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum EvidenceTarget {
     Correctness,
     Realtime,
     Segmented,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum EvidenceOutcome {
     CorrectnessPassed,
     RealtimePassed,
@@ -79,7 +83,8 @@ pub(super) enum EvidenceOutcome {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum EvidenceReason {
     VerificationFailed,
     VerificationNotImplemented,
@@ -740,6 +745,229 @@ impl EvidenceRecord {
             monotonic_expires_at_ms: MAX_EVIDENCE_TTL_MS,
         });
         record.validate(StateNow::from_test_minutes(0))
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct PersistedEvidenceRecord {
+    pub(super) key: PersistedCapabilityKey,
+    correctness: Option<PersistedObservation>,
+    realtime: Option<PersistedObservation>,
+    segmented: Option<PersistedObservation>,
+    terminal: Option<PersistedTerminalObservation>,
+    failure_history: Option<PersistedFailureHistory>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PersistedObservation {
+    target: EvidenceTarget,
+    outcome: EvidenceOutcome,
+    observed_at: u64,
+    duration_ms: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PersistedTerminalObservation {
+    target: EvidenceTarget,
+    outcome: EvidenceOutcome,
+    reason: EvidenceReason,
+    observed_at: u64,
+    duration_ms: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PersistedFailureHistory {
+    streak: u8,
+    last_failure_at: u64,
+    expires_at: u64,
+    cooldown_until: Option<u64>,
+}
+
+impl PersistedEvidenceRecord {
+    pub(super) fn from_record(record: &EvidenceRecord) -> Option<Self> {
+        let persisted = Self {
+            key: PersistedCapabilityKey::from_key(&record.key)?,
+            correctness: record.correctness.as_ref().map(PersistedObservation::from),
+            realtime: record.realtime.as_ref().map(PersistedObservation::from),
+            segmented: record.segmented.as_ref().map(PersistedObservation::from),
+            terminal: record
+                .terminal
+                .as_ref()
+                .map(PersistedTerminalObservation::from),
+            failure_history: record
+                .failure_history
+                .as_ref()
+                .map(PersistedFailureHistory::from),
+        };
+        if persisted.correctness.is_none()
+            && persisted.realtime.is_none()
+            && persisted.segmented.is_none()
+            && persisted.terminal.is_none()
+            && persisted.failure_history.is_none()
+        {
+            None
+        } else {
+            Some(persisted)
+        }
+    }
+
+    pub(super) fn into_record(self, now: StateNow) -> Result<EvidenceRecord, StateError> {
+        let key = self
+            .key
+            .into_key()
+            .map_err(|_| StateError::ImpossibleState)?;
+        if self.correctness.is_none()
+            && self.realtime.is_none()
+            && self.segmented.is_none()
+            && self.terminal.is_none()
+            && self.failure_history.is_none()
+        {
+            return Err(StateError::ImpossibleState);
+        }
+        let record = EvidenceRecord {
+            key,
+            correctness: self
+                .correctness
+                .map(|observation| observation.into_observation(now))
+                .transpose()?,
+            realtime: self
+                .realtime
+                .map(|observation| observation.into_observation(now))
+                .transpose()?,
+            segmented: self
+                .segmented
+                .map(|observation| observation.into_observation(now))
+                .transpose()?,
+            terminal: self
+                .terminal
+                .map(|observation| observation.into_terminal(now))
+                .transpose()?,
+            failure_history: self
+                .failure_history
+                .map(|history| history.into_history(now))
+                .transpose()?,
+        };
+        record.validate(now)?;
+        Ok(record)
+    }
+}
+
+impl From<&EvidenceObservation> for PersistedObservation {
+    fn from(observation: &EvidenceObservation) -> Self {
+        Self {
+            target: observation.target,
+            outcome: observation.outcome,
+            observed_at: observation.observed_at.0,
+            duration_ms: observation.duration_ms,
+            expires_at: observation.expires_at.0,
+        }
+    }
+}
+
+impl PersistedObservation {
+    fn into_observation(self, now: StateNow) -> Result<EvidenceObservation, StateError> {
+        let result = VerificationResult::new(
+            self.target,
+            self.outcome,
+            None,
+            EvidenceTimestamp::new(self.observed_at)?,
+            self.duration_ms,
+            EvidenceTimestamp::new(self.expires_at)?,
+        )?;
+        result.validate_at(now)?;
+        EvidenceObservation::from_result(result, now)
+    }
+}
+
+impl From<&TerminalObservation> for PersistedTerminalObservation {
+    fn from(observation: &TerminalObservation) -> Self {
+        Self {
+            target: observation.target,
+            outcome: observation.outcome,
+            reason: observation.reason,
+            observed_at: observation.observed_at.0,
+            duration_ms: observation.duration_ms,
+            expires_at: observation.expires_at.0,
+        }
+    }
+}
+
+impl PersistedTerminalObservation {
+    fn into_terminal(self, now: StateNow) -> Result<TerminalObservation, StateError> {
+        let result = VerificationResult::new(
+            self.target,
+            self.outcome,
+            Some(self.reason),
+            EvidenceTimestamp::new(self.observed_at)?,
+            self.duration_ms,
+            EvidenceTimestamp::new(self.expires_at)?,
+        )?;
+        result.validate_at(now)?;
+        TerminalObservation::from_result(result, now)
+    }
+}
+
+impl From<&FailureHistory> for PersistedFailureHistory {
+    fn from(history: &FailureHistory) -> Self {
+        Self {
+            streak: history.streak,
+            last_failure_at: history.last_failure_at.0,
+            expires_at: history.expires_at.0,
+            cooldown_until: history.cooldown_until.map(|timestamp| timestamp.0),
+        }
+    }
+}
+
+impl PersistedFailureHistory {
+    fn into_history(self, now: StateNow) -> Result<FailureHistory, StateError> {
+        let last_failure_at = EvidenceTimestamp::new(self.last_failure_at)?;
+        let expires_at = EvidenceTimestamp::new(self.expires_at)?;
+        let cooldown_until = self
+            .cooldown_until
+            .map(EvidenceTimestamp::new)
+            .transpose()?;
+        if self.streak == 0
+            || self.streak > MAX_FAILURE_STREAK
+            || last_failure_at.0 > now.wall.0.saturating_add(MAX_FUTURE_SKEW_MS)
+            || expires_at <= now.wall
+            || expires_at <= last_failure_at
+            || expires_at.0 - last_failure_at.0 > MAX_EVIDENCE_TTL_MS
+            || cooldown_until.is_some_and(|cooldown| {
+                cooldown <= last_failure_at || cooldown.0 - last_failure_at.0 > 60 * MINUTE_MS
+            })
+        {
+            return Err(StateError::ImpossibleState);
+        }
+        let remaining_expiry = expires_at
+            .0
+            .saturating_sub(now.wall.0)
+            .min(MAX_EVIDENCE_TTL_MS);
+        let monotonic_expires_at_ms = now
+            .monotonic_ms
+            .checked_add(remaining_expiry)
+            .ok_or(StateError::Bounds)?;
+        let monotonic_cooldown_until_ms = match cooldown_until {
+            Some(cooldown) => Some(
+                now.monotonic_ms
+                    .checked_add(cooldown.0.saturating_sub(now.wall.0).min(60 * MINUTE_MS))
+                    .ok_or(StateError::Bounds)?,
+            ),
+            None => None,
+        };
+        Ok(FailureHistory {
+            streak: self.streak,
+            last_failure_at,
+            expires_at,
+            cooldown_until,
+            monotonic_cooldown_until_ms,
+            monotonic_expires_at_ms,
+        })
     }
 }
 

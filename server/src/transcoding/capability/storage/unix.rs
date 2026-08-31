@@ -1,6 +1,6 @@
 use super::SeedStorageError;
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr},
     fs::File,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -11,6 +11,11 @@ use std::{
 
 const STORAGE_DIRECTORY_NAME: &[u8] = b"transcoding\0";
 const SEED_FILE_NAME: &[u8] = b"device-id.key\0";
+const CACHE_LOCK_FILE_NAME: &[u8] = b"capabilities.lock\0";
+const CACHE_LOCK_FILE_NAME_STR: &str = "capabilities.lock";
+const CACHE_FILE_NAME: &[u8] = b"capabilities-v1.json\0";
+const CACHE_TEMPORARY_PREFIX: &[u8] = b"capabilities-v1.tmp-";
+const MAX_RECOVERY_TEMPORARIES: usize = 16;
 
 pub(super) struct ProtectedDirectory {
     file: File,
@@ -26,6 +31,21 @@ pub(super) enum SeedOpen {
 pub(super) enum SeedCreate {
     Created(File),
     Exists,
+}
+
+pub(super) enum LifetimeLockOpen {
+    Acquired(LifetimeLock),
+    Contended,
+}
+
+pub(super) struct LifetimeLock {
+    file: File,
+}
+
+impl Drop for LifetimeLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 pub(super) fn prepare_storage_directory(
@@ -72,7 +92,11 @@ pub(super) fn prepare_storage_directory(
         unsafe { File::from_raw_fd(descriptor) }
     };
     let metadata = root.metadata().map_err(|_| SeedStorageError::Untrusted)?;
-    if !metadata.is_dir() || metadata.mode() & 0o777 != 0o700 || metadata.nlink() == 0 {
+    if !metadata.is_dir()
+        || metadata.mode() & 0o777 != 0o700
+        || metadata.nlink() == 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
         return Err(SeedStorageError::Untrusted);
     }
     ensure_local(&root)?;
@@ -136,11 +160,227 @@ pub(super) fn create_seed(directory: &ProtectedDirectory) -> Result<SeedCreate, 
     Ok(SeedCreate::Created(file))
 }
 
-pub(super) fn sync_directory(directory: &ProtectedDirectory) -> Result<(), SeedStorageError> {
-    directory
+pub(super) fn acquire_lifetime_lock(
+    directory: &ProtectedDirectory,
+) -> Result<LifetimeLockOpen, SeedStorageError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            CACHE_LOCK_FILE_NAME.as_ptr().cast(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SeedStorageError::Untrusted);
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    validate_regular(&file, directory)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => Ok(LifetimeLockOpen::Contended),
+            _ => Err(SeedStorageError::Unavailable),
+        };
+    }
+    Ok(LifetimeLockOpen::Acquired(LifetimeLock { file }))
+}
+
+pub(super) fn validate_lifetime_lock(
+    directory: &ProtectedDirectory,
+    lock: &LifetimeLock,
+) -> Result<(), SeedStorageError> {
+    validate_regular(&lock.file, directory)?;
+    let metadata = lock
         .file
-        .sync_all()
-        .map_err(|_| SeedStorageError::Unavailable)
+        .metadata()
+        .map_err(|_| SeedStorageError::Untrusted)?;
+    validate_named_identity(directory, CACHE_LOCK_FILE_NAME_STR, &metadata)
+}
+
+pub(super) fn open_cache(directory: &ProtectedDirectory) -> Result<Option<File>, SeedStorageError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            CACHE_FILE_NAME.as_ptr().cast(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(SeedStorageError::Untrusted),
+        };
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    validate_regular(&file, directory)?;
+    Ok(Some(file))
+}
+
+pub(super) fn create_cache_temporary(
+    directory: &ProtectedDirectory,
+    name: &str,
+) -> Result<File, SeedStorageError> {
+    if !valid_temporary_name(name) {
+        return Err(SeedStorageError::Untrusted);
+    }
+    let name = CString::new(name).map_err(|_| SeedStorageError::Untrusted)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SeedStorageError::Unavailable);
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    validate_regular(&file, directory)?;
+    Ok(file)
+}
+
+pub(super) fn open_cache_temporary(
+    directory: &ProtectedDirectory,
+    name: &str,
+) -> Result<File, SeedStorageError> {
+    if !valid_temporary_name(name) {
+        return Err(SeedStorageError::Untrusted);
+    }
+    let name = CString::new(name).map_err(|_| SeedStorageError::Untrusted)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SeedStorageError::Untrusted);
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    validate_regular(&file, directory)?;
+    Ok(file)
+}
+
+pub(super) fn list_cache_temporaries(
+    directory: &ProtectedDirectory,
+) -> Result<Vec<String>, SeedStorageError> {
+    let descriptor = unsafe { libc::fcntl(directory.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(SeedStorageError::Unavailable);
+    }
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        unsafe { libc::close(descriptor) };
+        return Err(SeedStorageError::Unavailable);
+    }
+    let mut names = Vec::new();
+    loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            if last_errno() != 0 {
+                unsafe { libc::closedir(stream) };
+                return Err(SeedStorageError::Unavailable);
+            }
+            break;
+        }
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if !bytes.starts_with(CACHE_TEMPORARY_PREFIX) {
+            continue;
+        }
+        if names.len() == MAX_RECOVERY_TEMPORARIES {
+            unsafe { libc::closedir(stream) };
+            return Err(SeedStorageError::Untrusted);
+        }
+        let Ok(name) = std::str::from_utf8(bytes) else {
+            unsafe { libc::closedir(stream) };
+            return Err(SeedStorageError::Untrusted);
+        };
+        if !valid_temporary_name(name) {
+            unsafe { libc::closedir(stream) };
+            return Err(SeedStorageError::Untrusted);
+        }
+        names.push(name.to_owned());
+    }
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(SeedStorageError::Unavailable);
+    }
+    Ok(names)
+}
+
+pub(super) fn replace_cache_temporary(
+    directory: &ProtectedDirectory,
+    temporary: &File,
+    temporary_name: &str,
+) -> Result<(), SeedStorageError> {
+    if !valid_temporary_name(temporary_name) {
+        return Err(SeedStorageError::Untrusted);
+    }
+    validate_regular(temporary, directory)?;
+    let temporary_metadata = temporary
+        .metadata()
+        .map_err(|_| SeedStorageError::Untrusted)?;
+    validate_named_identity(directory, temporary_name, &temporary_metadata)?;
+    if let Some(existing) = open_cache(directory)? {
+        drop(existing);
+    }
+    validate_named_identity(directory, temporary_name, &temporary_metadata)?;
+    let temporary_name = CString::new(temporary_name).map_err(|_| SeedStorageError::Untrusted)?;
+    if unsafe {
+        libc::renameat(
+            directory.file.as_raw_fd(),
+            temporary_name.as_ptr(),
+            directory.file.as_raw_fd(),
+            CACHE_FILE_NAME.as_ptr().cast(),
+        )
+    } != 0
+    {
+        return Err(SeedStorageError::Unavailable);
+    }
+    let installed = open_cache(directory)?.ok_or(SeedStorageError::Untrusted)?;
+    let installed_metadata = installed
+        .metadata()
+        .map_err(|_| SeedStorageError::Untrusted)?;
+    if temporary_metadata.dev() != installed_metadata.dev()
+        || temporary_metadata.ino() != installed_metadata.ino()
+    {
+        return Err(SeedStorageError::Untrusted);
+    }
+    Ok(())
+}
+
+pub(super) fn discard_temporary(
+    directory: &ProtectedDirectory,
+    file: &File,
+    temporary_name: &str,
+) -> Result<(), SeedStorageError> {
+    if !valid_temporary_name(temporary_name) {
+        return Err(SeedStorageError::Untrusted);
+    }
+    validate_regular(file, directory)?;
+    let metadata = file.metadata().map_err(|_| SeedStorageError::Untrusted)?;
+    validate_named_identity(directory, temporary_name, &metadata)?;
+    let name = CString::new(temporary_name).map_err(|_| SeedStorageError::Untrusted)?;
+    if unsafe { libc::unlinkat(directory.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(SeedStorageError::Unavailable);
+    }
+    Ok(())
+}
+
+pub(super) fn sync_directory(directory: &ProtectedDirectory) -> Result<(), SeedStorageError> {
+    match directory.file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .raw_os_error()
+                .is_some_and(|code| matches!(code, libc::EINVAL | libc::ENOTSUP | libc::EROFS)) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(SeedStorageError::Unavailable),
+    }
 }
 
 fn open_absolute_directory(path: &Path) -> Result<File, SeedStorageError> {
@@ -188,10 +428,86 @@ fn validate_seed(file: &File, directory: &ProtectedDirectory) -> Result<(), Seed
         || metadata.mode() & 0o777 != 0o600
         || metadata.nlink() != 1
         || metadata.dev() != directory.device
+        || metadata.uid() != unsafe { libc::geteuid() }
     {
         return Err(SeedStorageError::Untrusted);
     }
     ensure_local(file)
+}
+
+fn validate_regular(file: &File, directory: &ProtectedDirectory) -> Result<(), SeedStorageError> {
+    let metadata = file.metadata().map_err(|_| SeedStorageError::Untrusted)?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.dev() != directory.device
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(SeedStorageError::Untrusted);
+    }
+    ensure_local(file)
+}
+
+fn valid_temporary_name(name: &str) -> bool {
+    const PREFIX: &str = "capabilities-v1.tmp-";
+    name.strip_prefix(PREFIX).is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+fn clear_errno() {
+    unsafe { *errno_location() = 0 };
+}
+
+fn last_errno() -> libc::c_int {
+    unsafe { *errno_location() }
+}
+
+fn validate_named_identity(
+    directory: &ProtectedDirectory,
+    name: &str,
+    expected: &std::fs::Metadata,
+) -> Result<(), SeedStorageError> {
+    let name = CString::new(name).map_err(|_| SeedStorageError::Untrusted)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SeedStorageError::Untrusted);
+    }
+    let current = unsafe { File::from_raw_fd(descriptor) };
+    validate_regular(&current, directory)?;
+    let actual = current
+        .metadata()
+        .map_err(|_| SeedStorageError::Untrusted)?;
+    if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+        return Err(SeedStorageError::Untrusted);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -219,8 +219,28 @@ pub(crate) struct DriverIdentity {
 }
 
 impl DriverIdentity {
-    pub(super) fn is_persistable(&self) -> bool {
+    pub(crate) fn is_persistable(&self) -> bool {
         self.persistable
+    }
+
+    pub(crate) fn persisted_hex(&self) -> Option<String> {
+        self.persistable.then(|| hex::encode(self.digest))
+    }
+
+    pub(crate) fn from_persisted_hex(value: &str) -> Result<Self, IdentityError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(IdentityError);
+        }
+        let bytes = hex::decode(value).map_err(|_| IdentityError)?;
+        let digest = bytes.try_into().map_err(|_| IdentityError)?;
+        Ok(Self {
+            digest,
+            persistable: true,
+        })
     }
 
     #[cfg(test)]

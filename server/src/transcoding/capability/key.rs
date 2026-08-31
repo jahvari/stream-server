@@ -1,5 +1,7 @@
 use std::{collections::BTreeSet, fmt, num::NonZeroU32};
 
+use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess};
+
 use crate::transcoding::{
     codec::{
         ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, FieldOrder,
@@ -54,7 +56,8 @@ pub(super) struct StaticPrerequisites<'a> {
     pub(super) requirements: Option<&'a PipelineRequirements>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum BitDepth {
     Eight,
     Ten,
@@ -71,7 +74,8 @@ impl BitDepth {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum CodecLevel {
     L20,
     L21,
@@ -95,7 +99,8 @@ pub(super) enum CodecLevel {
     Vc1High,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum HdrMode {
     Sdr,
     Hdr10,
@@ -103,7 +108,8 @@ pub(super) enum HdrMode {
     DolbyVision,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum CodedDimensionBucket {
     UpTo480,
     UpTo576,
@@ -145,7 +151,8 @@ impl CodedDimensionBucket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct ResolutionBucket {
     pub(super) width: CodedDimensionBucket,
     pub(super) height: CodedDimensionBucket,
@@ -163,7 +170,8 @@ impl ResolutionBucket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum FrameRateBucket {
     UpTo24,
     UpTo25,
@@ -197,7 +205,8 @@ impl FrameRateBucket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum RequiredTransform {
     Scale,
     Deinterlace,
@@ -209,14 +218,16 @@ pub(super) enum RequiredTransform {
     PixelFormat,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum RequiredTransfer {
     Upload,
     Download,
     HardwareMap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum RequiredFilter {
     Format,
     Scale,
@@ -228,7 +239,8 @@ pub(super) enum RequiredFilter {
     HardwareMap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) enum OutputContainerContract {
     MpegTsHls,
     Fmp4Hls,
@@ -237,7 +249,8 @@ pub(super) enum OutputContainerContract {
     MovMp4,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct ColorSignature {
     pub(super) range: ColorRange,
     pub(super) primaries: ColorPrimaries,
@@ -271,7 +284,8 @@ impl ColorSignature {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct InputVideoSignature {
     pub(super) codec: InputVideoCodec,
     pub(super) profile: VideoProfile,
@@ -286,7 +300,8 @@ pub(super) struct InputVideoSignature {
     pub(super) frame_rate_class: FrameRateClass,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct OutputVideoSignature {
     pub(super) codec: OutputVideoCodec,
     pub(super) profile: VideoProfile,
@@ -513,13 +528,62 @@ fn pixel_matches(
         && !matches!(chroma, ChromaSubsampling::Unknown)
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct PipelineRequirements {
+    #[serde(deserialize_with = "deserialize_requirement_items")]
     pub(super) transforms: Vec<RequiredTransform>,
+    #[serde(deserialize_with = "deserialize_requirement_items")]
     pub(super) transfers: Vec<RequiredTransfer>,
+    #[serde(deserialize_with = "deserialize_requirement_items")]
     pub(super) filters: Vec<RequiredFilter>,
     pub(super) container: Option<OutputContainerContract>,
     pub(super) output_time_base: Option<RationalRate>,
+}
+
+fn deserialize_requirement_items<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct RequirementVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T> serde::de::Visitor<'de> for RequirementVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("at most 16 pipeline requirement items")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|hint| hint > MAX_REQUIREMENT_ITEMS)
+            {
+                return Err(serde::de::Error::custom("too many requirement items"));
+            }
+            let mut values =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_REQUIREMENT_ITEMS));
+            while values.len() < MAX_REQUIREMENT_ITEMS {
+                let Some(value) = sequence.next_element()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("too many requirement items"));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(RequirementVisitor(std::marker::PhantomData))
 }
 
 impl PipelineRequirements {
@@ -550,7 +614,8 @@ fn canonical_requirements<T: Copy + Ord>(
     Ok(values.into_iter().collect())
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct SegmentationContract {
     pub(super) exact_frame_rate: RationalRate,
     pub(super) frame_rate_class: FrameRateClass,
@@ -884,6 +949,172 @@ impl CapabilityKey {
             && validate_operation(self.direction(), &self.operation).is_ok()
     }
 }
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct PersistedCapabilityKey {
+    schema_version: u16,
+    evidence_version: u16,
+    recipe_version: u16,
+    runtime_id: String,
+    device_id: DeviceId,
+    driver_id: String,
+    backend: BackendKind,
+    operation: PersistedCapabilityOperation,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "direction")]
+enum PersistedCapabilityOperation {
+    Decode {
+        input: InputVideoSignature,
+        requirements: PipelineRequirements,
+    },
+    Encode {
+        output: OutputVideoSignature,
+        requirements: PipelineRequirements,
+    },
+    FullPipeline {
+        input: InputVideoSignature,
+        output: OutputVideoSignature,
+        requirements: PipelineRequirements,
+    },
+    SegmentedPipeline {
+        input: InputVideoSignature,
+        output: OutputVideoSignature,
+        requirements: PipelineRequirements,
+        segmentation: SegmentationContract,
+    },
+}
+
+impl PersistedCapabilityKey {
+    pub(super) fn from_key(key: &CapabilityKey) -> Option<Self> {
+        if !key.is_valid() || !key.driver.is_persistable() {
+            return None;
+        }
+        let operation = match &key.operation {
+            CapabilityOperation::Decode {
+                input,
+                requirements,
+            } => PersistedCapabilityOperation::Decode {
+                input: input.clone(),
+                requirements: requirements.clone(),
+            },
+            CapabilityOperation::Encode {
+                output,
+                requirements,
+            } => PersistedCapabilityOperation::Encode {
+                output: output.clone(),
+                requirements: requirements.clone(),
+            },
+            CapabilityOperation::FullPipeline {
+                input,
+                output,
+                requirements,
+            } => PersistedCapabilityOperation::FullPipeline {
+                input: input.clone(),
+                output: output.clone(),
+                requirements: requirements.clone(),
+            },
+            CapabilityOperation::SegmentedPipeline {
+                input,
+                output,
+                requirements,
+                segmentation,
+            } => PersistedCapabilityOperation::SegmentedPipeline {
+                input: input.clone(),
+                output: output.clone(),
+                requirements: requirements.clone(),
+                segmentation: segmentation.clone(),
+            },
+            CapabilityOperation::CopyRemux(_) => return None,
+        };
+        Some(Self {
+            schema_version: key.versions.schema,
+            evidence_version: key.versions.evidence,
+            recipe_version: key.versions.recipe,
+            runtime_id: key.runtime.persisted_hex(),
+            device_id: key.device.clone(),
+            driver_id: key.driver.persisted_hex()?,
+            backend: key.backend,
+            operation,
+        })
+    }
+
+    pub(super) fn into_key(self) -> Result<CapabilityKey, PersistedKeyError> {
+        let runtime = RuntimeEvidenceId::from_persisted_hex(&self.runtime_id)
+            .map_err(|_| PersistedKeyError)?;
+        let driver =
+            DriverIdentity::from_persisted_hex(&self.driver_id).map_err(|_| PersistedKeyError)?;
+        let key = match self.operation {
+            PersistedCapabilityOperation::Decode {
+                input,
+                requirements,
+            } => CapabilityKey::decode(
+                runtime,
+                self.device_id,
+                driver,
+                self.backend,
+                input,
+                requirements,
+            ),
+            PersistedCapabilityOperation::Encode {
+                output,
+                requirements,
+            } => CapabilityKey::encode(
+                runtime,
+                self.device_id,
+                driver,
+                self.backend,
+                output,
+                requirements,
+            ),
+            PersistedCapabilityOperation::FullPipeline {
+                input,
+                output,
+                requirements,
+            } => CapabilityKey::full_pipeline(
+                runtime,
+                self.device_id,
+                driver,
+                self.backend,
+                input,
+                output,
+                requirements,
+            ),
+            PersistedCapabilityOperation::SegmentedPipeline {
+                input,
+                output,
+                requirements,
+                segmentation,
+            } => CapabilityKey::segmented_pipeline(
+                runtime,
+                self.device_id,
+                driver,
+                self.backend,
+                input,
+                output,
+                requirements,
+                segmentation,
+            ),
+        }
+        .map_err(|_| PersistedKeyError)?;
+        if key.versions.schema != self.schema_version
+            || key.versions.evidence != self.evidence_version
+            || key.versions.recipe != self.recipe_version
+        {
+            return Err(PersistedKeyError);
+        }
+        Ok(key)
+    }
+
+    pub(super) fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PersistedKeyError;
 
 fn listed_input_codec(codec: InputVideoCodec) -> ListedCodec {
     match codec {

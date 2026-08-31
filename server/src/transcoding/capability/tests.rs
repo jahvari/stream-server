@@ -13,15 +13,16 @@ use super::state::{
     WorkState,
 };
 use super::storage::{
-    SeedStorageError, SeedStorageEvent, load_or_create_device_seed,
-    load_or_create_device_seed_with_observer,
+    CacheSchemaError, EvidenceStorage, PersistenceTestHooks, SeedStorageError, SeedStorageEvent,
+    StorageStatus, create_cache_temporary_for_test, decode_evidence_cache, encode_evidence_cache,
+    load_or_create_device_seed, load_or_create_device_seed_with_observer,
 };
 use crate::transcoding::{
     CapabilityState, ChromaSubsampling, FrameRateClass, InputVideoCodec, KeyframeStrategy,
     OutputVideoCodec, PixelFormat, RationalRate, VideoProfile,
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     num::NonZeroU32,
     sync::{
@@ -850,6 +851,585 @@ async fn current_exact_evidence_is_reused_without_a_second_verifier_invocation()
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(registry.snapshot().await.evidence().len(), 1);
     registry.shutdown().await;
+}
+
+fn cache_record(key: CapabilityKey, outcome: EvidenceOutcome, minute: u64) -> EvidenceRecord {
+    let mut record = EvidenceRecord::new(key);
+    record
+        .apply(
+            verification(EvidenceTarget::Correctness, outcome, minute),
+            VerifierMode::ActiveInjected,
+            state_now(minute),
+        )
+        .unwrap();
+    record
+}
+
+#[test]
+fn cache_schema_round_trips_complete_evidence_and_excludes_memory_only_keys() {
+    let (runtime, _, _, _) = test_common();
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let record = cache_record(key.clone(), EvidenceOutcome::CorrectnessPassed, 0);
+    let records = BTreeMap::from([(key.clone(), record.clone())]);
+    let bytes = encode_evidence_cache(&runtime, &records, state_now(0)).unwrap();
+    assert!(bytes.len() < 8 * 1024 * 1024);
+    let decoded = decode_evidence_cache(&bytes, &runtime, state_now(0)).unwrap();
+    assert_eq!(decoded, records);
+    assert!(!bytes.windows(7).any(|window| window == b"workState"));
+    assert!(!bytes.windows(6).any(|window| window == b"listed"));
+    assert!(!bytes.windows(14).any(|window| window == b"administrative"));
+    assert!(!bytes.windows(15).any(|window| window == b"selectedStreams"));
+
+    let keys = CapabilityKey::complete_test_keys();
+    let copy = keys[4].clone();
+    let incomplete = keys[0]
+        .all_identity_mutations_for_test()
+        .into_iter()
+        .find(|candidate| !candidate.driver().is_persistable())
+        .expect("mutation corpus includes incomplete driver identity");
+    let memory_only = BTreeMap::from([
+        (
+            copy.clone(),
+            cache_record(copy, EvidenceOutcome::CorrectnessPassed, 0),
+        ),
+        (
+            incomplete.clone(),
+            cache_record(incomplete, EvidenceOutcome::CorrectnessPassed, 0),
+        ),
+    ]);
+    let bytes = encode_evidence_cache(&runtime, &memory_only, state_now(0)).unwrap();
+    assert!(
+        decode_evidence_cache(&bytes, &runtime, state_now(0))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cache_schema_rejects_unknown_duplicate_overflow_and_identity_mutations() {
+    let (runtime, _, _, _) = test_common();
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let record = cache_record(key.clone(), EvidenceOutcome::CorrectnessPassed, 0);
+    let bytes =
+        encode_evidence_cache(&runtime, &BTreeMap::from([(key, record)]), state_now(0)).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rejects = |value: serde_json::Value, now: StateNow| {
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert!(decode_evidence_cache(&encoded, &runtime, now).is_err());
+    };
+
+    let mut value = original.clone();
+    value["unexpected"] = serde_json::json!(true);
+    rejects(value, state_now(0));
+
+    let duplicate_top = String::from_utf8(bytes.clone()).unwrap().replacen(
+        "{\"schemaVersion\":1,",
+        "{\"schemaVersion\":1,\"schemaVersion\":1,",
+        1,
+    );
+    assert_eq!(
+        decode_evidence_cache(duplicate_top.as_bytes(), &runtime, state_now(0)),
+        Err(CacheSchemaError::Invalid)
+    );
+
+    let mut value = original.clone();
+    let duplicate = value["records"][0].clone();
+    value["records"].as_array_mut().unwrap().push(duplicate);
+    rejects(value, state_now(0));
+
+    let mut value = original.clone();
+    value["schemaVersion"] = serde_json::json!(2);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["evidenceVersion"] = serde_json::json!(2);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["writerServerVersion"] = serde_json::json!("../unsafe");
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["runtimeId"] = serde_json::json!("00".repeat(32));
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["key"]["runtimeId"] = serde_json::json!("00".repeat(32));
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["key"]["backend"] = serde_json::json!("unknownBackend");
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["key"]["recipeVersion"] = serde_json::json!(99);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["key"]["operation"]["requirements"]["unexpected"] = serde_json::json!(true);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["key"]["operation"]["requirements"]["transforms"] =
+        serde_json::Value::Array(vec![serde_json::json!("scale"); 17]);
+    rejects(value, state_now(0));
+
+    let duplicate_nested = String::from_utf8(bytes.clone()).unwrap().replacen(
+        "\"transforms\":[",
+        "\"transforms\":[],\"transforms\":[",
+        1,
+    );
+    assert_eq!(
+        decode_evidence_cache(duplicate_nested.as_bytes(), &runtime, state_now(0)),
+        Err(CacheSchemaError::Invalid)
+    );
+
+    assert_eq!(
+        decode_evidence_cache(&vec![b' '; 8 * 1024 * 1024 + 1], &runtime, state_now(0)),
+        Err(CacheSchemaError::Bounds)
+    );
+
+    let mut value = original;
+    let row = value["records"][0].clone();
+    value["records"] = serde_json::Value::Array(vec![row; 3_073]);
+    rejects(value, state_now(0));
+}
+
+#[test]
+fn cache_schema_rejects_invalid_times_shapes_and_wall_clock_rollback() {
+    let (runtime, _, _, _) = test_common();
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let record = cache_record(key.clone(), EvidenceOutcome::CorrectnessPassed, 0);
+    let bytes = encode_evidence_cache(
+        &runtime,
+        &BTreeMap::from([(key.clone(), record)]),
+        state_now(0),
+    )
+    .unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rejects = |value: serde_json::Value, now: StateNow| {
+        assert!(
+            decode_evidence_cache(&serde_json::to_vec(&value).unwrap(), &runtime, now).is_err()
+        );
+    };
+
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["target"] = serde_json::json!("realtime");
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["outcome"] = serde_json::json!("unknown");
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["durationMs"] = serde_json::json!(9_007_199_254_740_992_u64);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["observedAt"] = serde_json::json!(5 * 60_000);
+    assert!(
+        decode_evidence_cache(&serde_json::to_vec(&value).unwrap(), &runtime, state_now(0)).is_ok()
+    );
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["observedAt"] = serde_json::json!(6 * 60_000);
+    value["records"][0]["correctness"]["expiresAt"] = serde_json::json!(7 * 60_000);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["expiresAt"] = serde_json::json!(0);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"]["expiresAt"] = serde_json::json!(24 * 60 * 60_000_u64 + 1);
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["correctness"] = serde_json::Value::Null;
+    value["records"][0]["realtime"] = serde_json::json!({
+        "target": "realtime",
+        "outcome": "realtimePassed",
+        "observedAt": 0,
+        "durationMs": 100,
+        "expiresAt": 24 * 60 * 60_000_u64
+    });
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    value["records"][0]["terminal"] = serde_json::json!({
+        "target": "correctness",
+        "outcome": "unsupported",
+        "reason": "unsupported",
+        "observedAt": 0,
+        "durationMs": 100,
+        "expiresAt": 24 * 60 * 60_000_u64
+    });
+    rejects(value, state_now(0));
+    let mut value = original.clone();
+    for field in [
+        "correctness",
+        "realtime",
+        "segmented",
+        "terminal",
+        "failureHistory",
+    ] {
+        value["records"][0][field] = serde_json::Value::Null;
+    }
+    rejects(value, state_now(0));
+    rejects(original.clone(), state_now(1_441));
+
+    let failure = cache_record(key.clone(), EvidenceOutcome::TemporaryFailure, 0);
+    let failure_bytes = encode_evidence_cache(
+        &runtime,
+        &BTreeMap::from([(key.clone(), failure)]),
+        state_now(5),
+    )
+    .unwrap();
+    let decoded = decode_evidence_cache(&failure_bytes, &runtime, state_now(5)).unwrap();
+    assert_eq!(
+        decoded[&key].cooldown_minutes_for_test(state_now(5)),
+        Some(5)
+    );
+    assert_eq!(
+        decode_evidence_cache(&failure_bytes, &runtime, StateNow::from_test_times(0, 5),),
+        Err(CacheSchemaError::Invalid)
+    );
+
+    let mut value: serde_json::Value = serde_json::from_slice(&failure_bytes).unwrap();
+    value["records"][0]["failureHistory"]["streak"] = serde_json::json!(0);
+    rejects(value, state_now(5));
+    let mut value: serde_json::Value = serde_json::from_slice(&failure_bytes).unwrap();
+    value["records"][0]["failureHistory"]["streak"] = serde_json::json!(5);
+    rejects(value, state_now(5));
+    let mut value: serde_json::Value = serde_json::from_slice(&failure_bytes).unwrap();
+    value["records"][0]["failureHistory"]["cooldownUntil"] =
+        value["records"][0]["failureHistory"]["lastFailureAt"].clone();
+    rejects(value, state_now(5));
+    let mut value: serde_json::Value = serde_json::from_slice(&failure_bytes).unwrap();
+    value["records"][0]["failureHistory"]["cooldownUntil"] = serde_json::json!(61 * 60_000_u64);
+    rejects(value, state_now(5));
+}
+
+#[tokio::test]
+async fn cache_storage_lifetime_lock_is_read_only_for_a_second_owner_and_releases_after_join() {
+    let config = new_config_directory();
+    let owner = EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(owner.status(), StorageStatus::Writable);
+
+    let (runtime, _, _, _) = test_common();
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let record = cache_record(key.clone(), EvidenceOutcome::CorrectnessPassed, 0);
+    let records = BTreeMap::from([(key, record)]);
+    assert!(owner.request_persist(1, runtime.clone(), records.clone(), state_now(0)));
+    assert!(owner.wait_for_persisted(1).await);
+
+    let reader = EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(reader.status(), StorageStatus::ReadOnlyLocked);
+    assert_eq!(
+        reader.load_evidence(runtime.clone(), state_now(0)).await,
+        records
+    );
+    assert_eq!(reader.status(), StorageStatus::ReadOnlyLocked);
+    assert!(!reader.request_persist(2, runtime, BTreeMap::new(), state_now(0)));
+    reader.shutdown().await;
+
+    owner.shutdown().await;
+    let replacement =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(replacement.status(), StorageStatus::Writable);
+    replacement.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_replaces_trusted_malformed_content_but_not_an_untrusted_object() {
+    let config = new_config_directory();
+    let owner = EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    let (runtime, _, _, _) = test_common();
+    assert!(owner.request_persist(1, runtime.clone(), BTreeMap::new(), state_now(0)));
+    assert!(owner.wait_for_persisted(1).await);
+    let cache = config.path().join("transcoding/capabilities-v1.json");
+    fs::write(&cache, b"{malformed").unwrap();
+    assert!(
+        owner
+            .load_evidence(runtime.clone(), state_now(0))
+            .await
+            .is_empty()
+    );
+    assert_eq!(owner.status(), StorageStatus::Invalid);
+    assert!(owner.request_persist(2, runtime.clone(), BTreeMap::new(), state_now(0)));
+    assert!(owner.wait_for_persisted(2).await);
+    assert_eq!(owner.status(), StorageStatus::Writable);
+    owner.shutdown().await;
+
+    fs::remove_file(&cache).unwrap();
+    fs::create_dir(&cache).unwrap();
+    let blocked =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert!(
+        blocked
+            .load_evidence(runtime.clone(), state_now(0))
+            .await
+            .is_empty()
+    );
+    assert_eq!(blocked.status(), StorageStatus::Untrusted);
+    assert!(!blocked.request_persist(3, runtime, BTreeMap::new(), state_now(0)));
+    assert!(cache.is_dir());
+    blocked.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_recovers_only_bounded_exact_prefix_temporaries() {
+    let config = new_config_directory();
+    load_or_create_device_seed(config.path(), &CancellationToken::new()).unwrap();
+    let temporary = "capabilities-v1.tmp-00112233445566778899aabbccddeeff";
+    create_cache_temporary_for_test(config.path(), temporary, b"interrupted").unwrap();
+    let unrelated = config.path().join("transcoding/keep-me.txt");
+    fs::write(&unrelated, b"preserve").unwrap();
+
+    let storage =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(storage.status(), StorageStatus::Writable);
+    assert!(!config.path().join("transcoding").join(temporary).exists());
+    assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+    storage.shutdown().await;
+
+    let suspicious = "capabilities-v1.tmp-not-a-random-suffix";
+    fs::write(config.path().join("transcoding").join(suspicious), b"x").unwrap();
+    let disabled =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(disabled.status(), StorageStatus::Untrusted);
+    assert!(config.path().join("transcoding").join(suspicious).exists());
+    disabled.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_recovery_overflow_preserves_every_entry_and_disables_writes() {
+    let config = new_config_directory();
+    load_or_create_device_seed(config.path(), &CancellationToken::new()).unwrap();
+    let mut names = Vec::new();
+    for index in 0_u128..17 {
+        let name = format!("capabilities-v1.tmp-{index:032x}");
+        create_cache_temporary_for_test(config.path(), &name, b"interrupted").unwrap();
+        names.push(name);
+    }
+
+    let storage =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(storage.status(), StorageStatus::Untrusted);
+    assert!(
+        names
+            .iter()
+            .all(|name| config.path().join("transcoding").join(name).exists())
+    );
+    storage.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_coalesces_pending_revisions_without_blocking_tokio_workers() {
+    let config = new_config_directory();
+    let hooks = Arc::new(PersistenceTestHooks::new());
+    let storage = EvidenceStorage::open_with_test_hooks(
+        config.path().to_path_buf(),
+        CancellationToken::new(),
+        Arc::clone(&hooks),
+    )
+    .await;
+    let (runtime, _, _, _) = test_common();
+    assert!(storage.request_persist(1, runtime.clone(), BTreeMap::new(), state_now(0)));
+    hooks.wait_until_entered().await;
+
+    assert!(storage.request_persist(2, runtime.clone(), BTreeMap::new(), state_now(0)));
+    let key = CapabilityKey::complete_test_keys().remove(0);
+    let records = BTreeMap::from([(
+        key.clone(),
+        cache_record(key, EvidenceOutcome::CorrectnessPassed, 0),
+    )]);
+    assert!(storage.request_persist(3, runtime.clone(), records.clone(), state_now(0)));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::task::yield_now().await;
+    })
+    .await
+    .expect("paused native persistence does not block Tokio workers");
+
+    hooks.release_one();
+    hooks.wait_until_entered().await;
+    hooks.release_one();
+    assert!(storage.wait_for_persisted(3).await);
+    assert_eq!(storage.load_evidence(runtime, state_now(0)).await, records);
+    assert!(
+        fs::read_dir(config.path().join("transcoding"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("capabilities-v1.tmp-"))
+    );
+    storage.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_shutdown_joins_native_work_before_releasing_lifetime_lock() {
+    let config = new_config_directory();
+    let hooks = Arc::new(PersistenceTestHooks::new());
+    let storage = Arc::new(
+        EvidenceStorage::open_with_test_hooks(
+            config.path().to_path_buf(),
+            CancellationToken::new(),
+            Arc::clone(&hooks),
+        )
+        .await,
+    );
+    let (runtime, _, _, _) = test_common();
+    assert!(storage.request_persist(1, runtime, BTreeMap::new(), state_now(0)));
+    hooks.wait_until_entered().await;
+
+    let shutdown_owner = Arc::clone(&storage);
+    let shutdown = tokio::spawn(async move { shutdown_owner.shutdown().await });
+    let second_shutdown_owner = Arc::clone(&storage);
+    let second_shutdown = tokio::spawn(async move { second_shutdown_owner.shutdown().await });
+    tokio::task::yield_now().await;
+    assert!(!shutdown.is_finished());
+    assert!(!second_shutdown.is_finished());
+    let contender =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(contender.status(), StorageStatus::ReadOnlyLocked);
+
+    hooks.release_one();
+    shutdown.await.unwrap();
+    second_shutdown.await.unwrap();
+    assert!(
+        !config
+            .path()
+            .join("transcoding/capabilities-v1.json")
+            .exists()
+    );
+    assert!(
+        fs::read_dir(config.path().join("transcoding"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("capabilities-v1.tmp-"))
+    );
+    let replacement =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(replacement.status(), StorageStatus::Writable);
+    contender.shutdown().await;
+    replacement.shutdown().await;
+}
+
+const CACHE_STORAGE_HELPER_CONFIG: &str = "STREAM_SERVER_TEST_CACHE_CONFIG";
+const CACHE_STORAGE_HELPER_STATUS: &str = "STREAM_SERVER_TEST_CACHE_STATUS";
+
+#[test]
+fn cache_storage_cross_process_helper() {
+    let Ok(config) = std::env::var(CACHE_STORAGE_HELPER_CONFIG) else {
+        return;
+    };
+    let expected = std::env::var(CACHE_STORAGE_HELPER_STATUS).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let storage = EvidenceStorage::open(config.into(), CancellationToken::new()).await;
+        let expected = match expected.as_str() {
+            "writable" => StorageStatus::Writable,
+            "readOnlyLocked" => StorageStatus::ReadOnlyLocked,
+            _ => panic!("invalid closed helper expectation"),
+        };
+        assert_eq!(storage.status(), expected);
+        storage.shutdown().await;
+    });
+}
+
+#[tokio::test]
+async fn cache_storage_lifetime_lock_is_exclusive_across_processes() {
+    async fn run_helper(config: std::path::PathBuf, expected: &'static str) {
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transcoding::capability::tests::cache_storage_cross_process_helper",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CACHE_STORAGE_HELPER_CONFIG, config)
+                .env(CACHE_STORAGE_HELPER_STATUS, expected)
+                .status()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(status.success());
+    }
+
+    let config = new_config_directory();
+    let parent_cancellation = CancellationToken::new();
+    let owner =
+        EvidenceStorage::open(config.path().to_path_buf(), parent_cancellation.clone()).await;
+    assert_eq!(owner.status(), StorageStatus::Writable);
+    run_helper(config.path().to_path_buf(), "readOnlyLocked").await;
+    owner.shutdown().await;
+    assert!(!parent_cancellation.is_cancelled());
+    run_helper(config.path().to_path_buf(), "writable").await;
+}
+
+#[tokio::test]
+async fn cache_storage_rejects_a_wrong_type_lifetime_lock_without_replacing_it() {
+    let config = new_config_directory();
+    load_or_create_device_seed(config.path(), &CancellationToken::new()).unwrap();
+    let lock = config.path().join("transcoding/capabilities.lock");
+    fs::create_dir(&lock).unwrap();
+    let storage =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    assert_eq!(storage.status(), StorageStatus::Untrusted);
+    assert!(lock.is_dir());
+    storage.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cache_storage_windows_lifetime_lock_cannot_be_replaced_while_owned() {
+    let config = new_config_directory();
+    let storage =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    let lock = config.path().join("transcoding/capabilities.lock");
+    assert!(fs::remove_file(&lock).is_err());
+    storage.shutdown().await;
+    fs::remove_file(lock).unwrap();
+}
+
+#[tokio::test]
+async fn cache_storage_bounded_read_rejects_oversize_content_and_can_replace_it() {
+    let config = new_config_directory();
+    let storage =
+        EvidenceStorage::open(config.path().to_path_buf(), CancellationToken::new()).await;
+    let (runtime, _, _, _) = test_common();
+    assert!(storage.request_persist(1, runtime.clone(), BTreeMap::new(), state_now(0)));
+    assert!(storage.wait_for_persisted(1).await);
+    let cache = config.path().join("transcoding/capabilities-v1.json");
+    fs::write(&cache, vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
+    assert!(
+        storage
+            .load_evidence(runtime.clone(), state_now(0))
+            .await
+            .is_empty()
+    );
+    assert_eq!(storage.status(), StorageStatus::Invalid);
+    assert!(storage.request_persist(2, runtime, BTreeMap::new(), state_now(0)));
+    assert!(storage.wait_for_persisted(2).await);
+    assert_eq!(storage.status(), StorageStatus::Writable);
+    assert!(fs::metadata(cache).unwrap().len() < 8 * 1024 * 1024);
+    storage.shutdown().await;
+}
+
+#[tokio::test]
+async fn cache_storage_replacement_failure_is_closed_and_preserves_the_wrong_object() {
+    let config = new_config_directory();
+    let hooks = Arc::new(PersistenceTestHooks::new());
+    let storage = EvidenceStorage::open_with_test_hooks(
+        config.path().to_path_buf(),
+        CancellationToken::new(),
+        Arc::clone(&hooks),
+    )
+    .await;
+    let (runtime, _, _, _) = test_common();
+    assert!(storage.request_persist(1, runtime, BTreeMap::new(), state_now(0)));
+    hooks.wait_until_entered().await;
+    let cache = config.path().join("transcoding/capabilities-v1.json");
+    fs::create_dir(&cache).unwrap();
+    hooks.release_one();
+    assert!(!storage.wait_for_persisted(1).await);
+    assert_eq!(storage.status(), StorageStatus::PersistFailed);
+    assert!(cache.is_dir());
+    storage.shutdown().await;
 }
 
 fn new_config_directory() -> tempfile::TempDir {

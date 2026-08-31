@@ -241,7 +241,7 @@ impl<'de> Deserialize<'de> for RationalRate {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
         struct Raw {
             numerator: u32,
             denominator: NonZeroU32,

@@ -425,6 +425,23 @@ impl RuntimeEvidenceId {
         update_required(&mut digest, 5, runtime.pair_root_identity.as_bytes())?;
         Ok(Self(digest.finalize().into()))
     }
+
+    pub(crate) fn persisted_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub(crate) fn from_persisted_hex(value: &str) -> Result<Self, InventoryError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(InventoryError::Malformed);
+        }
+        let bytes = hex::decode(value).map_err(|_| InventoryError::Malformed)?;
+        let bytes = bytes.try_into().map_err(|_| InventoryError::Malformed)?;
+        Ok(Self(bytes))
+    }
 }
 
 fn update_required(digest: &mut Sha256, tag: u8, value: &[u8]) -> Result<(), InventoryError> {
