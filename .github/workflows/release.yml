@@ -85,6 +85,14 @@ jobs:
       - name: Test librqbit backend
         run: cargo test -p enginefs -p server --features librqbit --no-default-features
 
+      - name: Qualify PR 4 device capability registry on Linux
+        run: |
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::device::tests
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::inventory::tests
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::capability::tests
+          cargo test -p server --no-default-features --features librqbit --lib routes::transcoding::tests
+          cargo test -p server --no-default-features --features librqbit --test transcoding_capability_api
+
   check-windows:
     name: Check Windows native FFI and shutdown
     runs-on: windows-2022
@@ -109,6 +117,48 @@ jobs:
 
       - name: Test repeated Windows shutdown
         run: cargo test -p server --test embed --features librqbit --no-default-features
+
+      - name: Qualify PR 4 device capability registry on Windows
+        run: |
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::device::tests
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::inventory::tests
+          cargo test -p server --no-default-features --features librqbit --lib transcoding::capability::tests
+          cargo test -p server --no-default-features --features librqbit --lib routes::transcoding::tests
+          cargo test -p server --no-default-features --features librqbit --test transcoding_capability_api
+
+  check-macos:
+    name: Check macOS disabled VideoToolbox model
+    runs-on: macos-15
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pr4-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pr4-cargo-
+
+      - name: Check server targets without runtime acquisition
+        run: cargo check -p server --no-default-features --features librqbit --all-targets
+
+      - name: Run warnings-as-errors Clippy
+        run: cargo clippy -p server --no-default-features --features librqbit --all-targets -- -D warnings
+
+      - name: Test packaging-disabled VideoToolbox model
+        run: cargo test -p server --no-default-features --features librqbit --lib transcoding::device::tests::macos_
 
   build-windows:
     name: Build Windows
