@@ -3,12 +3,17 @@ use crate::transcoding::runtime::ensure_managed_runtime;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use crate::transcoding::runtime_manifest::{RuntimeHost, RuntimeManifest};
 use crate::transcoding::{
+    capability::registry::CapabilityRegistry,
     process::ProcessSupervisor,
     runtime::{RuntimeConfig, TranscodingService, resolve_runtime},
     runtime_manifest::RuntimeError,
 };
 use anyhow::Result;
 use std::{error::Error, fmt, path::Path, sync::Arc};
+
+fn uninitialized_capability_registry() -> Arc<CapabilityRegistry> {
+    CapabilityRegistry::uninitialized()
+}
 
 #[derive(Debug)]
 pub struct MissingFfmpegError {
@@ -110,9 +115,15 @@ pub(crate) async fn setup_ffmpeg(
 ) -> Result<Arc<TranscodingService>> {
     let config = RuntimeConfig::for_server(config_dir);
     match resolve_runtime(&config, &supervisor).await {
-        Ok(runtime) => Ok(Arc::new(TranscodingService::resolved(
-            config, supervisor, runtime,
-        ))),
+        Ok(runtime) => {
+            let capabilities = CapabilityRegistry::production(config_dir.to_path_buf()).await;
+            Ok(Arc::new(TranscodingService::resolved(
+                config,
+                supervisor,
+                runtime,
+                capabilities,
+            )))
+        }
         Err(resolution_error) => {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
@@ -126,8 +137,12 @@ pub(crate) async fn setup_ffmpeg(
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!(MissingFfmpegError::from_runtime(error)))?;
+                let capabilities = CapabilityRegistry::production(config_dir.to_path_buf()).await;
                 Ok(Arc::new(TranscodingService::resolved(
-                    config, supervisor, runtime,
+                    config,
+                    supervisor,
+                    runtime,
+                    capabilities,
                 )))
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -152,12 +167,19 @@ pub(crate) async fn setup_ffmpeg_with_config(
         .await
         .map_err(|_| MissingFfmpegError::unavailable())?;
     Ok(Arc::new(TranscodingService::resolved(
-        config, supervisor, runtime,
+        config,
+        supervisor,
+        runtime,
+        uninitialized_capability_registry(),
     )))
 }
 
-pub(crate) fn unavailable_service(supervisor: Arc<ProcessSupervisor>) -> Arc<TranscodingService> {
-    Arc::new(TranscodingService::unavailable(supervisor))
+pub(crate) async fn unavailable_service(
+    config_dir: &Path,
+    supervisor: Arc<ProcessSupervisor>,
+) -> Arc<TranscodingService> {
+    let capabilities = CapabilityRegistry::production(config_dir.to_path_buf()).await;
+    Arc::new(TranscodingService::unavailable(supervisor, capabilities))
 }
 
 #[cfg(test)]

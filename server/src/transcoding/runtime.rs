@@ -1,4 +1,7 @@
 use super::{
+    capability::registry::{
+        CapabilityRegistry, CapabilitySnapshot, RefreshAdmission, RefreshCause,
+    },
     probe::ProbeCache,
     process::{
         BoundedOutput, ProcessError, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy,
@@ -345,6 +348,7 @@ pub struct TranscodingService {
     supervisor: Arc<ProcessSupervisor>,
     state: tokio::sync::RwLock<ServiceState>,
     probe_cache: ProbeCache,
+    capability_registry: Arc<CapabilityRegistry>,
 }
 
 enum ServiceState {
@@ -356,11 +360,15 @@ enum ServiceState {
 }
 
 impl TranscodingService {
-    pub(crate) fn unavailable(supervisor: Arc<ProcessSupervisor>) -> Self {
+    pub(crate) fn unavailable(
+        supervisor: Arc<ProcessSupervisor>,
+        capability_registry: Arc<CapabilityRegistry>,
+    ) -> Self {
         Self {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Unavailable),
             probe_cache: ProbeCache::default(),
+            capability_registry,
         }
     }
 
@@ -368,12 +376,64 @@ impl TranscodingService {
         config: RuntimeConfig,
         supervisor: Arc<ProcessSupervisor>,
         runtime: Arc<FfmpegRuntime>,
+        capability_registry: Arc<CapabilityRegistry>,
     ) -> Self {
         Self {
             supervisor,
             state: tokio::sync::RwLock::new(ServiceState::Resolved { config, runtime }),
             probe_cache: ProbeCache::default(),
+            capability_registry,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn capability_snapshot(&self) -> Arc<CapabilitySnapshot> {
+        self.capability_registry.snapshot().await
+    }
+
+    pub(crate) async fn capability_api_bytes(
+        &self,
+    ) -> Result<Vec<u8>, super::capability::dto::DtoError> {
+        self.capability_registry
+            .api_dto()
+            .await?
+            .serialize_bounded()
+    }
+
+    pub(crate) async fn capability_refresh_api_bytes(
+        &self,
+        expected_id: u64,
+    ) -> Result<Vec<u8>, super::capability::dto::DtoError> {
+        self.capability_registry
+            .api_refresh_dto(expected_id)
+            .await?
+            .serialize_bounded()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn start_capability_refresh(
+        self: &Arc<Self>,
+        cause: RefreshCause,
+    ) -> RefreshAdmission {
+        self.capability_registry
+            .start_refresh(Arc::downgrade(self), cause)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn begin_capability_shutdown(&self) {
+        self.capability_registry.begin_shutdown();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn shutdown_capabilities(&self) {
+        self.begin_capability_shutdown();
+        self.capability_registry.shutdown().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_registry_for_test(&self) -> &Arc<CapabilityRegistry> {
+        &self.capability_registry
     }
 
     pub async fn current(&self) -> Option<RuntimeSnapshot> {
@@ -430,6 +490,11 @@ impl TranscodingService {
             supervisor: self.supervisor.clone(),
         })
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_capability_registry() -> Arc<CapabilityRegistry> {
+    CapabilityRegistry::ephemeral_for_test()
 }
 
 #[derive(Debug)]
@@ -590,7 +655,7 @@ impl HashTestObserver {
 }
 
 #[derive(Debug)]
-enum CandidateFailure {
+pub(super) enum CandidateFailure {
     Missing,
     Unsafe,
     Probe,
@@ -1212,7 +1277,7 @@ fn parse_version<'a>(output: &'a [u8], role: &str) -> Result<&'a str, CandidateF
     Ok(token)
 }
 
-fn build_configuration(output: &[u8]) -> Result<Vec<u8>, CandidateFailure> {
+pub(super) fn build_configuration(output: &[u8]) -> Result<Vec<u8>, CandidateFailure> {
     let output = std::str::from_utf8(output).map_err(|_| CandidateFailure::Incompatible)?;
     let mut lines = output.lines();
     let header_remainder = loop {
@@ -8607,7 +8672,12 @@ fn main() {{
         let runtime = resolve_runtime(&config, &supervisor)
             .await
             .expect("resolve original immutable pair");
-        let service = TranscodingService::resolved(config, supervisor, runtime);
+        let service = TranscodingService::resolved(
+            config,
+            supervisor,
+            runtime,
+            super::test_capability_registry(),
+        );
         service
             .runtime_for_session()
             .await
@@ -8895,8 +8965,12 @@ fn main() {{
             hash_observer: Some(Arc::new(HashTestObserver::default())),
         });
         let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
-        let service =
-            TranscodingService::resolved(RuntimeConfig::isolated(), supervisor, runtime.clone());
+        let service = TranscodingService::resolved(
+            RuntimeConfig::isolated(),
+            supervisor,
+            runtime.clone(),
+            super::test_capability_registry(),
+        );
         for _ in 0..16 {
             service
                 .runtime_for_session()

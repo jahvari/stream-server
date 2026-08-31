@@ -467,7 +467,7 @@ fn validate_workflow_digest(workflow: &str) -> Result<(), &'static str> {
     // nested text that YAML treats as non-semantic or that a bounded grammar could otherwise skip.
     // It authenticates repository declaration text only, not mutable marketplace action tags.
     const EXPECTED_WORKFLOW_SHA256: &str =
-        "76d04e105cab2a09b1ef9ac504e31044153217b5718925043e68263b3c189bfc";
+        "b53ad358f733062e6c96ac61797417823670dc715263828ce251438fd2f51908";
     let normalized_workflow = workflow.replace("\r\n", "\n");
     if hex::encode(Sha256::digest(normalized_workflow.as_bytes())) != EXPECTED_WORKFLOW_SHA256 {
         return Err("release workflow declaration digest changed");
@@ -512,6 +512,7 @@ fn workflow_steps(workflow: &str) -> Result<ParsedWorkflow, &'static str> {
         != [
             "check",
             "check-windows",
+            "check-macos",
             "build-windows",
             "build-linux",
             "build-arch",
@@ -1370,6 +1371,11 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
                 &["name", "run"],
                 "b3876eb1195ee67af7f3e186192dc1fb186d364d26153a243f4335f81dbb78cb",
             ),
+            run_contract(
+                "Qualify PR 4 device capability registry on Linux",
+                &["name", "run"],
+                "902f5b931b2c36c3d30475dcb28b8d127dd20f3533a33e96c7ff2a5af95564af",
+            ),
         ]),
         "check-windows" => Some(vec![
             shallow_checkout(),
@@ -1393,6 +1399,48 @@ fn expected_packaging_steps(job: &str) -> Option<Vec<ExpectedWorkflowStep>> {
                 "Test repeated Windows shutdown",
                 &["name", "run"],
                 "ee3e3c4b6c32e558d06f0826d727768a9de61582de2f76f702642d86641b28d8",
+            ),
+            run_contract(
+                "Qualify PR 4 device capability registry on Windows",
+                &["name", "run"],
+                "902f5b931b2c36c3d30475dcb28b8d127dd20f3533a33e96c7ff2a5af95564af",
+            ),
+        ]),
+        "check-macos" => Some(vec![
+            shallow_checkout(),
+            action_contract(
+                Some("Setup Rust"),
+                &["name", "uses", "with"],
+                "dtolnay/rust-toolchain@1.98.0",
+                &[("components", &["clippy"])],
+            ),
+            action_contract(
+                Some("Restore Cargo cache"),
+                &["name", "uses", "with"],
+                "actions/cache@v6",
+                &[
+                    (
+                        "key",
+                        &["${{ runner.os }}-pr4-cargo-${{ hashFiles('**/Cargo.lock') }}"],
+                    ),
+                    ("path", &["~/.cargo/registry", "~/.cargo/git", "target"]),
+                    ("restore-keys", &["${{ runner.os }}-pr4-cargo-"]),
+                ],
+            ),
+            run_contract(
+                "Check server targets without runtime acquisition",
+                &["name", "run"],
+                "fb7c287d4b106f7c03b98bc7baac17f0667cebbd067e98833f8cea52fcc9c29a",
+            ),
+            run_contract(
+                "Run warnings-as-errors Clippy",
+                &["name", "run"],
+                "08d018d93c0deb792ae9f795d2f24168f6f5dc9ac58c786e6b84cb9b5674ef85",
+            ),
+            run_contract(
+                "Test packaging-disabled VideoToolbox model",
+                &["name", "run"],
+                "0f5d80ef9e82292ddfadba8b32d0b17fbd4aa05834cf57139c8a9ddd808d67e0",
             ),
         ]),
         "build-windows" => {
@@ -1841,6 +1889,9 @@ fn expected_packaging_job_metadata(job: &str) -> Option<&'static str> {
         "check-windows" => Some(
             "name: Check Windows native FFI and shutdown\nruns-on: windows-2022\nif: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))\nenv:\n  LIBCLANG_PATH: C:\\Program Files\\LLVM\\bin",
         ),
+        "check-macos" => Some(
+            "name: Check macOS disabled VideoToolbox model\nruns-on: macos-15\nif: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))",
+        ),
         "build-windows" => Some(
             "name: Build Windows\nruns-on: windows-2022\nif: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'\nenv:\n  VCPKG_BINARY_SOURCES: \"clear;x-gha,readwrite\"",
         ),
@@ -1861,6 +1912,7 @@ fn validate_packaging_job_contract(parsed: &ParsedWorkflow) -> Result<(), &'stat
     for job in [
         "check",
         "check-windows",
+        "check-macos",
         "build-windows",
         "build-linux",
         "build-arch",

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InputVideoCodec {
     H264,
@@ -26,7 +26,7 @@ impl InputVideoCodec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OutputVideoCodec {
     H264,
@@ -85,7 +85,7 @@ impl ContainerKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SampleEntry {
     Avc1,
@@ -115,7 +115,7 @@ impl SampleEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VideoProfile {
     H264Baseline,
@@ -159,15 +159,18 @@ impl VideoProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PixelFormat {
     Yuv420p,
     Yuv420p10le,
+    Yuv420p12le,
     Yuv422p,
     Yuv422p10le,
+    Yuv422p12le,
     Yuv444p,
     Yuv444p10le,
+    Yuv444p12le,
     Nv12,
     P010le,
     Gray8,
@@ -182,10 +185,13 @@ impl PixelFormat {
             "" | "unknown" | "n/a" => Self::Unknown,
             "yuv420p" => Self::Yuv420p,
             "yuv420p10le" => Self::Yuv420p10le,
+            "yuv420p12le" => Self::Yuv420p12le,
             "yuv422p" => Self::Yuv422p,
             "yuv422p10le" => Self::Yuv422p10le,
+            "yuv422p12le" => Self::Yuv422p12le,
             "yuv444p" => Self::Yuv444p,
             "yuv444p10le" => Self::Yuv444p10le,
+            "yuv444p12le" => Self::Yuv444p12le,
             "nv12" => Self::Nv12,
             "p010le" | "p010" => Self::P010le,
             "gray" | "gray8" => Self::Gray8,
@@ -202,24 +208,25 @@ impl PixelFormat {
             | Self::Yuv444p10le
             | Self::P010le
             | Self::Gray10le => Some(10),
+            Self::Yuv420p12le | Self::Yuv422p12le | Self::Yuv444p12le => Some(12),
             Self::OtherProbed | Self::Unknown => None,
         }
     }
 
     pub(crate) const fn chroma(self) -> ChromaSubsampling {
         match self {
-            Self::Yuv420p | Self::Yuv420p10le | Self::Nv12 | Self::P010le => {
+            Self::Yuv420p | Self::Yuv420p10le | Self::Yuv420p12le | Self::Nv12 | Self::P010le => {
                 ChromaSubsampling::Cs420
             }
-            Self::Yuv422p | Self::Yuv422p10le => ChromaSubsampling::Cs422,
-            Self::Yuv444p | Self::Yuv444p10le => ChromaSubsampling::Cs444,
+            Self::Yuv422p | Self::Yuv422p10le | Self::Yuv422p12le => ChromaSubsampling::Cs422,
+            Self::Yuv444p | Self::Yuv444p10le | Self::Yuv444p12le => ChromaSubsampling::Cs444,
             Self::Gray8 | Self::Gray10le => ChromaSubsampling::Monochrome,
             Self::OtherProbed | Self::Unknown => ChromaSubsampling::Unknown,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChromaSubsampling {
     Cs420,
@@ -229,7 +236,7 @@ pub enum ChromaSubsampling {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FieldOrder {
     Progressive,
@@ -253,7 +260,7 @@ impl FieldOrder {
 
 macro_rules! probed_color_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "camelCase")]
         pub enum $name { $($variant,)+ OtherProbed, Unknown }
 
@@ -289,7 +296,7 @@ probed_color_enum!(ColorMatrix {
     Rgb => "gbr",
 });
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ColorRange {
     Limited,

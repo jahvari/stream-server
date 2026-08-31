@@ -2,6 +2,25 @@ use std::time::Duration;
 
 const SERVER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn stop_and_join(
+    handle: stream_server::ServerHandle,
+) -> anyhow::Result<Option<stream_server::ShutdownSource>> {
+    handle.shutdown()?;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let joiner = std::thread::spawn(move || {
+        let _ = result_tx.send(handle.join());
+    });
+    let shutdown_source = result_rx
+        .recv_timeout(SERVER_JOIN_TIMEOUT)
+        .map_err(|err| {
+            anyhow::anyhow!("embedded server did not stop within {SERVER_JOIN_TIMEOUT:?}: {err}")
+        })??;
+    joiner
+        .join()
+        .map_err(|_| anyhow::anyhow!("server join helper thread panicked"))?;
+    Ok(shutdown_source)
+}
+
 fn start_and_stop_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
@@ -20,27 +39,46 @@ fn start_and_stop_embedded_server() -> anyhow::Result<()> {
     let body: serde_json::Value = response.json()?;
     assert_eq!(body["success"], true);
 
-    handle.shutdown()?;
-
     // ServerHandle::join is intentionally blocking. Run it on a separate
     // thread so a shutdown regression fails this test instead of hanging CI.
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let joiner = std::thread::spawn(move || {
-        let _ = result_tx.send(handle.join());
-    });
-    let shutdown_source = result_rx
-        .recv_timeout(SERVER_JOIN_TIMEOUT)
-        .map_err(|err| {
-            anyhow::anyhow!("embedded server did not stop within {SERVER_JOIN_TIMEOUT:?}: {err}")
-        })??;
-    joiner
-        .join()
-        .map_err(|_| anyhow::anyhow!("server join helper thread panicked"))?;
+    let shutdown_source = stop_and_join(handle)?;
 
     assert_eq!(
         shutdown_source,
         Some(stream_server::ShutdownSource::External)
     );
+
+    Ok(())
+}
+
+#[test]
+fn capability_storage_lock_is_released_before_embedded_shutdown_returns() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let server_config_dir = config_dir.path().join("config");
+
+    for cycle in 1..=2 {
+        let handle = stream_server::start(stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(server_config_dir.clone()),
+            cache_dir: Some(cache_dir.path().join("cache")),
+            ..stream_server::ServerConfig::default()
+        })?;
+        let body: serde_json::Value = reqwest::blocking::get(format!(
+            "http://{}/transcoding/capabilities",
+            handle.http_addr()
+        ))?
+        .error_for_status()?
+        .json()?;
+        assert_eq!(
+            body["storage"]["status"], "writable",
+            "cycle {cycle} must own the protected capability lock"
+        );
+        assert_eq!(
+            stop_and_join(handle)?,
+            Some(stream_server::ShutdownSource::External)
+        );
+    }
 
     Ok(())
 }

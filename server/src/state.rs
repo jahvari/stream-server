@@ -20,7 +20,10 @@ pub(crate) fn unavailable_transcoding_for_test() -> Arc<TranscodingService> {
     let supervisor = Arc::new(crate::transcoding::process::ProcessSupervisor::new(
         tokio_util::sync::CancellationToken::new(),
     ));
-    crate::ffmpeg_setup::unavailable_service(supervisor)
+    Arc::new(TranscodingService::unavailable(
+        supervisor,
+        crate::transcoding::capability::registry::CapabilityRegistry::ephemeral_for_test(),
+    ))
 }
 
 pub(crate) struct SettingsPersistenceCoordinator {

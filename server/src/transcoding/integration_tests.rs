@@ -6,6 +6,9 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::transcoding::inventory::{
+    InventoryError, PairedRuntimeInventorySource, StaticInventorySource,
+};
 use crate::transcoding::process::{
     PROCESS_TEST_LOCK, ProcessErrorCode, ProcessSpec, ProcessSupervisor, StdinPolicy, StdoutPolicy,
 };
@@ -13,9 +16,15 @@ use crate::transcoding::process::{
 use crate::transcoding::runtime::verify_unchanged;
 use crate::transcoding::runtime::{
     HASH_ADMISSION_DEADLINE, RuntimeConfig, RuntimeKind, RuntimeStatus, TranscodingService,
-    resolve_runtime,
+    resolve_runtime, test_capability_registry,
 };
 use crate::transcoding::runtime_manifest::RuntimeError;
+use crate::transcoding::{
+    capability::registry::{CapabilityRegistry, RefreshAdmission, RefreshCause, SnapshotFreshness},
+    device::{
+        DeviceDiscovery, DeviceEnumerator, DeviceError, DriverRunEpoch, identity::DeviceIdSeed,
+    },
+};
 #[cfg(windows)]
 use sha2::Digest;
 use tempfile::TempDir;
@@ -24,6 +33,23 @@ use tokio_util::sync::CancellationToken;
 struct FakeProcess {
     _directory: TempDir,
     executable: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct IntegrationEmptyEnumerator;
+
+#[async_trait::async_trait]
+impl DeviceEnumerator for IntegrationEmptyEnumerator {
+    async fn enumerate(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<DeviceDiscovery, DeviceError> {
+        if cancellation.is_cancelled() {
+            Err(DeviceError::Cancelled)
+        } else {
+            Ok(DeviceDiscovery::supported(Vec::new()))
+        }
+    }
 }
 
 fn fake_process() -> &'static FakeProcess {
@@ -205,6 +231,47 @@ fn jellyfin_root(base: &Path, name: &str) -> PathBuf {
         "7.1.4-Jellyfin",
         "--enable-gpl\n--enable-libx264",
     )
+}
+
+fn inventory_runtime_root(base: &Path, name: &str) -> PathBuf {
+    let root = jellyfin_root(base, name);
+    for (name, contents) in [
+        (
+            "hwaccels.inventory",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/transcoding_inventory/hwaccels.txt"
+            ))
+            .as_slice(),
+        ),
+        (
+            "encoders.inventory",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/transcoding_inventory/encoders.txt"
+            ))
+            .as_slice(),
+        ),
+        (
+            "decoders.inventory",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/transcoding_inventory/decoders.txt"
+            ))
+            .as_slice(),
+        ),
+        (
+            "filters.inventory",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/transcoding_inventory/filters.txt"
+            ))
+            .as_slice(),
+        ),
+    ] {
+        fs::write(root.join(name), contents).expect("write static inventory fixture");
+    }
+    root
 }
 
 #[cfg(windows)]
@@ -1065,30 +1132,28 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
     let config = isolated_config()
         .with_explicit_root(stalled)
         .with_managed_current_root(managed);
+    let resolution_started = Instant::now();
     let mut resolving = {
         let supervisor = supervisor.clone();
         tokio::spawn(async move { resolve_runtime(&config, &supervisor).await })
     };
-    let registered = match tokio::time::timeout(
-        HASH_ADMISSION_DEADLINE + Duration::from_secs(5),
-        async {
-            loop {
-                if supervisor.active_processes() != 0 {
-                    break Instant::now();
-                }
-                if resolving.is_finished() {
-                    let result = (&mut resolving)
-                        .await
-                        .expect("join resolver that finished before probe registration");
-                    panic!("resolver finished before the stalled probe registered: {result:?}");
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+    match tokio::time::timeout(HASH_ADMISSION_DEADLINE + Duration::from_secs(5), async {
+        loop {
+            if supervisor.active_processes() != 0 {
+                break;
             }
-        },
-    )
+            if resolving.is_finished() {
+                let result = (&mut resolving)
+                    .await
+                    .expect("join resolver that finished before probe registration");
+                panic!("resolver finished before the stalled probe registered: {result:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
     .await
     {
-        Ok(registered) => registered,
+        Ok(()) => {}
         Err(_) => {
             supervisor.cancel();
             let force_result = supervisor.force_terminate_registered();
@@ -1099,7 +1164,7 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
                 "stalled probe did not register within the bounded snapshot admission window: force={force_result:?}, idle={idle_result:?}"
             );
         }
-    };
+    }
 
     let resolved = match tokio::time::timeout(Duration::from_secs(20), &mut resolving).await {
         Ok(result) => result,
@@ -1120,7 +1185,7 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
 
     assert!(matches!(error, RuntimeError::ProbeDeadline));
     assert!(
-        registered.elapsed() >= Duration::from_secs(10),
+        resolution_started.elapsed() >= Duration::from_secs(10),
         "the stalled probe ended before its ten-second wall deadline"
     );
     assert_eq!(supervisor.active_processes(), 0);
@@ -1340,7 +1405,12 @@ async fn verified_session_keeps_the_pair_leased_and_publishes_only_safe_identity
         .await
         .expect("resolve initial runtime");
     let initial_digest = initial.id().install_digest.clone();
-    let service = TranscodingService::resolved(config, supervisor.clone(), initial);
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        initial,
+        test_capability_registry(),
+    );
     let snapshot = service
         .current()
         .await
@@ -1374,7 +1444,8 @@ async fn session_revalidation_detects_a_path_replaced_after_validation() {
     let initial = resolve_runtime(&config, &supervisor)
         .await
         .expect("resolve initial runtime");
-    let service = TranscodingService::resolved(config, supervisor, initial);
+    let service =
+        TranscodingService::resolved(config, supervisor, initial, test_capability_registry());
     let original_session = service
         .runtime_for_session()
         .await
@@ -1398,7 +1469,7 @@ async fn session_revalidation_detects_a_path_replaced_after_validation() {
 #[tokio::test]
 async fn unavailable_service_is_side_effect_free_and_exposes_disabled_status() {
     let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
-    let service = TranscodingService::unavailable(supervisor.clone());
+    let service = TranscodingService::unavailable(supervisor.clone(), test_capability_registry());
 
     assert_eq!(service.status().await, RuntimeStatus::Unavailable);
     assert!(matches!(
@@ -1423,6 +1494,7 @@ async fn fake_probe_service(
             config,
             supervisor.clone(),
             runtime,
+            test_capability_registry(),
         )),
         supervisor,
     )
@@ -1633,6 +1705,207 @@ async fn explicit_runtime_rejects_a_symlinked_executable_escape() {
     assert_eq!(supervisor.active_processes(), 0);
 }
 
+#[tokio::test]
+async fn paired_runtime_inventory_uses_six_supervised_processes() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("inventory runtime directory");
+    let root = inventory_runtime_root(directory.path(), "inventory-success");
+    let config = RuntimeConfig::isolated().with_explicit_root(root.clone());
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let runtime = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve inventory runtime");
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        test_capability_registry(),
+    );
+    let session = service
+        .runtime_for_session()
+        .await
+        .expect("verified inventory session");
+    assert_eq!(session.kind(), RuntimeKind::SoftwareCompatible);
+    assert_eq!(session.id().jellyfin_revision, None);
+
+    let inventory = PairedRuntimeInventorySource
+        .collect(&session, CancellationToken::new())
+        .await
+        .expect("collect paired inventory");
+    assert!(!inventory.accelerators.is_empty());
+    assert!(!inventory.decoders.is_empty());
+    assert!(!inventory.encoders.is_empty());
+    assert!(!inventory.filters.is_empty());
+    assert_eq!(
+        fs::read_to_string(root.join("inventory-invocations"))
+            .expect("read inventory invocation log")
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "-version",
+            "-buildconf",
+            "-hwaccels",
+            "-encoders",
+            "-decoders",
+            "-filters",
+        ]
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
+#[tokio::test]
+async fn capability_refresh_uses_one_verified_session_and_inventory_failure_becomes_stale() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("refresh inventory runtime directory");
+    let root = inventory_runtime_root(directory.path(), "refresh-inventory");
+    let config = RuntimeConfig::isolated().with_explicit_root(root.clone());
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let runtime = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve refresh inventory runtime");
+    let registry = CapabilityRegistry::with_persist_failed_storage_for_test(
+        Arc::new(IntegrationEmptyEnumerator),
+        Arc::new(PairedRuntimeInventorySource),
+        Some(DeviceIdSeed::from_test_bytes([0x51; 32])),
+        Some(DriverRunEpoch::from_test_bytes([0x61; 32])),
+    );
+    let service = Arc::new(TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        Arc::clone(&registry),
+    ));
+
+    assert_eq!(
+        service
+            .start_capability_refresh(RefreshCause::Startup)
+            .await,
+        RefreshAdmission::Started { id: 1 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let fresh = service.capability_snapshot().await;
+    assert_eq!(fresh.freshness(), SnapshotFreshness::Fresh);
+    assert!(fresh.runtime_for_test().is_some());
+    assert!(registry.refresh_persistence_failed_for_test().await);
+    assert_eq!(supervisor.active_processes(), 0);
+
+    fs::write(root.join("inventory-exit-query"), b"-encoders")
+        .expect("write refresh inventory failure control");
+    assert_eq!(
+        service.start_capability_refresh(RefreshCause::Manual).await,
+        RefreshAdmission::Started { id: 2 }
+    );
+    registry.wait_for_refresh_for_test().await;
+    let stale = service.capability_snapshot().await;
+    assert_eq!(stale.freshness(), SnapshotFreshness::Stale);
+    assert_eq!(fresh.freshness(), SnapshotFreshness::Fresh);
+    assert_eq!(supervisor.active_processes(), 0);
+    service.shutdown_capabilities().await;
+}
+
+#[tokio::test]
+async fn paired_runtime_inventory_reaps_nonzero_overflow_and_cancelled_children() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("inventory failure runtime directory");
+    let root = inventory_runtime_root(directory.path(), "inventory-failures");
+    let config = RuntimeConfig::isolated().with_explicit_root(root.clone());
+    let supervisor = Arc::new(ProcessSupervisor::new(CancellationToken::new()));
+    let runtime = resolve_runtime(&config, &supervisor)
+        .await
+        .expect("resolve inventory runtime");
+    let service = TranscodingService::resolved(
+        config,
+        supervisor.clone(),
+        runtime,
+        test_capability_registry(),
+    );
+    let session = service
+        .runtime_for_session()
+        .await
+        .expect("verified inventory session");
+    let source = PairedRuntimeInventorySource;
+
+    fs::write(root.join("inventory-exit-query"), b"-encoders")
+        .expect("write inventory exit control");
+    assert_eq!(
+        source.collect(&session, CancellationToken::new()).await,
+        Err(InventoryError::ProcessFailed)
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+    fs::remove_file(root.join("inventory-exit-query")).expect("remove inventory exit control");
+
+    fs::write(root.join("inventory-overflow-query"), b"-encoders")
+        .expect("write inventory overflow control");
+    assert_eq!(
+        source.collect(&session, CancellationToken::new()).await,
+        Err(InventoryError::Bounds)
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+    fs::remove_file(root.join("inventory-overflow-query"))
+        .expect("remove inventory overflow control");
+
+    fs::write(root.join("inventory-stderr-overflow-query"), b"-encoders")
+        .expect("write inventory stderr overflow control");
+    assert_eq!(
+        source.collect(&session, CancellationToken::new()).await,
+        Err(InventoryError::Bounds)
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+    fs::remove_file(root.join("inventory-stderr-overflow-query"))
+        .expect("remove inventory stderr overflow control");
+
+    fs::write(root.join("inventory-stall-query"), b"-encoders")
+        .expect("write inventory stall control");
+    let cancellation = CancellationToken::new();
+    let canceller = cancellation.clone();
+    let marker = root.join("inventory-stalled");
+    let cancellation_task = tokio::spawn(async move {
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(observed.is_ok(), "inventory stall process did not start");
+        canceller.cancel();
+    });
+    assert_eq!(
+        source.collect(&session, cancellation).await,
+        Err(InventoryError::Cancelled)
+    );
+    cancellation_task.await.expect("cancellation task");
+    assert_eq!(supervisor.active_processes(), 0);
+
+    fs::remove_file(root.join("inventory-stalled")).expect("remove first stall marker");
+    let timeout_collection =
+        tokio::spawn(async move { source.collect(&session, CancellationToken::new()).await });
+    let timeout_marker = root.join("inventory-stalled");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !timeout_marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed inventory process started");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    for _ in 0..10 {
+        if timeout_collection.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    tokio::time::resume();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), timeout_collection)
+            .await
+            .expect("timed inventory cleanup completes")
+            .expect("join timed inventory"),
+        Err(InventoryError::Timeout)
+    );
+    assert_eq!(supervisor.active_processes(), 0);
+}
+
 const FAKE_PROCESS_SOURCE: &str = r#"
 use std::env;
 use std::ffi::OsString;
@@ -1770,13 +2043,58 @@ fn probe_query(args: &[OsString]) -> bool {
 }
 
 fn runtime_query(args: &[OsString]) -> bool {
-    let Some(query) = args.first().and_then(|arg| arg.to_str()) else {
-        return false;
+    let (query, inventory) = match args {
+        [query] if query == "-version" || query == "-buildconf" => {
+            (query.to_str().unwrap(), false)
+        }
+        [nostdin, hide_banner, query]
+            if nostdin == "-nostdin"
+                && hide_banner == "-hide_banner"
+                && matches!(
+                    query.to_str(),
+                    Some(
+                        "-version"
+                            | "-buildconf"
+                            | "-hwaccels"
+                            | "-encoders"
+                            | "-decoders"
+                            | "-filters"
+                    )
+                ) =>
+        {
+            (query.to_str().unwrap(), true)
+        }
+        _ => return false,
     };
-    if args.len() != 1 || (query != "-version" && query != "-buildconf") {
-        return false;
-    }
     let root = env::current_dir().unwrap();
+    if inventory {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("inventory-invocations"))
+            .unwrap();
+        writeln!(log, "{query}").unwrap();
+        if control_matches(&root, "inventory-stall-query", query) {
+            fs::write(root.join("inventory-stalled"), b"started").unwrap();
+            loop { thread::sleep(Duration::from_secs(1)); }
+        }
+        if control_matches(&root, "inventory-overflow-query", query) {
+            io::stdout().write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+            return true;
+        }
+        if control_matches(&root, "inventory-stderr-overflow-query", query) {
+            io::stderr().write_all(&vec![b'x'; 256 * 1024 + 1]).unwrap();
+            return true;
+        }
+        if !matches!(query, "-version" | "-buildconf") {
+            let name = format!("{}.inventory", query.trim_start_matches('-'));
+            io::stdout().write_all(&fs::read(root.join(name)).unwrap()).unwrap();
+            if control_matches(&root, "inventory-exit-query", query) {
+                std::process::exit(7);
+            }
+            return true;
+        }
+    }
     if root.join("stall-version").is_file() && query == "-version" {
         loop { thread::sleep(Duration::from_secs(1)); }
     }
@@ -1808,7 +2126,15 @@ fn runtime_query(args: &[OsString]) -> bool {
             println!("libavutil      59. 39.100 / 59. 39.100");
         }
     }
+    if inventory && control_matches(&root, "inventory-exit-query", query) {
+        std::process::exit(7);
+    }
     true
+}
+
+fn control_matches(root: &std::path::Path, name: &str, query: &str) -> bool {
+    fs::read_to_string(root.join(name))
+        .is_ok_and(|value| value.trim() == query)
 }
 
 fn parse_size(value: Option<&OsString>) -> usize {

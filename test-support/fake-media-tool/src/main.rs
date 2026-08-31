@@ -281,6 +281,8 @@ fn is_inventory_query(args: &[OsString], query: &str) -> bool {
     is_exact_invocation(args, query)
         || matches!(args, [hide_banner, requested]
             if hide_banner == "-hide_banner" && requested == query)
+        || matches!(args, [nostdin, hide_banner, requested]
+            if nostdin == "-nostdin" && hide_banner == "-hide_banner" && requested == query)
 }
 
 fn requests_json_probe(args: &[OsString]) -> bool {
@@ -375,13 +377,19 @@ const ENCODERS: &str = "\
 Encoders:
  V..... h264_qsv             H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (Intel Quick Sync Video)
  V..... hevc_qsv             H.265 / HEVC (Intel Quick Sync Video)
+ V..... av1_qsv              AV1 (Intel Quick Sync Video)
  V..... h264_nvenc           NVIDIA NVENC H.264 encoder
  V..... hevc_nvenc           NVIDIA NVENC HEVC encoder
+ V..... av1_nvenc            NVIDIA NVENC AV1 encoder
  V..... h264_vaapi           H.264/AVC (VAAPI)
  V..... hevc_vaapi           H.265/HEVC (VAAPI)
+ V..... av1_vaapi            AV1 (VAAPI)
  V..... h264_amf             AMD AMF H.264 encoder
  V..... hevc_amf             AMD AMF HEVC encoder
+ V..... av1_amf              AMD AMF AV1 encoder
  V..... h264_videotoolbox    VideoToolbox H.264 encoder
+ V..... hevc_videotoolbox    VideoToolbox HEVC encoder
+ V..... av1_videotoolbox     VideoToolbox AV1 encoder
  V..... h264_v4l2m2m         V4L2 mem2mem H.264 encoder wrapper
  V..... libx264              libx264 H.264 / AVC
  V..... libx265              libx265 H.265 / HEVC
@@ -391,10 +399,22 @@ const DECODERS: &str = "\
 Decoders:
  V..... h264                  H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10
  V..... hevc                  H.265 / HEVC
+ V..... av1                   AV1
+ V..... vp9                   VP9
+ V..... mpeg2video            MPEG-2 video
+ V..... vc1                   SMPTE VC-1
  V..... h264_qsv             H264 video (Intel Quick Sync Video acceleration)
  V..... hevc_qsv             HEVC video (Intel Quick Sync Video acceleration)
+ V..... av1_qsv              AV1 video (Intel Quick Sync Video acceleration)
+ V..... vp9_qsv              VP9 video (Intel Quick Sync Video acceleration)
+ V..... mpeg2_qsv            MPEG-2 video (Intel Quick Sync Video acceleration)
+ V..... vc1_qsv              VC-1 video (Intel Quick Sync Video acceleration)
  V..... h264_cuvid           Nvidia CUVID H264 decoder
  V..... hevc_cuvid           Nvidia CUVID HEVC decoder
+ V..... av1_cuvid            Nvidia CUVID AV1 decoder
+ V..... vp9_cuvid            Nvidia CUVID VP9 decoder
+ V..... mpeg2_cuvid          Nvidia CUVID MPEG-2 decoder
+ V..... vc1_cuvid            Nvidia CUVID VC-1 decoder
  V..... h264_v4l2m2m         V4L2 mem2mem H.264 decoder wrapper
 ";
 

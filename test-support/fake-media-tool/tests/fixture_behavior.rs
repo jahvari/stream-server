@@ -138,6 +138,38 @@ fn copied_ffmpeg_and_ffprobe_names_are_invoked_directly() {
 }
 
 #[test]
+fn bounded_inventory_argv_returns_only_the_requested_listing() {
+    let dir = tempdir().expect("temp dir");
+    for (query, expected, forbidden) in [
+        (
+            "-version",
+            "ffmpeg version",
+            "Hardware acceleration methods:",
+        ),
+        (
+            "-buildconf",
+            "configuration:",
+            "Hardware acceleration methods:",
+        ),
+        ("-hwaccels", "Hardware acceleration methods:", "Encoders:"),
+        ("-encoders", "Encoders:", "Decoders:"),
+        ("-decoders", "Decoders:", "Filters:"),
+        ("-filters", "Filters:", "Encoders:"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fake-media-tool"))
+            .args(["-nostdin", "-hide_banner", query])
+            .current_dir(dir.path())
+            .output()
+            .expect("run inventory query");
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 listing");
+        assert!(stdout.contains(expected));
+        assert!(!stdout.contains(forbidden));
+    }
+}
+
+#[test]
 fn option_looking_input_value_is_not_dispatched_as_a_query() {
     let dir = tempdir().expect("temp dir");
 
