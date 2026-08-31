@@ -549,7 +549,7 @@ fn ensure_local(file: &File) -> Result<(), SeedStorageError> {
         return Err(SeedStorageError::Untrusted);
     }
     const MNT_LOCAL: u32 = 0x0000_1000;
-    if unsafe { statistics.assume_init() }.f_flags as u32 & MNT_LOCAL == 0 {
+    if unsafe { statistics.assume_init() }.f_flags & MNT_LOCAL == 0 {
         Err(SeedStorageError::Untrusted)
     } else {
         Ok(())

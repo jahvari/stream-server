@@ -1942,7 +1942,7 @@ fn join_unix_reader_durably(
     owner.ownership.record_reader_join_result(result)
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(target_os = "linux", all(test, windows)))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinuxProcessIdentity {
     process_group: i32,
@@ -1950,7 +1950,7 @@ struct LinuxProcessIdentity {
     terminal: bool,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(target_os = "linux", all(test, windows)))]
 fn parse_linux_process_identity(statistics: &str) -> Option<LinuxProcessIdentity> {
     let fields = statistics.rsplit_once(") ")?.1;
     let mut fields = fields.split_ascii_whitespace();
