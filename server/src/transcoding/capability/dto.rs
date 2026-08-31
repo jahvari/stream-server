@@ -915,11 +915,20 @@ mod tests {
 
         let dto = CapabilitiesDto::project(publication, now).expect("safe projection");
         let bytes = serde_json::to_vec(&dto).expect("serialize DTO");
-
-        assert_eq!(
-            bytes,
-            br#"{"schemaVersion":1,"freshness":"uninitialized","identityEpoch":0,"publicationRevision":0,"runtime":{"status":"unavailable","version":null,"jellyfinRevision":null,"platform":"windows"},"softwareBaseline":{"state":"notPresent","reason":"verificationNotImplemented"},"devices":[],"runtimeComponents":{"hardwareAccelerators":[],"decoders":[],"encoders":[],"filters":[]},"listedCandidates":[],"evidenceRows":[],"storage":{"status":"unavailable"},"refresh":{"id":null,"cause":null,"state":"idle","startedAt":null,"completedAt":null,"outcomeReason":null,"persistenceStatus":"unavailable"}}"#
+        let platform = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "unsupported"
+        };
+        let expected = format!(
+            r#"{{"schemaVersion":1,"freshness":"uninitialized","identityEpoch":0,"publicationRevision":0,"runtime":{{"status":"unavailable","version":null,"jellyfinRevision":null,"platform":"{platform}"}},"softwareBaseline":{{"state":"notPresent","reason":"verificationNotImplemented"}},"devices":[],"runtimeComponents":{{"hardwareAccelerators":[],"decoders":[],"encoders":[],"filters":[]}},"listedCandidates":[],"evidenceRows":[],"storage":{{"status":"unavailable"}},"refresh":{{"id":null,"cause":null,"state":"idle","startedAt":null,"completedAt":null,"outcomeReason":null,"persistenceStatus":"unavailable"}}}}"#
         );
+
+        assert_eq!(bytes, expected.as_bytes());
     }
 
     #[tokio::test]
