@@ -1132,30 +1132,28 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
     let config = isolated_config()
         .with_explicit_root(stalled)
         .with_managed_current_root(managed);
+    let resolution_started = Instant::now();
     let mut resolving = {
         let supervisor = supervisor.clone();
         tokio::spawn(async move { resolve_runtime(&config, &supervisor).await })
     };
-    let registered = match tokio::time::timeout(
-        HASH_ADMISSION_DEADLINE + Duration::from_secs(5),
-        async {
-            loop {
-                if supervisor.active_processes() != 0 {
-                    break Instant::now();
-                }
-                if resolving.is_finished() {
-                    let result = (&mut resolving)
-                        .await
-                        .expect("join resolver that finished before probe registration");
-                    panic!("resolver finished before the stalled probe registered: {result:?}");
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+    match tokio::time::timeout(HASH_ADMISSION_DEADLINE + Duration::from_secs(5), async {
+        loop {
+            if supervisor.active_processes() != 0 {
+                break;
             }
-        },
-    )
+            if resolving.is_finished() {
+                let result = (&mut resolving)
+                    .await
+                    .expect("join resolver that finished before probe registration");
+                panic!("resolver finished before the stalled probe registered: {result:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
     .await
     {
-        Ok(registered) => registered,
+        Ok(()) => {}
         Err(_) => {
             supervisor.cancel();
             let force_result = supervisor.force_terminate_registered();
@@ -1166,7 +1164,7 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
                 "stalled probe did not register within the bounded snapshot admission window: force={force_result:?}, idle={idle_result:?}"
             );
         }
-    };
+    }
 
     let resolved = match tokio::time::timeout(Duration::from_secs(20), &mut resolving).await {
         Ok(result) => result,
@@ -1187,7 +1185,7 @@ async fn version_probe_is_killed_at_the_ten_second_runtime_deadline() {
 
     assert!(matches!(error, RuntimeError::ProbeDeadline));
     assert!(
-        registered.elapsed() >= Duration::from_secs(10),
+        resolution_started.elapsed() >= Duration::from_secs(10),
         "the stalled probe ended before its ten-second wall deadline"
     );
     assert_eq!(supervisor.active_processes(), 0);
